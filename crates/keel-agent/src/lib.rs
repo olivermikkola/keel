@@ -11,8 +11,10 @@
 //! until the model stops requesting tools. Lifecycle events are emitted on the
 //! kernel [`Context`] so other plugins can observe them.
 
+pub mod cascade;
 pub mod checkpoint;
 pub mod compaction;
+pub mod daemon;
 pub mod epistemic;
 pub mod guard;
 pub mod lsp;
@@ -375,6 +377,35 @@ impl Plugin for SessionLogPlugin {
     }
 }
 
+/// Cooperative cancellation token checked between agent steps and tool calls.
+#[derive(Clone, Default)]
+pub struct CancelToken(pub Arc<std::sync::atomic::AtomicBool>);
+
+impl CancelToken {
+    pub fn new() -> Self {
+        Self(Arc::new(std::sync::atomic::AtomicBool::new(false)))
+    }
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    pub fn reset(&self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+pub struct CancelTokenPlugin(pub CancelToken);
+impl Plugin for CancelTokenPlugin {
+    fn name(&self) -> &str {
+        "cancel-token"
+    }
+    fn apply(&self, scope: &mut Scope) {
+        scope.provide::<CancelToken>(self.0.clone());
+    }
+}
+
 // ---- lifecycle events (observable via Context::emit) ----
 pub struct TurnStart;
 pub struct StepStart(pub usize);
@@ -547,7 +578,11 @@ impl Agent<'_> {
             .append("user", serde_json::json!({ "text": user }))?;
         let specs: Vec<ToolSpec> = self.tools.iter().map(|t| t.spec()).collect();
 
+        let cancel_token = self.ctx.service::<CancelToken>();
         for step in 0..self.max_steps {
+            if cancel_token.as_ref().is_some_and(|c| c.is_cancelled()) {
+                anyhow::bail!("turn cancelled by client");
+            }
             self.ctx.emit(&StepStart(step));
             if let Some(pruner) = self.ctx.service::<compaction::ToolResultPruner>() {
                 pruner.prune_history(history);
@@ -555,6 +590,9 @@ impl Agent<'_> {
             let mut reply = self
                 .llm
                 .complete_streaming(history, &specs, &mut |c| self.ctx.emit(&c))?;
+            if cancel_token.as_ref().is_some_and(|c| c.is_cancelled()) {
+                anyhow::bail!("turn cancelled by client");
+            }
             if let Message::Assistant {
                 ref text,
                 ref mut tool_calls,
@@ -597,6 +635,9 @@ impl Agent<'_> {
                 return Ok(text);
             }
             for call in tool_calls {
+                if cancel_token.as_ref().is_some_and(|c| c.is_cancelled()) {
+                    anyhow::bail!("turn cancelled by client");
+                }
                 self.ctx.emit(&ToolStart(call.clone()));
                 let mut out = self.execute(&call);
                 if let Some(guard) = self.ctx.service::<guard::RepeatToolGuard>() {
