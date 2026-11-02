@@ -15,6 +15,7 @@ pub mod checkpoint;
 pub mod compaction;
 pub mod epistemic;
 pub mod guard;
+pub mod lsp;
 pub mod mcp;
 pub mod patch;
 pub mod plan;
@@ -633,9 +634,21 @@ impl Agent<'_> {
             }
             Decision::Allow => {
                 // Tool errors go back to the model as text; they never abort the turn.
-                let out = tool
+                let mut out = tool
                     .run(&call.args)
                     .unwrap_or_else(|e| format!("error: {e:#}"));
+                if !out.starts_with("error:")
+                    && matches!(call.name.as_str(), "write_file" | "edit_file" | "patch_file")
+                {
+                    if let Some(rel_path) = call.args.get("path").and_then(|v| v.as_str()) {
+                        if let Some(lsp_svc) = self.ctx.service::<Arc<lsp::LspService>>() {
+                            if let Some(diag_feedback) = lsp_svc.post_edit_feedback(rel_path) {
+                                out.push_str("\n\n");
+                                out.push_str(&diag_feedback);
+                            }
+                        }
+                    }
+                }
                 self.ctx.emit(&ToolResult(call.id.clone(), out.clone()));
                 out
             }
@@ -1043,5 +1056,61 @@ mod tests {
 
         // 5. Subsequent shell call auto-passes via session whitelist even though stdin is now EOF!
         assert_eq!(approver.decide(&shell_call, true), Decision::Allow);
+    }
+
+    #[test]
+    fn post_edit_diagnostics_injected_on_broken_file_write() {
+        let tmp =
+            std::env::temp_dir().join(format!("keel-lsp-turn-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let ctx = Context::new();
+        let _p_tools = ctx.mount(&tools::BuiltinToolsPlugin {
+            root: tmp.clone(),
+            landlock_enabled: false,
+        });
+        let _p_lsp = ctx.mount(&lsp::LspPlugin {
+            root: tmp.clone(),
+            extra_servers: std::collections::HashMap::new(),
+            auto_post_edit_check: true,
+        });
+
+        let llm = Script(Mutex::new(vec![
+            asst(
+                "Writing config",
+                vec![ToolCall {
+                    id: "w1".into(),
+                    name: "write_file".into(),
+                    args: serde_json::json!({
+                        "path": "config.json",
+                        "content": "{\"broken\": true, }"
+                    }),
+                }],
+            ),
+            asst("Fixed config", vec![]),
+        ]));
+
+        let _p_llm = ctx.mount(&LlmPlugin(Arc::new(llm)));
+        let _p_app = ctx.mount(&ApproverPlugin(Arc::new(AllowAll)));
+        let _p_log = ctx.mount(&SessionLogPlugin(SessionLog::none()));
+
+        let mut h = vec![];
+        let ans = Agent::run_from_context(&ctx, &mut h, "create config.json", 5).unwrap();
+        assert_eq!(ans, "Fixed config");
+
+        let tool_msg = h
+            .iter()
+            .find_map(|m| match m {
+                Message::Tool { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .expect("tool result must be recorded");
+        assert!(
+            tool_msg.contains("[diagnostics: 1 issue(s) detected in `config.json`]"),
+            "expected post-edit diagnostics in tool result, got: {tool_msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

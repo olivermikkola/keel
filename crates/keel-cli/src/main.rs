@@ -17,6 +17,7 @@ use keel_agent::{
     compaction::{ToolResultPrunerPlugin, WorkspaceContextPlugin, WorkspaceInstructions},
     epistemic::{EpistemicMemoryPlugin, EpistemicStore},
     guard::RepeatToolReminderPlugin,
+    lsp::{LspPlugin, LspService},
     mcp::{McpClient, McpPlugin, McpServerConfig},
     plan::PlanPlugin,
     provider::OpenAiCompat,
@@ -108,6 +109,7 @@ fn print_usage() {
   keel checkpoint <cmd>            git shadow snapshots (save, restore, list, diff)
   keel undo                        revert workspace to most recent snapshot
   keel mcp <list|call|test>        Model Context Protocol (MCP) client hub
+  keel lsp <check|def|hover>       Language Server & compiler diagnostics hub
   keel memory <cmd>                epistemic belief state (show, add-fact, set-hypothesis, clear)
   keel bench [filter] [--runs N]   run benchmark suite
 
@@ -424,6 +426,64 @@ fn cli_mcp(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result<()
     Ok(())
 }
 
+fn cli_lsp(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result<()> {
+    let json_mode = take_flag(&mut args, "--json");
+    let root = match root_opt {
+        Some(r) => std::fs::canonicalize(r)?,
+        None => std::env::current_dir()?,
+    };
+    let configs = LspService::load_config(&root);
+    let svc = LspService::new(root, configs, true);
+
+    let subcmd = args.first().map(String::as_str).unwrap_or("check");
+    match subcmd {
+        "check" | "diagnostics" => {
+            if args.len() < 2 {
+                eprintln!("usage: keel lsp check <file> [--json]");
+                std::process::exit(2);
+            }
+            let file = &args[1];
+            let items = svc.check_file(std::path::Path::new(file));
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&items)?);
+            } else if items.is_empty() {
+                println!("No diagnostics for {file}");
+            } else {
+                for item in items {
+                    println!("{}", item.format_compact());
+                }
+            }
+        }
+        "def" | "definition" => {
+            if args.len() < 4 {
+                eprintln!("usage: keel lsp def <file> <line> <column> [--json]");
+                std::process::exit(2);
+            }
+            let file = &args[1];
+            let line: usize = args[2].parse().unwrap_or(1);
+            let col: usize = args[3].parse().unwrap_or(1);
+            let res = svc.definition(file, line, col)?;
+            println!("{}", serde_json::to_string_pretty(&res)?);
+        }
+        "hover" => {
+            if args.len() < 4 {
+                eprintln!("usage: keel lsp hover <file> <line> <column> [--json]");
+                std::process::exit(2);
+            }
+            let file = &args[1];
+            let line: usize = args[2].parse().unwrap_or(1);
+            let col: usize = args[3].parse().unwrap_or(1);
+            let res = svc.hover(file, line, col)?;
+            println!("{}", serde_json::to_string_pretty(&res)?);
+        }
+        other => {
+            eprintln!("unknown lsp subcommand `{other}`. Available: check, def, hover");
+            std::process::exit(2);
+        }
+    }
+    Ok(())
+}
+
 fn cli_memory(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result<()> {
     let json_mode = take_flag(&mut args, "--json");
     let root = match root_opt {
@@ -539,6 +599,10 @@ fn main() -> anyhow::Result<()> {
         args.remove(0);
         return cli_mcp(args, root_opt);
     }
+    if args.first().map(String::as_str) == Some("lsp") {
+        args.remove(0);
+        return cli_lsp(args, root_opt);
+    }
     if args.first().map(String::as_str) == Some("memory") {
         args.remove(0);
         return cli_memory(args, root_opt);
@@ -652,6 +716,11 @@ fn main() -> anyhow::Result<()> {
         auto_rollback,
     });
     let _p_epistemic = ctx.mount(&EpistemicMemoryPlugin { root: root.clone() });
+    let _p_lsp = ctx.mount(&LspPlugin {
+        root: root.clone(),
+        extra_servers: std::collections::HashMap::new(),
+        auto_post_edit_check: true,
+    });
 
     let mut extra_servers = std::collections::HashMap::new();
     for spec in mcp_server_opts {
