@@ -23,8 +23,8 @@ use keel_agent::{
     sandbox::LandlockPlugin,
     subagent::SubagentPlugin,
     tools::BuiltinToolsPlugin,
-    Agent, AllowAll, Approver, ApproverPlugin, LlmPlugin, Message, ReadOnly, SessionLog,
-    SessionLogPlugin, ToolResult, ToolStart,
+    Agent, AllowAll, ApprovalPolicy, Approver, ApproverPlugin, InteractiveApprover, LlmPlugin,
+    Message, ReadOnly, SessionLog, SessionLogPlugin, ToolResult, ToolStart,
 };
 use keel_kernel::{Context, Plugin, Scope};
 use std::io::Write;
@@ -62,12 +62,14 @@ impl Plugin for JsonPrinter {
         s.on::<Chunk, _>(|c| match c {
             Chunk::Text(t) => {
                 println!("{}", serde_json::json!({ "type": "text", "content": t }));
+                let _ = std::io::stdout().flush();
             }
             Chunk::Reasoning(t) => {
                 println!(
                     "{}",
                     serde_json::json!({ "type": "reasoning", "content": t })
                 );
+                let _ = std::io::stdout().flush();
             }
         });
         s.on::<ToolStart, _>(|ts| {
@@ -79,6 +81,7 @@ impl Plugin for JsonPrinter {
                     "arguments": ts.0.args,
                 })
             );
+            let _ = std::io::stdout().flush();
         });
         s.on::<ToolResult, _>(|tr| {
             println!(
@@ -89,6 +92,7 @@ impl Plugin for JsonPrinter {
                     "output": tr.1,
                 })
             );
+            let _ = std::io::stdout().flush();
         });
     }
 }
@@ -550,6 +554,8 @@ fn main() -> anyhow::Result<()> {
     }
 
     let yolo = take_flag(&mut args, "--yolo");
+    let read_only = take_flag(&mut args, "--read-only");
+    let safety_mode_opt = take_opt(&mut args, "--safety-mode");
     let no_sandbox = take_flag(&mut args, "--no-sandbox");
     let dump_config = take_flag(&mut args, "--dump-config");
     let json_mode = take_flag(&mut args, "--json");
@@ -589,7 +595,7 @@ fn main() -> anyhow::Result<()> {
         enable_thinking: std::env::var("KEEL_THINKING").ok().map(|v| v != "0"),
     });
     if bench_mode {
-        return bench::run(llm.as_ref(), args.first().map(String::as_str), runs);
+        return bench::run(llm, args.first().map(String::as_str), runs);
     }
 
     let root = match root_opt {
@@ -601,8 +607,14 @@ fn main() -> anyhow::Result<()> {
         .unwrap_or_else(SessionLog::none);
     let approver: Arc<dyn Approver> = if yolo {
         Arc::new(AllowAll)
-    } else {
+    } else if read_only {
         Arc::new(ReadOnly)
+    } else {
+        let policy = safety_mode_opt
+            .or_else(|| std::env::var("KEEL_SAFETY_MODE").ok())
+            .map(|s| ApprovalPolicy::from_str_lossy(&s))
+            .unwrap_or(ApprovalPolicy::Standard);
+        Arc::new(InteractiveApprover::new(policy, json_mode))
     };
 
     // Everything is mounted as a plugin onto the kernel Context.

@@ -132,6 +132,141 @@ impl Approver for ReadOnly {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApprovalPolicy {
+    /// Prompt on stdin for all mutating tools.
+    Safe,
+    /// Auto-allow low/medium non-shell workspace edits; prompt on stdin for shell or sensitive paths.
+    Standard,
+    /// Allow all tools without prompting.
+    Yolo,
+    /// Strictly deny all mutating tools without reading stdin.
+    ReadOnly,
+}
+
+impl ApprovalPolicy {
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "yolo" | "allow-all" | "allow_all" => Self::Yolo,
+            "safe" | "strict" => Self::Safe,
+            "read-only" | "readonly" | "read_only" => Self::ReadOnly,
+            _ => Self::Standard,
+        }
+    }
+}
+
+/// Interactive HITL approver that reads `y` / `n` / `always` decisions from stdin
+/// (compatible with both terminal users and parent harnesses like Helm).
+pub struct InteractiveApprover {
+    pub policy: ApprovalPolicy,
+    pub json_mode: bool,
+    whitelisted: std::sync::Mutex<std::collections::HashSet<String>>,
+    reader: std::sync::Mutex<Option<Box<dyn std::io::BufRead + Send>>>,
+}
+
+impl InteractiveApprover {
+    pub fn new(policy: ApprovalPolicy, json_mode: bool) -> Self {
+        Self {
+            policy,
+            json_mode,
+            whitelisted: std::sync::Mutex::new(std::collections::HashSet::new()),
+            reader: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub fn with_reader(
+        policy: ApprovalPolicy,
+        json_mode: bool,
+        reader: Box<dyn std::io::BufRead + Send>,
+    ) -> Self {
+        Self {
+            policy,
+            json_mode,
+            whitelisted: std::sync::Mutex::new(std::collections::HashSet::new()),
+            reader: std::sync::Mutex::new(Some(reader)),
+        }
+    }
+
+    fn is_sensitive_target(call: &ToolCall) -> bool {
+        let target = call
+            .args
+            .get("path")
+            .or_else(|| call.args.get("file"))
+            .or_else(|| call.args.get("command"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        target.contains("/etc/")
+            || target.contains(".ssh/")
+            || target.contains(".bashrc")
+            || target.contains(".zshrc")
+            || target.contains(".profile")
+            || target.contains(".env")
+    }
+}
+
+impl Approver for InteractiveApprover {
+    fn decide(&self, call: &ToolCall, mutating: bool) -> Decision {
+        if !mutating || self.policy == ApprovalPolicy::Yolo {
+            return Decision::Allow;
+        }
+        if self.policy == ApprovalPolicy::ReadOnly {
+            return Decision::Deny(format!("`{}` denied: read-only policy", call.name));
+        }
+        if let Ok(wl) = self.whitelisted.lock() {
+            if wl.contains(&call.name) {
+                return Decision::Allow;
+            }
+        }
+        if self.policy == ApprovalPolicy::Standard
+            && call.name != "shell"
+            && !Self::is_sensitive_target(call)
+        {
+            return Decision::Allow;
+        }
+
+        if !self.json_mode {
+            eprint!(
+                "[keel] Approve tool call `{}` ({})? [y/N]: ",
+                call.name, call.args
+            );
+            let _ = std::io::stderr().flush();
+        }
+        let _ = std::io::stdout().flush();
+
+        let mut line = String::new();
+        let read_res = if let Ok(mut guard) = self.reader.lock() {
+            if let Some(r) = guard.as_mut() {
+                r.read_line(&mut line)
+            } else {
+                std::io::stdin().read_line(&mut line)
+            }
+        } else {
+            std::io::stdin().read_line(&mut line)
+        };
+
+        match read_res {
+            Ok(0) | Err(_) => Decision::Deny(format!(
+                "`{}` denied: awaiting approval on stdin (EOF)",
+                call.name
+            )),
+            Ok(_) => {
+                let ans = line.trim().to_ascii_lowercase();
+                if matches!(ans.as_str(), "y" | "yes" | "allow" | "ok") {
+                    Decision::Allow
+                } else if matches!(ans.as_str(), "a" | "always" | "allow_always") {
+                    if let Ok(mut wl) = self.whitelisted.lock() {
+                        wl.insert(call.name.clone());
+                    }
+                    Decision::Allow
+                } else {
+                    Decision::Deny(format!("`{}` denied by user", call.name))
+                }
+            }
+        }
+    }
+}
+
 /// Append-only JSONL log; the source of truth for a session.
 #[derive(Clone)]
 pub struct SessionLog {
@@ -379,7 +514,12 @@ impl Agent<'_> {
             .unwrap_or_default();
         let pre_turn_ckpt = if policy.auto_checkpoint || policy.auto_rollback {
             if let Some(mgr) = self.ctx.service::<checkpoint::CheckpointManager>() {
-                mgr.save("pre-turn automatic checkpoint").ok()
+                // Only auto-snapshot if already inside a git repository or if auto_rollback was explicitly requested
+                if mgr.root().join(".git").exists() || policy.auto_rollback {
+                    mgr.save("pre-turn automatic checkpoint").ok()
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -863,5 +1003,45 @@ mod tests {
         assert!(state.failed_attempts[0].failure_reason.contains("exit 1"));
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn interactive_approver_handles_stdin_decisions_and_standard_policy() {
+        let input = b"y\nn\na\n";
+        let approver = InteractiveApprover::with_reader(
+            ApprovalPolicy::Standard,
+            true,
+            Box::new(std::io::Cursor::new(&input[..])),
+        );
+
+        // 1. Non-shell workspace write auto-passes in Standard mode without consuming stdin
+        let edit_call = ToolCall {
+            id: "1".into(),
+            name: "edit_file".into(),
+            args: serde_json::json!({"path": "src/main.rs"}),
+        };
+        assert_eq!(approver.decide(&edit_call, true), Decision::Allow);
+
+        // 2. Sensitive target (.env) requires stdin approval -> consumes "y\n" -> Allow
+        let env_call = ToolCall {
+            id: "2".into(),
+            name: "write_file".into(),
+            args: serde_json::json!({"path": ".env"}),
+        };
+        assert_eq!(approver.decide(&env_call, true), Decision::Allow);
+
+        // 3. Shell tool requires stdin approval -> consumes "n\n" -> Deny
+        let shell_call = ToolCall {
+            id: "3".into(),
+            name: "shell".into(),
+            args: serde_json::json!({"command": "cargo test"}),
+        };
+        assert!(matches!(approver.decide(&shell_call, true), Decision::Deny(_)));
+
+        // 4. Next shell call -> consumes "a\n" (always) -> Allow and whitelists "shell"
+        assert_eq!(approver.decide(&shell_call, true), Decision::Allow);
+
+        // 5. Subsequent shell call auto-passes via session whitelist even though stdin is now EOF!
+        assert_eq!(approver.decide(&shell_call, true), Decision::Allow);
     }
 }

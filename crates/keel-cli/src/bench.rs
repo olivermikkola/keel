@@ -156,35 +156,12 @@ impl Plugin for ReasoningMeter {
     }
 }
 
-struct BorrowedLlm<'a>(&'a dyn Llm);
-impl Llm for BorrowedLlm<'_> {
-    fn complete(
-        &self,
-        messages: &[Message],
-        tools: &[keel_agent::ToolSpec],
-    ) -> anyhow::Result<Message> {
-        self.0.complete(messages, tools)
-    }
-    fn complete_streaming(
-        &self,
-        messages: &[Message],
-        tools: &[keel_agent::ToolSpec],
-        sink: &mut dyn FnMut(Chunk),
-    ) -> anyhow::Result<Message> {
-        self.0.complete_streaming(messages, tools, sink)
-    }
-}
-
-pub fn run(llm: &dyn Llm, filter: Option<&str>, runs: usize) -> anyhow::Result<()> {
+pub fn run(shared_llm: Arc<dyn Llm>, filter: Option<&str>, runs: usize) -> anyhow::Result<()> {
     let (mut passed, mut total) = (0, 0);
     println!(
         "{:<18} {:>6} {:>10} {:>9} {:>11}",
         "task", "pass", "avg steps", "avg secs", "~think tok"
     );
-    // Safety: BorrowedLlm only lives for the duration of each task turn inside this stack frame.
-    let shared_llm: Arc<dyn Llm> = unsafe {
-        std::mem::transmute::<Arc<dyn Llm + '_>, Arc<dyn Llm + 'static>>(Arc::new(BorrowedLlm(llm)))
-    };
 
     for t in tasks()
         .into_iter()
