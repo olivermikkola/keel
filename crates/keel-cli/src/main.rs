@@ -11,6 +11,7 @@ use keel_agent::{
     plan::PlanPlugin,
     provider::OpenAiCompat,
     sandbox::LandlockPlugin,
+    subagent::SubagentPlugin,
     tools::BuiltinToolsPlugin,
     Agent, AllowAll, Approver, ApproverPlugin, LlmPlugin, Message, ReadOnly, SessionLog,
     SessionLogPlugin,
@@ -108,6 +109,10 @@ fn main() -> anyhow::Result<()> {
     let _p_plan = ctx.mount(&PlanPlugin {
         root: root.clone(),
         verify_command: verify_cmd,
+    });
+    let _p_subagent = ctx.mount(&SubagentPlugin {
+        root: root.clone(),
+        landlock_enabled: !no_sandbox,
     });
 
     if dump_config {
