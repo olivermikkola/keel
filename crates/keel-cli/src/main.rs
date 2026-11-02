@@ -24,6 +24,7 @@ use keel_agent::{
     sandbox::LandlockPlugin,
     subagent::SubagentPlugin,
     tools::BuiltinToolsPlugin,
+    vfs::{TransactionalVfs, VfsMode, VfsPlugin},
     Agent, AllowAll, ApprovalPolicy, Approver, ApproverPlugin, InteractiveApprover, LlmPlugin,
     Message, ReadOnly, SessionLog, SessionLogPlugin, ToolResult, ToolStart,
 };
@@ -110,6 +111,7 @@ fn print_usage() {
   keel undo                        revert workspace to most recent snapshot
   keel mcp <list|call|test>        Model Context Protocol (MCP) client hub
   keel lsp <check|def|hover>       Language Server & compiler diagnostics hub
+  keel vfs <status|diff|commit|rollback> transactional CoW / shadow VFS control
   keel memory <cmd>                epistemic belief state (show, add-fact, set-hypothesis, clear)
   keel bench [filter] [--runs N]   run benchmark suite
 
@@ -569,6 +571,73 @@ fn cli_memory(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result
     Ok(())
 }
 
+fn cli_vfs(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result<()> {
+    let json_mode = take_flag(&mut args, "--json");
+    let root = match root_opt {
+        Some(r) => std::fs::canonicalize(r)?,
+        None => std::env::current_dir()?,
+    };
+    let vfs = TransactionalVfs::new(root, VfsMode::MaterializedCow, true);
+
+    let subcmd = args.first().map(String::as_str).unwrap_or("status");
+    match subcmd {
+        "status" => {
+            let items = vfs.status();
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&items)?);
+            } else if items.is_empty() {
+                println!("No uncommitted VFS transaction changes.");
+            } else {
+                for i in items {
+                    println!(
+                        "  {} [{}] ({}B -> {}B)",
+                        i.path, i.status, i.original_bytes, i.staged_bytes
+                    );
+                }
+            }
+        }
+        "diff" => {
+            let d = vfs.diff();
+            if json_mode {
+                println!("{}", serde_json::json!({ "diff": d }));
+            } else if d.is_empty() {
+                println!("No diff in active VFS transaction.");
+            } else {
+                print!("{d}");
+            }
+        }
+        "commit" => {
+            let rep = vfs.commit()?;
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&rep)?);
+            } else {
+                println!(
+                    "Committed {} file(s) in VFS transaction.",
+                    rep.committed_files
+                );
+            }
+        }
+        "rollback" => {
+            let rep = vfs.rollback()?;
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&rep)?);
+            } else {
+                println!(
+                    "Rolled back VFS transaction (restored {} file(s), removed {} newly created file(s)).",
+                    rep.restored_files, rep.removed_files
+                );
+            }
+        }
+        other => {
+            eprintln!(
+                "unknown vfs subcommand `{other}`. Available: status, diff, commit, rollback"
+            );
+            std::process::exit(2);
+        }
+    }
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -603,6 +672,10 @@ fn main() -> anyhow::Result<()> {
         args.remove(0);
         return cli_lsp(args, root_opt);
     }
+    if args.first().map(String::as_str) == Some("vfs") {
+        args.remove(0);
+        return cli_vfs(args, root_opt);
+    }
     if args.first().map(String::as_str) == Some("memory") {
         args.remove(0);
         return cli_memory(args, root_opt);
@@ -619,6 +692,7 @@ fn main() -> anyhow::Result<()> {
 
     let yolo = take_flag(&mut args, "--yolo");
     let read_only = take_flag(&mut args, "--read-only");
+    let shadow_vfs = take_flag(&mut args, "--shadow");
     let safety_mode_opt = take_opt(&mut args, "--safety-mode");
     let no_sandbox = take_flag(&mut args, "--no-sandbox");
     let dump_config = take_flag(&mut args, "--dump-config");
@@ -719,7 +793,16 @@ fn main() -> anyhow::Result<()> {
     let _p_lsp = ctx.mount(&LspPlugin {
         root: root.clone(),
         extra_servers: std::collections::HashMap::new(),
-        auto_post_edit_check: true,
+        auto_post_edit_check: !shadow_vfs,
+    });
+    let _p_vfs = ctx.mount(&VfsPlugin {
+        root: root.clone(),
+        mode: if shadow_vfs {
+            VfsMode::ShadowMemory
+        } else {
+            VfsMode::MaterializedCow
+        },
+        persist: !shadow_vfs,
     });
 
     let mut extra_servers = std::collections::HashMap::new();

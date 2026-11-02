@@ -23,6 +23,7 @@ pub mod provider;
 pub mod sandbox;
 pub mod subagent;
 pub mod tools;
+pub mod vfs;
 
 use anyhow::Result;
 use keel_kernel::{Context, Plugin, Scope};
@@ -611,6 +612,9 @@ impl Agent<'_> {
             }
         }
         if policy.auto_rollback {
+            if let Some(vfs_svc) = self.ctx.service::<Arc<vfs::TransactionalVfs>>() {
+                let _ = vfs_svc.rollback();
+            }
             if let Some(ckpt) = &pre_turn_ckpt {
                 if let Some(mgr) = self.ctx.service::<checkpoint::CheckpointManager>() {
                     let _ = mgr.restore(&ckpt.id);
@@ -633,6 +637,20 @@ impl Agent<'_> {
                 format!("denied: {why}")
             }
             Decision::Allow => {
+                let vfs_svc = self.ctx.service::<Arc<vfs::TransactionalVfs>>();
+                if let Some(ref v) = vfs_svc {
+                    if let Some(shadow_res) = v.execute_shadow_tool(&call.name, &call.args) {
+                        let out = shadow_res.unwrap_or_else(|e| format!("error: {e:#}"));
+                        self.ctx.emit(&ToolResult(call.id.clone(), out.clone()));
+                        return out;
+                    }
+                    if matches!(call.name.as_str(), "write_file" | "edit_file" | "patch_file") {
+                        if let Some(rel_path) = call.args.get("path").and_then(|val| val.as_str()) {
+                            let _ = v.capture_pre_image(rel_path);
+                        }
+                    }
+                }
+
                 // Tool errors go back to the model as text; they never abort the turn.
                 let mut out = tool
                     .run(&call.args)
@@ -641,6 +659,9 @@ impl Agent<'_> {
                     && matches!(call.name.as_str(), "write_file" | "edit_file" | "patch_file")
                 {
                     if let Some(rel_path) = call.args.get("path").and_then(|v| v.as_str()) {
+                        if let Some(ref v) = vfs_svc {
+                            let _ = v.sync_post_image(rel_path);
+                        }
                         if let Some(lsp_svc) = self.ctx.service::<Arc<lsp::LspService>>() {
                             if let Some(diag_feedback) = lsp_svc.post_edit_feedback(rel_path) {
                                 out.push_str("\n\n");
