@@ -1,6 +1,8 @@
 //! `keel "prompt"` - one-shot headless run. `keel bench [filter]` - run the benchmark tasks.
 //! `keel patch <file> [diff]` - apply unified diff or search/replace hunks (supports stdin).
 //! `keel edit <file> --old <str> --new <str>` - surgical fuzzy replacement.
+//! `keel checkpoint <save|restore|list|diff>` - git shadow snapshots and instant rollback.
+//! `keel undo` - revert workspace to most recent snapshot.
 //!
 //! Env: KEEL_THINKING=0 disables model thinking (Qwen templates). KEEL_BASE_URL (default https://api.deepseek.com), KEEL_API_KEY (or DEEPSEEK_API_KEY),
 //! KEEL_MODEL (default deepseek-chat). Flags: --yolo (allow mutating tools), --no-sandbox (disable Landlock), --log <file>.
@@ -9,6 +11,7 @@
 use anyhow::Context as _;
 use keel_agent::Chunk;
 use keel_agent::{
+    checkpoint::{CheckpointManager, CheckpointPlugin},
     compaction::{ToolResultPrunerPlugin, WorkspaceContextPlugin, WorkspaceInstructions},
     guard::RepeatToolReminderPlugin,
     plan::PlanPlugin,
@@ -74,6 +77,8 @@ fn print_usage() {
   keel repl [options]              interactive multi-turn REPL
   keel patch <file> [diff]         apply diff or search/replace hunks (supports stdin)
   keel edit <file> --old S --new S surgical fuzzy replacement
+  keel checkpoint <cmd>            git shadow snapshots (save, restore, list, diff)
+  keel undo                        revert workspace to most recent snapshot
   keel bench [filter] [--runs N]   run benchmark suite
 
 options:
@@ -81,6 +86,7 @@ options:
   --dry-run                        preview patch/edit without writing
   --yolo                           allow mutating tools (write/edit/patch/shell)
   --no-sandbox                     disable Linux Landlock sandbox
+  --auto-rollback                  automatically revert workspace if verification fails
   --verify <cmd>                   enforce verification command gate
   --root <dir>                     workspace root directory
   --log <file>                     session JSONL log path
@@ -181,6 +187,93 @@ fn cli_edit(mut args: Vec<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn cli_checkpoint(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result<()> {
+    let json_mode = take_flag(&mut args, "--json");
+    let root = match root_opt {
+        Some(r) => std::fs::canonicalize(r)?,
+        None => std::env::current_dir()?,
+    };
+    let mgr = CheckpointManager::new(root);
+
+    let subcmd = args.first().map(String::as_str).unwrap_or("list");
+    match subcmd {
+        "save" => {
+            let desc = if args.len() > 1 {
+                args[1..].join(" ")
+            } else {
+                "manual checkpoint".into()
+            };
+            let ckpt = mgr.save(&desc)?;
+            if json_mode {
+                println!("{}", serde_json::to_string(&ckpt)?);
+            } else {
+                println!("Saved checkpoint {} ({})", ckpt.id, ckpt.description);
+            }
+        }
+        "restore" => {
+            let target = if args.len() > 1 { &args[1] } else { "latest" };
+            let rep = mgr.restore(target)?;
+            if json_mode {
+                println!("{}", serde_json::to_string(&rep)?);
+            } else {
+                println!(
+                    "Restored checkpoint {} (restored {} files, removed {} newly created files)",
+                    rep.checkpoint_id, rep.restored_files, rep.removed_files
+                );
+            }
+        }
+        "diff" => {
+            let target = args.get(1).map(String::as_str);
+            let diff_out = mgr.diff(target)?;
+            print!("{diff_out}");
+        }
+        "list" => {
+            let list = mgr.list()?;
+            if json_mode {
+                println!("{}", serde_json::to_string(&list)?);
+            } else if list.is_empty() {
+                println!("No checkpoints recorded yet.");
+            } else {
+                println!("Checkpoints ({}):", list.len());
+                for c in list {
+                    println!(
+                        "  - {} [{}] ({})",
+                        c.id,
+                        c.commit_hash.chars().take(7).collect::<String>(),
+                        c.description
+                    );
+                }
+            }
+        }
+        other => {
+            eprintln!(
+                "unknown checkpoint subcommand `{other}`. Available: save, restore, diff, list"
+            );
+            std::process::exit(2);
+        }
+    }
+    Ok(())
+}
+
+fn cli_undo(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result<()> {
+    let json_mode = take_flag(&mut args, "--json");
+    let root = match root_opt {
+        Some(r) => std::fs::canonicalize(r)?,
+        None => std::env::current_dir()?,
+    };
+    let mgr = CheckpointManager::new(root);
+    let rep = mgr.undo()?;
+    if json_mode {
+        println!("{}", serde_json::to_string(&rep)?);
+    } else {
+        println!(
+            "Restored checkpoint {} (restored {} files, removed {} newly created files)",
+            rep.checkpoint_id, rep.restored_files, rep.removed_files
+        );
+    }
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -189,6 +282,8 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let root_opt = take_opt(&mut args, "--root");
+
     if args.first().map(String::as_str) == Some("patch") {
         args.remove(0);
         return cli_patch(args);
@@ -196,6 +291,14 @@ fn main() -> anyhow::Result<()> {
     if args.first().map(String::as_str) == Some("edit") {
         args.remove(0);
         return cli_edit(args);
+    }
+    if args.first().map(String::as_str) == Some("checkpoint") {
+        args.remove(0);
+        return cli_checkpoint(args, root_opt);
+    }
+    if args.first().map(String::as_str) == Some("undo") {
+        args.remove(0);
+        return cli_undo(args, root_opt);
     }
 
     let mut interactive = take_flag(&mut args, "-i") || take_flag(&mut args, "--interactive");
@@ -211,9 +314,9 @@ fn main() -> anyhow::Result<()> {
     let no_sandbox = take_flag(&mut args, "--no-sandbox");
     let dump_config = take_flag(&mut args, "--dump-config");
     let json_mode = take_flag(&mut args, "--json");
+    let auto_rollback = take_flag(&mut args, "--auto-rollback");
     let mut log_opt = take_opt(&mut args, "--log");
     let resume_opt = take_opt(&mut args, "--resume");
-    let root_opt = take_opt(&mut args, "--root");
     let verify_cmd = take_opt(&mut args, "--verify");
     let runs: usize = take_opt(&mut args, "--runs")
         .and_then(|r| r.parse().ok())
@@ -285,6 +388,11 @@ fn main() -> anyhow::Result<()> {
         root: root.clone(),
         landlock_enabled: !no_sandbox,
     });
+    let _p_ckpt = ctx.mount(&CheckpointPlugin {
+        root: root.clone(),
+        auto_checkpoint: true,
+        auto_rollback,
+    });
 
     if dump_config {
         println!("# keel composed plugin tree (root: {})", root.display());
@@ -320,7 +428,7 @@ fn main() -> anyhow::Result<()> {
 
     if prompt.is_empty() || interactive {
         println!("keel v0.0.1 (interactive REPL, root: {})", root.display());
-        println!("Commands: /clear, /history, exit, quit.\n");
+        println!("Commands: /undo, /checkpoint, /clear, /history, exit, quit.\n");
         let stdin = std::io::stdin();
         loop {
             print!("keel> ");
@@ -336,6 +444,46 @@ fn main() -> anyhow::Result<()> {
             }
             if matches!(trimmed, "exit" | "quit") {
                 break;
+            }
+            if trimmed == "/undo" {
+                if let Some(mgr) = ctx.service::<CheckpointManager>() {
+                    match mgr.undo() {
+                        Ok(rep) => {
+                            println!(
+                                "Restored checkpoint {} (restored {} files, removed {} newly created files).\n",
+                                rep.checkpoint_id, rep.restored_files, rep.removed_files
+                            );
+                        }
+                        Err(e) => eprintln!("Failed to undo: {e:#}\n"),
+                    }
+                } else {
+                    println!("Checkpoint manager is not active.\n");
+                }
+                continue;
+            }
+            if trimmed == "/checkpoint" || trimmed == "/checkpoints" {
+                if let Some(mgr) = ctx.service::<CheckpointManager>() {
+                    match mgr.list() {
+                        Ok(list) => {
+                            if list.is_empty() {
+                                println!("No checkpoints recorded yet.\n");
+                            } else {
+                                println!("Checkpoints ({}):", list.len());
+                                for c in list {
+                                    println!(
+                                        "  - {} [{}] ({})",
+                                        c.id,
+                                        c.commit_hash.chars().take(7).collect::<String>(),
+                                        c.description
+                                    );
+                                }
+                                println!();
+                            }
+                        }
+                        Err(e) => eprintln!("Failed to list checkpoints: {e:#}\n"),
+                    }
+                }
+                continue;
             }
             if trimmed == "/clear" {
                 history.truncate(1);
