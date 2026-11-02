@@ -162,6 +162,43 @@ impl SessionLog {
         )?;
         Ok(())
     }
+
+    /// Read an existing JSONL session log file and reconstruct previous conversation messages.
+    pub fn read_history(path: impl AsRef<std::path::Path>) -> Result<Vec<Message>> {
+        use std::io::BufRead;
+        let file = std::fs::File::open(path)?;
+        let reader = std::io::BufReader::new(file);
+        let mut messages = Vec::new();
+        for line in reader.lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(val) = serde_json::from_str::<Value>(&line) {
+                let kind = val["kind"].as_str().unwrap_or("");
+                let data = &val["data"];
+                match kind {
+                    "user" => {
+                        if let Some(t) = data["text"].as_str() {
+                            messages.push(Message::User { text: t.into() });
+                        }
+                    }
+                    "assistant" => {
+                        if let Ok(msg) = serde_json::from_value::<Message>(data.clone()) {
+                            messages.push(msg);
+                        }
+                    }
+                    "tool" => {
+                        let id = data["id"].as_str().unwrap_or_default().to_string();
+                        let content = data["content"].as_str().unwrap_or_default().to_string();
+                        messages.push(Message::Tool { id, content });
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(messages)
+    }
 }
 
 // ---- Kernel Plugins for mounting standard services ----
@@ -612,5 +649,41 @@ mod tests {
             |m| matches!(m, Message::User { text } if text.contains("[verification gate failed]"))
         ));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn session_log_append_and_read_history_roundtrip() {
+        let tmp = std::env::temp_dir().join(format!("keel-log-test-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        let log = SessionLog::file(&tmp);
+
+        log.append("user", serde_json::json!({ "text": "hello world" }))
+            .unwrap();
+        log.append(
+            "assistant",
+            serde_json::to_value(Message::Assistant {
+                text: "hi there".into(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "echo".into(),
+                    args: serde_json::json!({ "s": "ok" }),
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        log.append("tool", serde_json::json!({ "id": "c1", "content": "ok" }))
+            .unwrap();
+
+        let history = SessionLog::read_history(&tmp).unwrap();
+        assert_eq!(history.len(), 3);
+        assert!(matches!(&history[0], Message::User { text } if text == "hello world"));
+        assert!(
+            matches!(&history[1], Message::Assistant { text, tool_calls } if text == "hi there" && tool_calls.len() == 1)
+        );
+        assert!(
+            matches!(&history[2], Message::Tool { id, content } if id == "c1" && content == "ok")
+        );
+        let _ = std::fs::remove_file(&tmp);
     }
 }
