@@ -3,6 +3,7 @@
 //! `keel edit <file> --old <str> --new <str>` - surgical fuzzy replacement.
 //! `keel checkpoint <save|restore|list|diff>` - git shadow snapshots and instant rollback.
 //! `keel undo` - revert workspace to most recent snapshot.
+//! `keel mcp <list|call|test>` - Model Context Protocol (MCP) client hub.
 //!
 //! Env: KEEL_THINKING=0 disables model thinking (Qwen templates). KEEL_BASE_URL (default https://api.deepseek.com), KEEL_API_KEY (or DEEPSEEK_API_KEY),
 //! KEEL_MODEL (default deepseek-chat). Flags: --yolo (allow mutating tools), --no-sandbox (disable Landlock), --log <file>.
@@ -14,6 +15,7 @@ use keel_agent::{
     checkpoint::{CheckpointManager, CheckpointPlugin},
     compaction::{ToolResultPrunerPlugin, WorkspaceContextPlugin, WorkspaceInstructions},
     guard::RepeatToolReminderPlugin,
+    mcp::{McpClient, McpPlugin, McpServerConfig},
     plan::PlanPlugin,
     provider::OpenAiCompat,
     sandbox::LandlockPlugin,
@@ -79,6 +81,7 @@ fn print_usage() {
   keel edit <file> --old S --new S surgical fuzzy replacement
   keel checkpoint <cmd>            git shadow snapshots (save, restore, list, diff)
   keel undo                        revert workspace to most recent snapshot
+  keel mcp <list|call|test>        Model Context Protocol (MCP) client hub
   keel bench [filter] [--runs N]   run benchmark suite
 
 options:
@@ -88,6 +91,7 @@ options:
   --no-sandbox                     disable Linux Landlock sandbox
   --auto-rollback                  automatically revert workspace if verification fails
   --verify <cmd>                   enforce verification command gate
+  --mcp-server <name=cmd...>       attach ad-hoc stdio MCP server
   --root <dir>                     workspace root directory
   --log <file>                     session JSONL log path
   --resume <file>                  resume session from previous JSONL log
@@ -274,6 +278,125 @@ fn cli_undo(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result<(
     Ok(())
 }
 
+fn cli_mcp(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result<()> {
+    let json_mode = take_flag(&mut args, "--json");
+    let root = match root_opt {
+        Some(r) => std::fs::canonicalize(r)?,
+        None => std::env::current_dir()?,
+    };
+
+    let subcmd = args.first().map(String::as_str).unwrap_or("list");
+    match subcmd {
+        "list" => {
+            let servers = McpPlugin::load_config(&root);
+            if servers.is_empty() {
+                if json_mode {
+                    println!("[]");
+                } else {
+                    println!("No MCP servers configured in .keel/mcp.json");
+                }
+                return Ok(());
+            }
+
+            let mut all_tools = Vec::new();
+            for (name, cfg) in &servers {
+                match McpClient::spawn(name, cfg) {
+                    Ok(client) => {
+                        for t in client.tools() {
+                            all_tools.push(serde_json::json!({
+                                "server": name,
+                                "name": t.name,
+                                "exposed_name": format!("mcp__{}__{}", name, t.name),
+                                "description": t.description,
+                                "input_schema": t.input_schema,
+                            }));
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("warning: failed to connect to MCP server `{name}`: {e:#}");
+                    }
+                }
+            }
+
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&all_tools)?);
+            } else if all_tools.is_empty() {
+                println!("No tools exposed by configured MCP servers.");
+            } else {
+                println!("MCP Tools ({}):", all_tools.len());
+                for t in all_tools {
+                    println!(
+                        "  - {} (server: {}) - {}",
+                        t["exposed_name"].as_str().unwrap_or(""),
+                        t["server"].as_str().unwrap_or(""),
+                        t["description"].as_str().unwrap_or("")
+                    );
+                }
+            }
+        }
+        "call" => {
+            if args.len() < 3 {
+                eprintln!("usage: keel mcp call <server> <tool> '<json_arguments>' [--json]");
+                std::process::exit(2);
+            }
+            let server_name = &args[1];
+            let tool_name = &args[2];
+            let raw_args = if args.len() > 3 { &args[3] } else { "{}" };
+            let parsed_args: serde_json::Value = serde_json::from_str(raw_args)
+                .with_context(|| format!("parsing JSON arguments `{raw_args}`"))?;
+
+            let servers = McpPlugin::load_config(&root);
+            let cfg = servers
+                .get(server_name)
+                .with_context(|| format!("server `{server_name}` not found in .keel/mcp.json"))?;
+
+            let client = McpClient::spawn(server_name, cfg)?;
+            let res = client.call_tool(tool_name, &parsed_args)?;
+
+            if json_mode {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "ok",
+                        "server": server_name,
+                        "tool": tool_name,
+                        "result": res,
+                    })
+                );
+            } else {
+                println!("{res}");
+            }
+        }
+        "test" => {
+            if args.len() < 2 {
+                eprintln!("usage: keel mcp test <command> [args...]");
+                std::process::exit(2);
+            }
+            let cmd = &args[1];
+            let cmd_args = args[2..].to_vec();
+            let cfg = McpServerConfig {
+                command: cmd.clone(),
+                args: cmd_args,
+                env: std::collections::HashMap::new(),
+            };
+            println!("Testing MCP handshake with `{cmd}`...");
+            let client = McpClient::spawn("test", &cfg)?;
+            println!(
+                "Handshake successful! Discovered {} tools:",
+                client.tools().len()
+            );
+            for t in client.tools() {
+                println!("  - {}: {}", t.name, t.description.as_deref().unwrap_or(""));
+            }
+        }
+        other => {
+            eprintln!("unknown mcp subcommand `{other}`. Available: list, call, test");
+            std::process::exit(2);
+        }
+    }
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -300,6 +423,10 @@ fn main() -> anyhow::Result<()> {
         args.remove(0);
         return cli_undo(args, root_opt);
     }
+    if args.first().map(String::as_str) == Some("mcp") {
+        args.remove(0);
+        return cli_mcp(args, root_opt);
+    }
 
     let mut interactive = take_flag(&mut args, "-i") || take_flag(&mut args, "--interactive");
     if args.first().map(String::as_str) == Some("repl") {
@@ -315,6 +442,7 @@ fn main() -> anyhow::Result<()> {
     let dump_config = take_flag(&mut args, "--dump-config");
     let json_mode = take_flag(&mut args, "--json");
     let auto_rollback = take_flag(&mut args, "--auto-rollback");
+    let mcp_server_opts = take_all_opts(&mut args, "--mcp-server");
     let mut log_opt = take_opt(&mut args, "--log");
     let resume_opt = take_opt(&mut args, "--resume");
     let verify_cmd = take_opt(&mut args, "--verify");
@@ -392,6 +520,27 @@ fn main() -> anyhow::Result<()> {
         root: root.clone(),
         auto_checkpoint: true,
         auto_rollback,
+    });
+
+    let mut extra_servers = std::collections::HashMap::new();
+    for spec in mcp_server_opts {
+        if let Some((name, cmd_line)) = spec.split_once('=') {
+            let parts: Vec<String> = cmd_line.split_whitespace().map(String::from).collect();
+            if !parts.is_empty() {
+                extra_servers.insert(
+                    name.to_string(),
+                    McpServerConfig {
+                        command: parts[0].clone(),
+                        args: parts[1..].to_vec(),
+                        env: std::collections::HashMap::new(),
+                    },
+                );
+            }
+        }
+    }
+    let _p_mcp = ctx.mount(&McpPlugin {
+        root: root.clone(),
+        extra_servers,
     });
 
     if dump_config {
@@ -551,4 +700,12 @@ fn take_opt(a: &mut Vec<String>, f: &str) -> Option<String> {
     let v = a.remove(i + 1);
     a.remove(i);
     Some(v)
+}
+
+fn take_all_opts(a: &mut Vec<String>, f: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    while let Some(v) = take_opt(a, f) {
+        out.push(v);
+    }
+    out
 }
