@@ -22,6 +22,7 @@ use keel_agent::{
     plan::PlanPlugin,
     provider::OpenAiCompat,
     sandbox::LandlockPlugin,
+    speculate::{SpeculatePlugin, SpeculationConfig, SpeculationEngine},
     subagent::SubagentPlugin,
     tools::BuiltinToolsPlugin,
     vfs::{TransactionalVfs, VfsMode, VfsPlugin},
@@ -112,6 +113,7 @@ fn print_usage() {
   keel mcp <list|call|test>        Model Context Protocol (MCP) client hub
   keel lsp <check|def|hover>       Language Server & compiler diagnostics hub
   keel vfs <status|diff|commit|rollback> transactional CoW / shadow VFS control
+  keel speculate "prompt" [opts]   parallel best-of-N speculative sandbox tournament
   keel memory <cmd>                epistemic belief state (show, add-fact, set-hypothesis, clear)
   keel bench [filter] [--runs N]   run benchmark suite
 
@@ -705,6 +707,14 @@ fn main() -> anyhow::Result<()> {
     let runs: usize = take_opt(&mut args, "--runs")
         .and_then(|r| r.parse().ok())
         .unwrap_or(1);
+    let candidates_opt: usize = take_opt(&mut args, "--candidates")
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(2);
+    let apply_winner = take_flag(&mut args, "--apply");
+    let speculate_mode = args.first().map(String::as_str) == Some("speculate");
+    if speculate_mode {
+        args.remove(0);
+    }
     let bench_mode = args.first().map(String::as_str) == Some("bench");
     if bench_mode {
         args.remove(0);
@@ -740,6 +750,45 @@ fn main() -> anyhow::Result<()> {
         Some(r) => std::fs::canonicalize(r)?,
         None => std::env::current_dir()?,
     };
+    if speculate_mode {
+        if prompt.trim().is_empty() {
+            eprintln!(
+                "usage: keel speculate \"<prompt>\" [--candidates N] [--verify \"<cmd>\"] [--apply] [--json]"
+            );
+            std::process::exit(2);
+        }
+        let engine = SpeculationEngine {
+            config: SpeculationConfig {
+                root,
+                candidates: candidates_opt,
+                max_steps: 20,
+                verify_command: verify_cmd,
+                apply_winner: apply_winner || yolo,
+                landlock_enabled: !no_sandbox,
+            },
+            llm,
+        };
+        let rep = engine.run(&prompt)?;
+        if json_mode {
+            println!("{}", serde_json::to_string_pretty(&rep)?);
+        } else {
+            println!(
+                "Speculation complete ({} candidates, winner: {:?}, applied: {}):",
+                rep.candidates_run, rep.winner_id, rep.applied_to_workspace
+            );
+            for c in &rep.candidates {
+                println!(
+                    "  [Candidate #{}] verified={} steps={} time={}ms files={:?}",
+                    c.candidate_id,
+                    c.verification_passed,
+                    c.steps,
+                    c.elapsed_ms,
+                    c.modified_files
+                );
+            }
+        }
+        return Ok(());
+    }
     let session = log_opt
         .map(SessionLog::file)
         .unwrap_or_else(SessionLog::none);
@@ -781,6 +830,10 @@ fn main() -> anyhow::Result<()> {
         verify_command: verify_cmd,
     });
     let _p_subagent = ctx.mount(&SubagentPlugin {
+        root: root.clone(),
+        landlock_enabled: !no_sandbox,
+    });
+    let _p_speculate = ctx.mount(&SpeculatePlugin {
         root: root.clone(),
         landlock_enabled: !no_sandbox,
     });
