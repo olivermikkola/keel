@@ -240,6 +240,7 @@ impl Plugin for SessionLogPlugin {
 // ---- lifecycle events (observable via Context::emit) ----
 pub struct TurnStart;
 pub struct StepStart(pub usize);
+pub struct ToolStart(pub ToolCall);
 pub struct ToolDenied(pub ToolCall);
 pub struct ToolResult(pub String, pub String);
 pub struct TurnEnd(pub String);
@@ -453,6 +454,7 @@ impl Agent<'_> {
                 return Ok(text);
             }
             for call in tool_calls {
+                self.ctx.emit(&ToolStart(call.clone()));
                 let mut out = self.execute(&call);
                 if let Some(guard) = self.ctx.service::<guard::RepeatToolGuard>() {
                     if let Some(reminder) = guard.observe(&call) {
