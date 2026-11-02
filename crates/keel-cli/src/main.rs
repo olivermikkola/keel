@@ -4,6 +4,7 @@
 //! `keel checkpoint <save|restore|list|diff>` - git shadow snapshots and instant rollback.
 //! `keel undo` - revert workspace to most recent snapshot.
 //! `keel mcp <list|call|test>` - Model Context Protocol (MCP) client hub.
+//! `keel memory <show|add-fact|set-hypothesis|record-failure|clear>` - epistemic working memory.
 //!
 //! Env: KEEL_THINKING=0 disables model thinking (Qwen templates). KEEL_BASE_URL (default https://api.deepseek.com), KEEL_API_KEY (or DEEPSEEK_API_KEY),
 //! KEEL_MODEL (default deepseek-chat). Flags: --yolo (allow mutating tools), --no-sandbox (disable Landlock), --log <file>.
@@ -14,6 +15,7 @@ use keel_agent::Chunk;
 use keel_agent::{
     checkpoint::{CheckpointManager, CheckpointPlugin},
     compaction::{ToolResultPrunerPlugin, WorkspaceContextPlugin, WorkspaceInstructions},
+    epistemic::{EpistemicMemoryPlugin, EpistemicStore},
     guard::RepeatToolReminderPlugin,
     mcp::{McpClient, McpPlugin, McpServerConfig},
     plan::PlanPlugin,
@@ -82,6 +84,7 @@ fn print_usage() {
   keel checkpoint <cmd>            git shadow snapshots (save, restore, list, diff)
   keel undo                        revert workspace to most recent snapshot
   keel mcp <list|call|test>        Model Context Protocol (MCP) client hub
+  keel memory <cmd>                epistemic belief state (show, add-fact, set-hypothesis, clear)
   keel bench [filter] [--runs N]   run benchmark suite
 
 options:
@@ -397,6 +400,91 @@ fn cli_mcp(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result<()
     Ok(())
 }
 
+fn cli_memory(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result<()> {
+    let json_mode = take_flag(&mut args, "--json");
+    let root = match root_opt {
+        Some(r) => std::fs::canonicalize(r)?,
+        None => std::env::current_dir()?,
+    };
+    let persist = EpistemicMemoryPlugin::persist_file(&root);
+    let store = EpistemicStore::new(Some(persist));
+
+    let subcmd = args.first().map(String::as_str).unwrap_or("show");
+    match subcmd {
+        "show" => {
+            let state = store.get();
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&state)?);
+            } else if state.is_empty() {
+                println!("Epistemic working memory is currently empty.");
+            } else {
+                print!("{}", state.render_markdown());
+            }
+        }
+        "add-fact" => {
+            if args.len() < 2 {
+                eprintln!("usage: keel memory add-fact \"<fact>\" [--json]");
+                std::process::exit(2);
+            }
+            let fact = args[1..].join(" ");
+            store.add_fact(&fact)?;
+            if json_mode {
+                println!("{}", serde_json::json!({ "status": "ok", "fact": fact }));
+            } else {
+                println!("Recorded fact: {fact}");
+            }
+        }
+        "set-hypothesis" => {
+            if args.len() < 2 {
+                eprintln!("usage: keel memory set-hypothesis \"<hypothesis>\" [--json]");
+                std::process::exit(2);
+            }
+            let hyp = args[1..].join(" ");
+            store.set_hypothesis(Some(hyp.clone()))?;
+            if json_mode {
+                println!(
+                    "{}",
+                    serde_json::json!({ "status": "ok", "hypothesis": hyp })
+                );
+            } else {
+                println!("Updated hypothesis: {hyp}");
+            }
+        }
+        "record-failure" => {
+            if args.len() < 3 {
+                eprintln!("usage: keel memory record-failure \"<approach>\" \"<reason>\" [--json]");
+                std::process::exit(2);
+            }
+            let approach = &args[1];
+            let reason = args[2..].join(" ");
+            store.record_failure(approach, &reason)?;
+            if json_mode {
+                println!(
+                    "{}",
+                    serde_json::json!({ "status": "ok", "approach": approach, "reason": reason })
+                );
+            } else {
+                println!("Logged failed attempt: {approach} -> {reason}");
+            }
+        }
+        "clear" => {
+            store.clear()?;
+            if json_mode {
+                println!("{}", serde_json::json!({ "status": "ok", "cleared": true }));
+            } else {
+                println!("Epistemic memory cleared.");
+            }
+        }
+        other => {
+            eprintln!(
+                "unknown memory subcommand `{other}`. Available: show, add-fact, set-hypothesis, record-failure, clear"
+            );
+            std::process::exit(2);
+        }
+    }
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -426,6 +514,10 @@ fn main() -> anyhow::Result<()> {
     if args.first().map(String::as_str) == Some("mcp") {
         args.remove(0);
         return cli_mcp(args, root_opt);
+    }
+    if args.first().map(String::as_str) == Some("memory") {
+        args.remove(0);
+        return cli_memory(args, root_opt);
     }
 
     let mut interactive = take_flag(&mut args, "-i") || take_flag(&mut args, "--interactive");
@@ -521,6 +613,7 @@ fn main() -> anyhow::Result<()> {
         auto_checkpoint: true,
         auto_rollback,
     });
+    let _p_epistemic = ctx.mount(&EpistemicMemoryPlugin { root: root.clone() });
 
     let mut extra_servers = std::collections::HashMap::new();
     for spec in mcp_server_opts {
@@ -577,7 +670,7 @@ fn main() -> anyhow::Result<()> {
 
     if prompt.is_empty() || interactive {
         println!("keel v0.0.1 (interactive REPL, root: {})", root.display());
-        println!("Commands: /undo, /checkpoint, /clear, /history, exit, quit.\n");
+        println!("Commands: /undo, /checkpoint, /memory, /clear, /history, exit, quit.\n");
         let stdin = std::io::stdin();
         loop {
             print!("keel> ");
@@ -631,6 +724,19 @@ fn main() -> anyhow::Result<()> {
                         }
                         Err(e) => eprintln!("Failed to list checkpoints: {e:#}\n"),
                     }
+                }
+                continue;
+            }
+            if trimmed == "/memory" {
+                if let Some(store) = ctx.service::<EpistemicStore>() {
+                    let state = store.get();
+                    if state.is_empty() {
+                        println!("Epistemic working memory is currently empty.\n");
+                    } else {
+                        println!("{}", state.render_markdown());
+                    }
+                } else {
+                    println!("Epistemic store is not active.\n");
                 }
                 continue;
             }
