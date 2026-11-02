@@ -1,21 +1,49 @@
-//! `keel "prompt"` - one-shot headless run.
+//! `keel "prompt"` - one-shot headless run. `keel bench [filter]` - run the benchmark tasks.
 //!
 //! Env: KEEL_BASE_URL (default https://api.deepseek.com), KEEL_API_KEY (or DEEPSEEK_API_KEY),
 //! KEEL_MODEL (default deepseek-chat). Flags: --yolo (allow mutating tools), --log <file>.
 //! Default policy is read-only: mutating tools are denied unless --yolo is given.
 
+use keel_agent::Chunk;
 use keel_agent::{
     provider::OpenAiCompat, tools, Agent, AllowAll, Approver, Message, ReadOnly, SessionLog,
 };
-use keel_kernel::Context;
+use keel_kernel::{Context, Plugin, Scope};
+use std::io::Write;
+
+mod bench;
+
+/// Live terminal output: answer text on stdout, reasoning dimmed on stderr.
+struct Printer;
+impl Plugin for Printer {
+    fn name(&self) -> &str {
+        "printer"
+    }
+    fn apply(&self, s: &mut Scope) {
+        s.on::<Chunk, _>(|c| match c {
+            Chunk::Text(t) => {
+                print!("{t}");
+                let _ = std::io::stdout().flush();
+            }
+            Chunk::Reasoning(t) => {
+                eprint!("\x1b[2m{t}\x1b[0m");
+                let _ = std::io::stderr().flush();
+            }
+        });
+    }
+}
 
 fn main() -> anyhow::Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let yolo = take_flag(&mut args, "--yolo");
     let log = take_opt(&mut args, "--log");
     let root_opt = take_opt(&mut args, "--root");
+    let bench_mode = args.first().map(String::as_str) == Some("bench");
+    if bench_mode {
+        args.remove(0);
+    }
     let prompt = args.join(" ");
-    if prompt.is_empty() {
+    if prompt.is_empty() && !bench_mode {
         eprintln!("usage: keel [--yolo] [--root DIR] [--log FILE] \"prompt\"");
         std::process::exit(2);
     }
@@ -28,7 +56,11 @@ fn main() -> anyhow::Result<()> {
             .ok(),
         model: std::env::var("KEEL_MODEL").unwrap_or_else(|_| "deepseek-chat".into()),
     };
+    if bench_mode {
+        return bench::run(&llm, args.first().map(String::as_str));
+    }
     let ctx = Context::new();
+    let _printer = ctx.mount(&Printer);
     let session = log.map(SessionLog::file).unwrap_or_else(SessionLog::none);
     let approver: &dyn Approver = if yolo { &AllowAll } else { &ReadOnly };
     let root = match root_opt {
@@ -47,7 +79,8 @@ fn main() -> anyhow::Result<()> {
     let mut history = vec![Message::System {
         text: format!("You are a coding agent working in {}. Use tools to inspect and change files. Be concise.", root.display()),
     }];
-    println!("{}", agent.run_turn(&mut history, &prompt)?);
+    agent.run_turn(&mut history, &prompt)?;
+    println!();
     Ok(())
 }
 

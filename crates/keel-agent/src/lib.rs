@@ -54,9 +54,33 @@ pub struct ToolSpec {
     pub parameters: Value,
 }
 
+/// Incremental output from a model while it is still generating.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Chunk {
+    Text(String),
+    /// Reasoning/thinking tokens. Shown to the user, never fed back into history.
+    Reasoning(String),
+}
+
 /// Model provider. Implementations are plugins (OpenAI-compatible, Anthropic, ...).
 pub trait Llm {
     fn complete(&self, messages: &[Message], tools: &[ToolSpec]) -> Result<Message>;
+
+    /// Streaming variant. Default: no streaming, emit the whole text at once.
+    fn complete_streaming(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        sink: &mut dyn FnMut(Chunk),
+    ) -> Result<Message> {
+        let reply = self.complete(messages, tools)?;
+        if let Message::Assistant { text, .. } = &reply {
+            if !text.is_empty() {
+                sink(Chunk::Text(text.clone()));
+            }
+        }
+        Ok(reply)
+    }
 }
 
 pub trait Tool {
@@ -159,7 +183,9 @@ impl Agent<'_> {
 
         for step in 0..self.max_steps {
             self.ctx.emit(&StepStart(step));
-            let reply = self.llm.complete(history, &specs)?;
+            let reply = self
+                .llm
+                .complete_streaming(history, &specs, &mut |c| self.ctx.emit(&c))?;
             self.log
                 .append("assistant", serde_json::to_value(&reply)?)?;
             history.push(reply.clone());

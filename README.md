@@ -23,6 +23,14 @@ keel --yolo --log s.jsonl "fix the failing test"
 
 **Known gaps (honest list):** not yet exercised against a live model; no streaming; the loop takes its seams as struct fields rather than kernel services (the next refactor); path confinement is lexical, so symlinks inside the workspace can escape (needs `canonicalize` + Landlock); `shell` is unsandboxed; no compaction, no MCP, no TUI.
 
+## Benchmark (`keel bench`)
+
+| model | harness | create_file | find_value | fix_bug |
+| --- | --- | --- | --- | --- |
+| Huihui Qwen3.8 27B abliterated Q4_K_M (local, Vulkan, ~4.7 tok/s) | keel @ streaming | PASS 2 steps / 66s | PASS 2 / 30s | PASS 4 / 79s |
+
+Three tiny tasks; a smoke test, not a rigorous benchmark. Expand it before drawing conclusions.
+
 ## Roadmap
 
 1. **M0, kernel:** services, events, effects, config-driven plugin tree, `--dump-config`.
