@@ -10,6 +10,8 @@ pub struct OpenAiCompat {
     pub base_url: String,
     pub api_key: Option<String>,
     pub model: String,
+    /// Qwen-style chat-template switch (`enable_thinking`). None = server default.
+    pub enable_thinking: Option<bool>,
 }
 
 impl OpenAiCompat {
@@ -18,6 +20,7 @@ impl OpenAiCompat {
             base_url: "https://api.deepseek.com".into(),
             api_key: Some(api_key),
             model: "deepseek-chat".into(),
+            enable_thinking: None,
         }
     }
 }
@@ -138,6 +141,9 @@ impl OpenAiCompat {
     ) -> Result<ureq::Response> {
         let mut body =
             json!({"model": self.model, "messages": messages_to_wire(messages), "stream": stream});
+        if let Some(t) = self.enable_thinking {
+            body["chat_template_kwargs"] = json!({ "enable_thinking": t });
+        }
         if !tools.is_empty() {
             body["tools"] = tools
                 .iter()

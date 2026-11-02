@@ -13,36 +13,35 @@ A **model-agnostic, Rust, everything-is-a-plugin CLI coding agent harness.** Pri
 
 ## Status
 
-**M1 first cut works** (8 tests, clippy clean): turn/step agent loop, OpenAI-compatible provider (DeepSeek default), `read_file`/`write_file`/`shell` tools, approval policy (read-only by default, `--yolo` to allow mutation), JSONL session log.
+**M1 & M2 core operational** (12 tests, clippy clean):
+- **Plugin-mounted architecture:** `LlmPlugin`, `ApproverPlugin`, `SessionLogPlugin`, `LandlockPlugin`, `BuiltinToolsPlugin`, `Printer`, and `ReasoningMeter` all mount onto `keel_kernel::Context`.
+- **Linux Landlock sandbox (`ABI::V3`):** `shell` child processes are confined in `pre_exec` so writes outside the workspace + `/tmp` are blocked by the kernel. Canonical symlink escape checks protect all file tools.
+- **Streaming + weak-model resilience:** Live SSE streaming for both content and reasoning tokens, `KEEL_THINKING=0|1` control, surgical `edit_file`, `grep`, `list_dir`, and `<tool_call>` text fallback recovery.
 
-```
+```bash
 export DEEPSEEK_API_KEY=...        # or KEEL_BASE_URL / KEEL_API_KEY / KEEL_MODEL for any compatible API
-keel "explain this repo"           # read-only
+keel "explain this repo"           # read-only by default
 keel --yolo --log s.jsonl "fix the failing test"
+keel bench --runs 3                # multi-run coding benchmark with thinking-token meter
 ```
-
-**Known gaps (honest list):** not yet exercised against a live model; no streaming; the loop takes its seams as struct fields rather than kernel services (the next refactor); path confinement is lexical, so symlinks inside the workspace can escape (needs `canonicalize` + Landlock); `shell` is unsandboxed; no compaction, no MCP, no TUI.
 
 ## Benchmark (`keel bench`)
 
-Huihui Qwen3.8 27B abliterated Q4_K_M, local via llama.cpp Vulkan (~4.7 tok/s), tools: read_file, list_dir, grep, edit_file, write_file, shell.
+Tested locally on Vulkan (`llama-server`) across **Huihui Qwen3.8 27B (`Q4_K_M`, 21 GB)** and the full **PrismML Ternary Bonsai 2 (`Q2_0`)** family (**2B, 4B, 9B, 27B**):
 
-| task | result | steps | secs |
-| --- | --- | --- | --- |
-| create_file | PASS | 2 | 55.5 |
-| find_value | PASS | 2 | 23.6 |
-| fix_bug | PASS | 4 | 67.1 |
-| rename_symbol (3 files) | PASS | 5 | 144.5 |
-| locate_def (with decoys) | PASS | 2 | 24.0 |
-| misleading_error | PASS | 5 | 300.4 |
-
-6/6, single run each. Still small and easy-ish, and one sample per task says little about reliability. Next: repeat runs for pass rates, tasks that need asking vs guessing, and a weaker model for contrast.
+| Model | Size | Pass Rate | `create_file` | `find_value` | `fix_bug` | `rename_symbol` | `locate_def` | `misleading_error` |
+| :--- | ---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Ternary-Bonsai-2-2B (`Q2_0`)** | 522 MB | **4/12 (33%)** | 2/2 (1.2s) | 0/2 (5.7s) | 0/2 (6.1s) | 0/2 (23.1s) | 2/2 (2.2s) | 0/2 (25.4s) |
+| **Ternary-Bonsai-2-4B (`Q2_0`)** | 1.2 GB | **10/12 (83%)** | 2/2 (3.3s) | 2/2 (2.3s) | 2/2 (6.9s) | 1/2 (18.0s) | 2/2 (2.1s) | 1/2 (25.1s) |
+| **Ternary-Bonsai-2-9B (`Q2_0`)** | 2.4 GB | **12/12 (100%)** | 2/2 (4.2s) | 2/2 (10.2s) | 2/2 (9.7s) | 2/2 (22.8s) | 2/2 (3.4s) | 2/2 (59.3s) |
+| **Ternary-Bonsai-2-27B (`Q2_0`)** | 7.2 GB | **12/12 (100%)** | 2/2 (14.8s) | 2/2 (10.8s) | 2/2 (33.1s) | 2/2 (62.9s) | 2/2 (9.8s) | 2/2 (131.4s) |
+| **Qwen3.8-27B-abliterated (`Q4_K_M`)** | 21.0 GB | **6/6 (100%)** | 1/1 (55.5s) | 1/1 (23.6s) | 1/1 (67.1s) | 1/1 (144.5s) | 1/1 (24.0s) | 1/1 (300.4s) |
 
 ## Roadmap
 
 1. **M0, kernel:** services, events, effects, config-driven plugin tree, `--dump-config`.
-2. **M1, minimal agent:** `llm` service + OpenAI-compatible and DeepSeek providers, `agent-loop` (turn/step), tools (read, edit, grep, shell), JSONL session log.
-3. **M2, safety:** sandbox plugin (Landlock), approval policy, guard plugins (timeouts, repeat-tool reminder).
+2. **M1, minimal agent (done):** `llm` service + OpenAI-compatible and DeepSeek providers, `agent-loop` (turn/step), tools (`read_file`, `list_dir`, `grep`, `edit_file`, `write_file`, `shell`), JSONL session log.
+3. **M2, safety (Landlock done):** sandbox plugin (Landlock `ABI::V3`), approval policy, guard plugins (timeouts, repeat-tool reminder).
 4. **M3, context:** compaction, skills (`SKILL.md`), `AGENTS.md`, MCP client, subagents, todo/plan.
 5. **M4, frontends:** TUI, ACP server, SDK JSON-RPC, Helm integration.
 6. **M5, extras:** LSP, worktree isolation per thread, scheduling/jobs, goal mode, cost meter.
@@ -51,6 +50,7 @@ Huihui Qwen3.8 27B abliterated Q4_K_M, local via llama.cpp Vulkan (~4.7 tok/s), 
 
 ```
 crates/keel-kernel   plugin kernel (Context, Plugin, Scope, effects)
-crates/keel-cli      `keel` binary
+crates/keel-agent    agent loop, tools, Landlock sandbox, OpenAI/DeepSeek provider
+crates/keel-cli      `keel` binary + `keel bench` harness benchmark suite
 docs/REFERENCES.md   what we study and borrow, with licenses
 ```

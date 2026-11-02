@@ -1,24 +1,27 @@
 //! keel-agent: the turn/step agent loop and its pluggable seams.
 //!
 //! Seams (each is a service/trait a plugin can replace):
-//! - [`Llm`]      model provider
-//! - [`Tool`]     capabilities the model may call
-//! - [`Approver`] permission policy for tool calls
-//! - [`SessionLog`] append-only JSONL record of everything
+//! - [`Llm`]           model provider (`Arc<dyn Llm>` service on [`Context`])
+//! - [`ToolRegistry`]  capabilities the model may call
+//! - [`Approver`]      permission policy for tool calls (`Arc<dyn Approver>` service)
+//! - [`SessionLog`]    append-only JSONL record of everything
+//! - [`SandboxPolicy`] Linux Landlock filesystem confinement for subprocesses
 //!
 //! A *step* is one model request plus the tools it calls. A *turn* is steps
 //! until the model stops requesting tools. Lifecycle events are emitted on the
 //! kernel [`Context`] so other plugins can observe them.
 
 pub mod provider;
+pub mod sandbox;
 pub mod tools;
 
 use anyhow::Result;
-use keel_kernel::Context;
+use keel_kernel::{Context, Plugin, Scope};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ToolCall {
@@ -63,7 +66,7 @@ pub enum Chunk {
 }
 
 /// Model provider. Implementations are plugins (OpenAI-compatible, Anthropic, ...).
-pub trait Llm {
+pub trait Llm: Send + Sync {
     fn complete(&self, messages: &[Message], tools: &[ToolSpec]) -> Result<Message>;
 
     /// Streaming variant. Default: no streaming, emit the whole text at once.
@@ -83,7 +86,7 @@ pub trait Llm {
     }
 }
 
-pub trait Tool {
+pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
     /// Whether this call changes state outside the session (needs approval).
     fn mutating(&self) -> bool;
@@ -97,7 +100,7 @@ pub enum Decision {
 }
 
 /// Permission policy. A phone UI, a TUI prompt or a static rule set can implement this.
-pub trait Approver {
+pub trait Approver: Send + Sync {
     fn decide(&self, call: &ToolCall, mutating: bool) -> Decision;
 }
 
@@ -122,6 +125,7 @@ impl Approver for ReadOnly {
 }
 
 /// Append-only JSONL log; the source of truth for a session.
+#[derive(Clone)]
 pub struct SessionLog {
     path: Option<PathBuf>,
 }
@@ -156,6 +160,38 @@ impl SessionLog {
     }
 }
 
+// ---- Kernel Plugins for mounting standard services ----
+
+pub struct LlmPlugin(pub Arc<dyn Llm>);
+impl Plugin for LlmPlugin {
+    fn name(&self) -> &str {
+        "llm"
+    }
+    fn apply(&self, scope: &mut Scope) {
+        scope.provide::<Arc<dyn Llm>>(self.0.clone());
+    }
+}
+
+pub struct ApproverPlugin(pub Arc<dyn Approver>);
+impl Plugin for ApproverPlugin {
+    fn name(&self) -> &str {
+        "approver"
+    }
+    fn apply(&self, scope: &mut Scope) {
+        scope.provide::<Arc<dyn Approver>>(self.0.clone());
+    }
+}
+
+pub struct SessionLogPlugin(pub SessionLog);
+impl Plugin for SessionLogPlugin {
+    fn name(&self) -> &str {
+        "session-log"
+    }
+    fn apply(&self, scope: &mut Scope) {
+        scope.provide::<SessionLog>(self.0.clone());
+    }
+}
+
 // ---- lifecycle events (observable via Context::emit) ----
 pub struct TurnStart;
 pub struct StepStart(pub usize);
@@ -173,6 +209,121 @@ pub struct Agent<'a> {
 }
 
 impl Agent<'_> {
+    /// Run a turn by resolving all services (`Arc<dyn Llm>`, `ToolRegistry`, `Arc<dyn Approver>`, `SessionLog`)
+    /// directly from the plugin [`Context`].
+    pub fn run_from_context(
+        ctx: &Context,
+        history: &mut Vec<Message>,
+        user: &str,
+        max_steps: usize,
+    ) -> Result<String> {
+        let llm = ctx
+            .service::<Arc<dyn Llm>>()
+            .ok_or_else(|| anyhow::anyhow!("missing `Llm` plugin in kernel context"))?;
+        let approver = ctx
+            .service::<Arc<dyn Approver>>()
+            .ok_or_else(|| anyhow::anyhow!("missing `Approver` plugin in kernel context"))?;
+        let log = ctx
+            .service::<SessionLog>()
+            .unwrap_or_else(|| Arc::new(SessionLog::none()));
+        let reg_tools = ctx
+            .service::<sandbox::ToolRegistry>()
+            .map(|r| r.list())
+            .unwrap_or_default();
+
+        struct ArcTool(Arc<dyn Tool>);
+        impl Tool for ArcTool {
+            fn spec(&self) -> ToolSpec {
+                self.0.spec()
+            }
+            fn mutating(&self) -> bool {
+                self.0.mutating()
+            }
+            fn run(&self, args: &Value) -> Result<String> {
+                self.0.run(args)
+            }
+        }
+
+        let tools: Vec<Box<dyn Tool>> = reg_tools
+            .into_iter()
+            .map(|t| Box::new(ArcTool(t)) as Box<dyn Tool>)
+            .collect();
+
+        let agent = Agent {
+            ctx,
+            llm: llm.as_ref().as_ref(),
+            tools,
+            approver: approver.as_ref().as_ref(),
+            log: log.as_ref(),
+            max_steps,
+        };
+        agent.run_turn(history, user)
+    }
+
+    /// Extract inline `<tool_call>{"name": ..., "arguments": ...}</tool_call>` or JSON blocks
+    /// when a smaller/weak model emits tool invocations in plain text instead of native `tool_calls`.
+    fn fallback_parse_text_tool_calls(text: &str) -> Vec<ToolCall> {
+        let mut out = Vec::new();
+        // 1. `<tool_call>...</tool_call>` tags (Qwen / Hermes / Bonsai style)
+        let mut rest = text;
+        while let Some(start) = rest.find("<tool_call>") {
+            let after = &rest[start + "<tool_call>".len()..];
+            let Some(end) = after.find("</tool_call>") else {
+                break;
+            };
+            let inner = after[..end].trim();
+            if let Ok(v) = serde_json::from_str::<Value>(inner) {
+                if let Some(name) = v["name"].as_str() {
+                    let args = v
+                        .get("arguments")
+                        .or_else(|| v.get("args"))
+                        .or_else(|| v.get("parameters"))
+                        .cloned()
+                        .unwrap_or_else(|| json_without_name(&v));
+                    out.push(ToolCall {
+                        id: format!("fallback-{}", out.len() + 1),
+                        name: name.to_string(),
+                        args,
+                    });
+                }
+            }
+            rest = &after[end + "</tool_call>".len()..];
+        }
+        if !out.is_empty() {
+            return out;
+        }
+        // 2. Fenced ```json or ```tool_call blocks containing {"name": ..., "arguments": ...}
+        let mut scan = text;
+        while let Some(fence) = scan.find("```") {
+            let after_fence = &scan[fence + 3..];
+            let Some(nl) = after_fence.find('\n') else {
+                break;
+            };
+            let body_start = &after_fence[nl + 1..];
+            let Some(close) = body_start.find("```") else {
+                break;
+            };
+            let candidate = body_start[..close].trim();
+            if let Ok(v) = serde_json::from_str::<Value>(candidate) {
+                if let Some(name) = v["name"].as_str() {
+                    let args = v
+                        .get("arguments")
+                        .or_else(|| v.get("args"))
+                        .or_else(|| v.get("parameters"))
+                        .cloned()
+                        .unwrap_or_else(|| json_without_name(&v));
+                    out.push(ToolCall {
+                        id: format!("fallback-{}", out.len() + 1),
+                        name: name.to_string(),
+                        args,
+                    });
+                }
+            }
+            scan = &body_start[close + 3..];
+        }
+        out
+    }
+
     /// Run one turn against `history` (mutated in place). Returns the final assistant text.
     pub fn run_turn(&self, history: &mut Vec<Message>, user: &str) -> Result<String> {
         self.ctx.emit(&TurnStart);
@@ -183,9 +334,21 @@ impl Agent<'_> {
 
         for step in 0..self.max_steps {
             self.ctx.emit(&StepStart(step));
-            let reply = self
+            let mut reply = self
                 .llm
                 .complete_streaming(history, &specs, &mut |c| self.ctx.emit(&c))?;
+            if let Message::Assistant {
+                ref text,
+                ref mut tool_calls,
+            } = reply
+            {
+                if tool_calls.is_empty() {
+                    let recovered = Self::fallback_parse_text_tool_calls(text);
+                    if !recovered.is_empty() {
+                        *tool_calls = recovered;
+                    }
+                }
+            }
             self.log
                 .append("assistant", serde_json::to_value(&reply)?)?;
             history.push(reply.clone());
@@ -233,16 +396,26 @@ impl Agent<'_> {
     }
 }
 
+fn json_without_name(v: &Value) -> Value {
+    if let Some(obj) = v.as_object() {
+        let mut m = obj.clone();
+        m.remove("name");
+        Value::Object(m)
+    } else {
+        Value::Null
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use std::sync::Mutex;
 
     /// Scripted model: returns queued replies in order.
-    struct Script(RefCell<Vec<Message>>);
+    struct Script(Mutex<Vec<Message>>);
     impl Llm for Script {
         fn complete(&self, _: &[Message], _: &[ToolSpec]) -> Result<Message> {
-            Ok(self.0.borrow_mut().remove(0))
+            Ok(self.0.lock().unwrap().remove(0))
         }
     }
 
@@ -296,7 +469,7 @@ mod tests {
     #[test]
     fn tool_loop_then_final_answer() {
         let ctx = Context::new();
-        let llm = Script(RefCell::new(vec![
+        let llm = Script(Mutex::new(vec![
             asst("", vec![call("1", "echo")]),
             asst("done", vec![]),
         ]));
@@ -314,9 +487,32 @@ mod tests {
     }
 
     #[test]
+    fn fallback_text_tool_call_recovery() {
+        let ctx = Context::new();
+        let llm = Script(Mutex::new(vec![
+            asst(
+                "Let me run echo:\n<tool_call>{\"name\":\"echo\",\"arguments\":{\"s\":\"recovered\"}}</tool_call>",
+                vec![],
+            ),
+            asst("all good", vec![]),
+        ]));
+        let agent = Agent {
+            ctx: &ctx,
+            llm: &llm,
+            tools: vec![Box::new(Echo)],
+            approver: &AllowAll,
+            log: &SessionLog::none(),
+            max_steps: 5,
+        };
+        let mut h = vec![];
+        assert_eq!(agent.run_turn(&mut h, "go").unwrap(), "all good");
+        assert!(matches!(&h[2], Message::Tool { content, .. } if content == "recovered"));
+    }
+
+    #[test]
     fn read_only_policy_denies_mutating_tool() {
         let ctx = Context::new();
-        let llm = Script(RefCell::new(vec![
+        let llm = Script(Mutex::new(vec![
             asst("", vec![call("1", "write")]),
             asst("ok", vec![]),
         ]));
@@ -339,7 +535,7 @@ mod tests {
         let calls = (0..3)
             .map(|i| asst("", vec![call(&i.to_string(), "echo")]))
             .collect();
-        let llm = Script(RefCell::new(calls));
+        let llm = Script(Mutex::new(calls));
         let agent = Agent {
             ctx: &ctx,
             llm: &llm,

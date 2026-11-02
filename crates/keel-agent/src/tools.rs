@@ -1,14 +1,20 @@
-//! Built-in tools: read_file, write_file, shell. All paths are confined to a root.
+//! Built-in tools: read_file, list_dir, grep, edit_file, write_file, shell.
+//! All paths are confined to a root, and `shell` enforces Linux Landlock when enabled.
 
+use crate::sandbox::{SandboxPolicy, ToolRegistry};
 use crate::{Tool, ToolSpec};
 use anyhow::{bail, Context as _, Result};
+use keel_kernel::{Plugin, Scope};
 use serde_json::{json, Value};
+use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 
 const MAX_OUT: usize = 32 * 1024;
 
-/// Resolve `rel` under `root`, rejecting absolute paths and `..` escapes.
+/// Resolve `rel` under `root`, rejecting absolute paths, `..` escapes, and symlinks
+/// that resolve outside the canonicalized workspace root.
 pub fn confine(root: &Path, rel: &str) -> Result<PathBuf> {
     let p = Path::new(rel);
     if p.is_absolute() {
@@ -19,7 +25,13 @@ pub fn confine(root: &Path, rel: &str) -> Result<PathBuf> {
     {
         bail!("path escapes workspace: {rel}");
     }
-    Ok(root.join(p))
+    let joined = root.join(p);
+    if let (Ok(canon_root), Ok(canon_target)) = (root.canonicalize(), joined.canonicalize()) {
+        if !canon_target.starts_with(&canon_root) {
+            bail!("symlink escapes workspace: {rel}");
+        }
+    }
+    Ok(joined)
 }
 
 fn truncate(mut s: String) -> String {
@@ -216,7 +228,20 @@ fn walk(p: &Path, root: &Path, pat: &str, hits: &mut Vec<String>) {
     }
 }
 
-pub struct Shell(pub PathBuf);
+pub struct Shell {
+    pub root: PathBuf,
+    pub sandbox: SandboxPolicy,
+}
+
+impl Shell {
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            sandbox: SandboxPolicy::new(root.clone(), true),
+            root,
+        }
+    }
+}
+
 impl Tool for Shell {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
@@ -230,12 +255,20 @@ impl Tool for Shell {
         true
     }
     fn run(&self, a: &Value) -> Result<String> {
-        let out = Command::new("sh")
-            .arg("-c")
+        let policy = self.sandbox.clone();
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
             .arg(arg(a, "command")?)
-            .current_dir(&self.0)
-            .stdin(Stdio::null())
-            .output()?;
+            .current_dir(&self.root)
+            .stdin(Stdio::null());
+        unsafe {
+            cmd.pre_exec(move || {
+                policy
+                    .restrict_current_thread()
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))
+            });
+        }
+        let out = cmd.output()?;
         Ok(truncate(format!(
             "exit: {}\nstdout:\n{}\nstderr:\n{}",
             out.status.code().unwrap_or(-1),
@@ -252,8 +285,38 @@ pub fn builtin(root: &Path) -> Vec<Box<dyn Tool>> {
         Box::new(Grep(root.into())),
         Box::new(EditFile(root.into())),
         Box::new(WriteFile(root.into())),
-        Box::new(Shell(root.into())),
+        Box::new(Shell::new(root.into())),
     ]
+}
+
+/// Plugin that mounts all built-in tools into the kernel's [`ToolRegistry`].
+pub struct BuiltinToolsPlugin {
+    pub root: PathBuf,
+    pub landlock_enabled: bool,
+}
+
+impl Plugin for BuiltinToolsPlugin {
+    fn name(&self) -> &str {
+        "builtin-tools"
+    }
+    fn apply(&self, scope: &mut Scope) {
+        let reg = scope
+            .context()
+            .service::<ToolRegistry>()
+            .map(|r| (*r).clone())
+            .unwrap_or_default();
+        let r = &self.root;
+        reg.register(Arc::new(ReadFile(r.clone())));
+        reg.register(Arc::new(ListDir(r.clone())));
+        reg.register(Arc::new(Grep(r.clone())));
+        reg.register(Arc::new(EditFile(r.clone())));
+        reg.register(Arc::new(WriteFile(r.clone())));
+        reg.register(Arc::new(Shell {
+            root: r.clone(),
+            sandbox: SandboxPolicy::new(r.clone(), self.landlock_enabled),
+        }));
+        scope.provide(reg);
+    }
 }
 
 #[cfg(test)]
@@ -299,5 +362,32 @@ mod tests {
             "hello"
         );
         std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn landlock_blocks_writes_outside_workspace() {
+        let ws = std::env::temp_dir().join(format!("keel-ll-ws-{}", std::process::id()));
+        let outside = std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/var/tmp"))
+            .join(format!(".keel-ll-forbidden-{}", std::process::id()));
+        std::fs::create_dir_all(&ws).unwrap();
+        let sh = Shell::new(ws.clone());
+        // Writing inside workspace must succeed
+        let ok_out = sh
+            .run(&json!({"command": "echo allowed > inside.txt"}))
+            .unwrap();
+        assert!(ok_out.contains("exit: 0"), "unexpected output: {ok_out}");
+        assert!(ws.join("inside.txt").exists());
+
+        // Writing outside workspace + /tmp (e.g. $HOME) must be blocked by Landlock
+        let blocked_cmd = format!("echo forbidden > {}", outside.display());
+        let deny_out = sh.run(&json!({"command": blocked_cmd})).unwrap();
+        assert!(
+            !outside.exists(),
+            "Landlock failed to block write outside workspace: {deny_out}"
+        );
+        let _ = std::fs::remove_dir_all(ws);
+        let _ = std::fs::remove_file(outside);
     }
 }
