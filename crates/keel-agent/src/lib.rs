@@ -13,6 +13,7 @@
 
 pub mod compaction;
 pub mod guard;
+pub mod patch;
 pub mod plan;
 pub mod provider;
 pub mod sandbox;
