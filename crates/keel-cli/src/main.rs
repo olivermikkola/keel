@@ -8,6 +8,7 @@ use keel_agent::Chunk;
 use keel_agent::{
     compaction::{ToolResultPrunerPlugin, WorkspaceContextPlugin, WorkspaceInstructions},
     guard::RepeatToolReminderPlugin,
+    plan::PlanPlugin,
     provider::OpenAiCompat,
     sandbox::LandlockPlugin,
     tools::BuiltinToolsPlugin,
@@ -47,6 +48,7 @@ fn main() -> anyhow::Result<()> {
     let dump_config = take_flag(&mut args, "--dump-config");
     let log = take_opt(&mut args, "--log");
     let root_opt = take_opt(&mut args, "--root");
+    let verify_cmd = take_opt(&mut args, "--verify");
     let runs: usize = take_opt(&mut args, "--runs")
         .and_then(|r| r.parse().ok())
         .unwrap_or(1);
@@ -57,7 +59,7 @@ fn main() -> anyhow::Result<()> {
     let prompt = args.join(" ");
     if prompt.is_empty() && !bench_mode && !dump_config {
         eprintln!(
-            "usage: keel [--yolo] [--no-sandbox] [--dump-config] [--root DIR] [--log FILE] \"prompt\""
+            "usage: keel [--yolo] [--no-sandbox] [--dump-config] [--verify CMD] [--root DIR] [--log FILE] \"prompt\""
         );
         std::process::exit(2);
     }
@@ -103,6 +105,10 @@ fn main() -> anyhow::Result<()> {
     let _p_guard = ctx.mount(&RepeatToolReminderPlugin::default());
     let _p_pruner = ctx.mount(&ToolResultPrunerPlugin::default());
     let _p_ws = ctx.mount(&WorkspaceContextPlugin { root: root.clone() });
+    let _p_plan = ctx.mount(&PlanPlugin {
+        root: root.clone(),
+        verify_command: verify_cmd,
+    });
 
     if dump_config {
         println!("# keel composed plugin tree (root: {})", root.display());

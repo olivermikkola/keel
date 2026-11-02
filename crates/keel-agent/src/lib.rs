@@ -13,6 +13,7 @@
 
 pub mod compaction;
 pub mod guard;
+pub mod plan;
 pub mod provider;
 pub mod sandbox;
 pub mod tools;
@@ -361,6 +362,18 @@ impl Agent<'_> {
                 anyhow::bail!("provider returned a non-assistant message");
             };
             if tool_calls.is_empty() {
+                if let Some(gate) = self.ctx.service::<plan::VerificationGate>() {
+                    if let Err(err) = gate.verify() {
+                        let cmd_str = gate.command.as_deref().unwrap_or("verification");
+                        let feedback = format!(
+                            "[verification gate failed]\nCommand: `{cmd_str}`\n{err}\nDo not finish until verification passes. Fix the issue and verify again."
+                        );
+                        self.log
+                            .append("user", serde_json::json!({ "text": feedback }))?;
+                        history.push(Message::User { text: feedback });
+                        continue;
+                    }
+                }
                 self.ctx.emit(&TurnEnd(text.clone()));
                 return Ok(text);
             }
@@ -555,5 +568,48 @@ mod tests {
             max_steps: 3,
         };
         assert!(agent.run_turn(&mut vec![], "go").is_err());
+    }
+
+    #[test]
+    fn verification_gate_forces_continuation_until_passing() {
+        let ctx = Context::new();
+        // Model tries to finish immediately ("I'm done"), but verification fails.
+        // On step 2, model fixes it and finishes ("Fixed"), and verification passes.
+        let llm = Script(Mutex::new(vec![
+            asst("I'm done", vec![]),
+            asst("Fixed", vec![]),
+        ]));
+
+        let tmp = std::env::temp_dir().join(format!("keel-verify-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Use a gate command that checks an external condition: fail on first run, create marker, pass on second
+        let gate_cmd = format!(
+            "if [ ! -f {}/pass ]; then touch {}/pass; exit 1; else exit 0; fi",
+            tmp.display(),
+            tmp.display()
+        );
+        let _p = ctx.mount(&plan::PlanPlugin {
+            root: tmp.clone(),
+            verify_command: Some(gate_cmd),
+        });
+
+        let agent = Agent {
+            ctx: &ctx,
+            llm: &llm,
+            tools: vec![Box::new(Echo)],
+            approver: &AllowAll,
+            log: &SessionLog::none(),
+            max_steps: 5,
+        };
+        let mut h = vec![];
+        let res = agent.run_turn(&mut h, "please solve it").unwrap();
+        assert_eq!(res, "Fixed");
+        // Verify that feedback was injected
+        assert!(h.iter().any(
+            |m| matches!(m, Message::User { text } if text.contains("[verification gate failed]"))
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
