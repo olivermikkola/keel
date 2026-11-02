@@ -118,6 +118,104 @@ impl Tool for WriteFile {
     }
 }
 
+/// Surgical edit: replace exactly one occurrence of `old` with `new`.
+/// Ambiguity is an error, so a weak model can't silently edit the wrong place.
+pub struct EditFile(pub PathBuf);
+impl Tool for EditFile {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "edit_file".into(),
+            description: "Replace one exact occurrence of `old` with `new` in a file. `old` must match exactly once; include surrounding lines if needed to make it unique.".into(),
+            parameters: json!({"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"}},"required":["path","old","new"]}),
+        }
+    }
+    fn mutating(&self) -> bool {
+        true
+    }
+    fn run(&self, a: &Value) -> Result<String> {
+        let p = confine(&self.0, arg(a, "path")?)?;
+        let (old, new) = (arg(a, "old")?, arg(a, "new")?);
+        if old.is_empty() {
+            bail!("`old` must not be empty");
+        }
+        let text =
+            std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
+        match text.matches(old).count() {
+            0 => bail!(
+                "`old` not found in {} (it must match exactly, including whitespace)",
+                p.display()
+            ),
+            1 => {
+                std::fs::write(&p, text.replacen(old, new, 1))?;
+                Ok(format!("edited {}", p.display()))
+            }
+            n => bail!(
+                "`old` matches {n} places in {}; add more surrounding context to make it unique",
+                p.display()
+            ),
+        }
+    }
+}
+
+/// Literal substring search across the workspace (skips .git, target, node_modules).
+pub struct Grep(pub PathBuf);
+impl Tool for Grep {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "grep".into(),
+            description: "Search files for a literal text pattern. Returns path:line:text. Optional `path` narrows to a subdirectory or file.".into(),
+            parameters: json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern"]}),
+        }
+    }
+    fn mutating(&self) -> bool {
+        false
+    }
+    fn run(&self, a: &Value) -> Result<String> {
+        let pat = arg(a, "pattern")?;
+        let start = confine(&self.0, a["path"].as_str().unwrap_or("."))?;
+        let mut hits = Vec::new();
+        walk(&start, &self.0, pat, &mut hits);
+        if hits.is_empty() {
+            return Ok("no matches".into());
+        }
+        Ok(truncate(hits.join("\n")))
+    }
+}
+
+const MAX_HITS: usize = 100;
+
+fn walk(p: &Path, root: &Path, pat: &str, hits: &mut Vec<String>) {
+    if hits.len() >= MAX_HITS {
+        return;
+    }
+    if p.is_dir() {
+        let Ok(rd) = std::fs::read_dir(p) else { return };
+        let mut entries: Vec<_> = rd.filter_map(|e| e.ok()).collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let n = e.file_name();
+            if matches!(
+                n.to_string_lossy().as_ref(),
+                ".git" | "target" | "node_modules"
+            ) {
+                continue;
+            }
+            // file_type() does not follow symlinks, so links can't pull in files outside the root.
+            if e.file_type().map(|t| t.is_symlink()).unwrap_or(true) {
+                continue;
+            }
+            walk(&e.path(), root, pat, hits);
+        }
+    } else if let Ok(text) = std::fs::read_to_string(p) {
+        let rel = p.strip_prefix(root).unwrap_or(p).display().to_string();
+        for (i, line) in text.lines().enumerate() {
+            if line.contains(pat) && hits.len() < MAX_HITS {
+                hits.push(format!("{rel}:{}:{}", i + 1, line.trim()));
+            }
+        }
+    }
+}
+
 pub struct Shell(pub PathBuf);
 impl Tool for Shell {
     fn spec(&self) -> ToolSpec {
@@ -151,6 +249,8 @@ pub fn builtin(root: &Path) -> Vec<Box<dyn Tool>> {
     vec![
         Box::new(ReadFile(root.into())),
         Box::new(ListDir(root.into())),
+        Box::new(Grep(root.into())),
+        Box::new(EditFile(root.into())),
         Box::new(WriteFile(root.into())),
         Box::new(Shell(root.into())),
     ]
@@ -167,6 +267,24 @@ mod tests {
         assert!(confine(r, "a/../../x").is_err());
         assert!(confine(r, "/etc/passwd").is_err());
         assert_eq!(confine(r, "a/b.txt").unwrap(), Path::new("/w/a/b.txt"));
+    }
+
+    #[test]
+    fn edit_requires_unique_match_and_grep_finds() {
+        let d = std::env::temp_dir().join(format!("keel-test-edit-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("f.txt"), "a\nb\na\n").unwrap();
+        let e = EditFile(d.clone());
+        assert!(e.run(&json!({"path":"f.txt","old":"a","new":"z"})).is_err()); // ambiguous
+        assert!(e.run(&json!({"path":"f.txt","old":"q","new":"z"})).is_err()); // missing
+        e.run(&json!({"path":"f.txt","old":"b","new":"B"})).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(d.join("f.txt")).unwrap(),
+            "a\nB\na\n"
+        );
+        let out = Grep(d.clone()).run(&json!({"pattern":"B"})).unwrap();
+        assert_eq!(out, "f.txt:2:B");
+        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]

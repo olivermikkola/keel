@@ -25,11 +25,18 @@ keel --yolo --log s.jsonl "fix the failing test"
 
 ## Benchmark (`keel bench`)
 
-| model | harness | create_file | find_value | fix_bug |
-| --- | --- | --- | --- | --- |
-| Huihui Qwen3.8 27B abliterated Q4_K_M (local, Vulkan, ~4.7 tok/s) | keel @ streaming | PASS 2 steps / 66s | PASS 2 / 30s | PASS 4 / 79s |
+Huihui Qwen3.8 27B abliterated Q4_K_M, local via llama.cpp Vulkan (~4.7 tok/s), tools: read_file, list_dir, grep, edit_file, write_file, shell.
 
-Three tiny tasks; a smoke test, not a rigorous benchmark. Expand it before drawing conclusions.
+| task | result | steps | secs |
+| --- | --- | --- | --- |
+| create_file | PASS | 2 | 55.5 |
+| find_value | PASS | 2 | 23.6 |
+| fix_bug | PASS | 4 | 67.1 |
+| rename_symbol (3 files) | PASS | 5 | 144.5 |
+| locate_def (with decoys) | PASS | 2 | 24.0 |
+| misleading_error | PASS | 5 | 300.4 |
+
+6/6, single run each. Still small and easy-ish, and one sample per task says little about reliability. Next: repeat runs for pass rates, tasks that need asking vs guessing, and a weaker model for contrast.
 
 ## Roadmap
 

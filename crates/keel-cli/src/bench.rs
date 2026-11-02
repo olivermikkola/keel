@@ -38,6 +38,43 @@ fn tasks() -> Vec<Task> {
             ],
             verify: |d, _| Command::new("python3").arg("test_add.py").current_dir(d).output().map(|o| o.status.success()).unwrap_or(false),
         },
+        Task {
+            name: "rename_symbol",
+            prompt: "Rename the function `compute_total` to `calc_total` everywhere in this workspace (definition and all call sites). `python3 main.py` must still print 6.",
+            setup: &[
+                ("pricing.py", "def compute_total(items):\n    return sum(items)\n"),
+                ("report.py", "from pricing import compute_total\n\ndef summary(items):\n    return compute_total(items)\n"),
+                ("main.py", "from report import summary\nfrom pricing import compute_total\nprint(summary([1, 2, 3]))\nassert compute_total([1]) == 1\n"),
+            ],
+            verify: |d, _| {
+                let any_old = ["pricing.py", "report.py", "main.py"]
+                    .iter()
+                    .any(|f| std::fs::read_to_string(d.join(f)).map(|s| s.contains("compute_total")).unwrap_or(true));
+                let out = Command::new("python3").arg("main.py").current_dir(d).output();
+                !any_old && out.map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "6").unwrap_or(false)
+            },
+        },
+        Task {
+            name: "locate_def",
+            prompt: "Which file defines the function `retry_with_backoff`? Reply with the file path only.",
+            setup: &[
+                ("src/a.py", "def helper():\n    pass\n"),
+                ("src/net/http.py", "from util import retry_with_backoff  # imported, not defined\n"),
+                ("src/net/util/retry.py", "def retry_with_backoff(fn):\n    return fn()\n"),
+                ("docs/notes.md", "we should call retry_with_backoff more often\n"),
+            ],
+            verify: |_, ans| ans.contains("src/net/util/retry.py"),
+        },
+        Task {
+            name: "misleading_error",
+            prompt: "Running `python3 main.py` fails. Find the real root cause and fix it so it exits successfully. Do not weaken the assertion in main.py.",
+            setup: &[
+                ("main.py", "from stats import mean_of_pairs\nresult = mean_of_pairs([(1, 3), (2, 6)])\nassert result == 3.0, 'main.py: wrong result'\nprint('ok')\n"),
+                ("stats.py", "def mean_of_pairs(pairs):\n    totals = [a + b for a, b in pairs]\n    return sum(totals) / (len(totals) + 1)\n"),
+            ],
+            verify: |d, _| Command::new("python3").arg("main.py").current_dir(d).output().map(|o| o.status.success()).unwrap_or(false)
+                && std::fs::read_to_string(d.join("main.py")).map(|s| s.contains("== 3.0")).unwrap_or(false),
+        },
     ]
 }
 
