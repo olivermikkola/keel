@@ -13,7 +13,11 @@ pub struct OpenAiCompat {
 
 impl OpenAiCompat {
     pub fn deepseek(api_key: String) -> Self {
-        Self { base_url: "https://api.deepseek.com".into(), api_key: Some(api_key), model: "deepseek-chat".into() }
+        Self {
+            base_url: "https://api.deepseek.com".into(),
+            api_key: Some(api_key),
+            model: "deepseek-chat".into(),
+        }
     }
 }
 
@@ -47,7 +51,10 @@ pub fn parse_reply(body: &Value) -> Result<Message> {
         let raw = c["function"]["arguments"].as_str().unwrap_or("{}");
         tool_calls.push(ToolCall {
             id: c["id"].as_str().unwrap_or_default().to_string(),
-            name: c["function"]["name"].as_str().unwrap_or_default().to_string(),
+            name: c["function"]["name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
             args: serde_json::from_str(raw).unwrap_or(Value::Null),
         });
     }
@@ -63,11 +70,22 @@ impl Llm for OpenAiCompat {
                 .map(|t| json!({"type":"function","function":{"name":t.name,"description":t.description,"parameters":t.parameters}}))
                 .collect();
         }
-        let mut req = ureq::post(&format!("{}/chat/completions", self.base_url.trim_end_matches('/')));
+        // Generous timeout: local 27B models generate at ~5 tok/s, but a dead server must still fail.
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(10))
+            .timeout_read(std::time::Duration::from_secs(600))
+            .build();
+        let mut req = agent.post(&format!(
+            "{}/chat/completions",
+            self.base_url.trim_end_matches('/')
+        ));
         if let Some(k) = &self.api_key {
             req = req.set("Authorization", &format!("Bearer {k}"));
         }
-        let resp: Value = req.send_json(body).context("provider request failed")?.into_json()?;
+        let resp: Value = req
+            .send_json(body)
+            .context("provider request failed")?
+            .into_json()?;
         parse_reply(&resp)
     }
 }
@@ -80,14 +98,19 @@ mod tests {
     fn parses_tool_calls() {
         let body = json!({"choices":[{"message":{"content":null,"tool_calls":[
             {"id":"c1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.rs\"}"}}]}}]});
-        let Message::Assistant { tool_calls, .. } = parse_reply(&body).unwrap() else { panic!() };
+        let Message::Assistant { tool_calls, .. } = parse_reply(&body).unwrap() else {
+            panic!()
+        };
         assert_eq!(tool_calls[0].name, "read_file");
         assert_eq!(tool_calls[0].args["path"], "a.rs");
     }
 
     #[test]
     fn wire_roundtrip_shapes() {
-        let w = messages_to_wire(&[Message::Tool { id: "c1".into(), content: "x".into() }]);
+        let w = messages_to_wire(&[Message::Tool {
+            id: "c1".into(),
+            content: "x".into(),
+        }]);
         assert_eq!(w[0]["tool_call_id"], "c1");
     }
 }

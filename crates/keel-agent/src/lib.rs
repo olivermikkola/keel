@@ -30,10 +30,20 @@ pub struct ToolCall {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "role", rename_all = "snake_case")]
 pub enum Message {
-    System { text: String },
-    User { text: String },
-    Assistant { text: String, tool_calls: Vec<ToolCall> },
-    Tool { id: String, content: String },
+    System {
+        text: String,
+    },
+    User {
+        text: String,
+    },
+    Assistant {
+        text: String,
+        tool_calls: Vec<ToolCall>,
+    },
+    Tool {
+        id: String,
+        content: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -94,7 +104,9 @@ pub struct SessionLog {
 
 impl SessionLog {
     pub fn file(path: impl Into<PathBuf>) -> Self {
-        Self { path: Some(path.into()) }
+        Self {
+            path: Some(path.into()),
+        }
     }
     pub fn none() -> Self {
         Self { path: None }
@@ -104,11 +116,18 @@ impl SessionLog {
         if let Some(dir) = p.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(p)?;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)?;
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_millis() as u64;
-        writeln!(f, "{}", serde_json::json!({"ts": ts, "kind": kind, "data": data}))?;
+        writeln!(
+            f,
+            "{}",
+            serde_json::json!({"ts": ts, "kind": kind, "data": data})
+        )?;
         Ok(())
     }
 }
@@ -134,13 +153,15 @@ impl Agent<'_> {
     pub fn run_turn(&self, history: &mut Vec<Message>, user: &str) -> Result<String> {
         self.ctx.emit(&TurnStart);
         history.push(Message::User { text: user.into() });
-        self.log.append("user", serde_json::json!({ "text": user }))?;
+        self.log
+            .append("user", serde_json::json!({ "text": user }))?;
         let specs: Vec<ToolSpec> = self.tools.iter().map(|t| t.spec()).collect();
 
         for step in 0..self.max_steps {
             self.ctx.emit(&StepStart(step));
             let reply = self.llm.complete(history, &specs)?;
-            self.log.append("assistant", serde_json::to_value(&reply)?)?;
+            self.log
+                .append("assistant", serde_json::to_value(&reply)?)?;
             history.push(reply.clone());
             let Message::Assistant { text, tool_calls } = reply else {
                 anyhow::bail!("provider returned a non-assistant message");
@@ -151,11 +172,18 @@ impl Agent<'_> {
             }
             for call in tool_calls {
                 let out = self.execute(&call);
-                self.log.append("tool", serde_json::json!({"id": call.id, "content": out}))?;
-                history.push(Message::Tool { id: call.id, content: out });
+                self.log
+                    .append("tool", serde_json::json!({"id": call.id, "content": out}))?;
+                history.push(Message::Tool {
+                    id: call.id,
+                    content: out,
+                });
             }
         }
-        anyhow::bail!("step limit ({}) reached without a final answer", self.max_steps)
+        anyhow::bail!(
+            "step limit ({}) reached without a final answer",
+            self.max_steps
+        )
     }
 
     fn execute(&self, call: &ToolCall) -> String {
@@ -169,7 +197,9 @@ impl Agent<'_> {
             }
             Decision::Allow => {
                 // Tool errors go back to the model as text; they never abort the turn.
-                let out = tool.run(&call.args).unwrap_or_else(|e| format!("error: {e:#}"));
+                let out = tool
+                    .run(&call.args)
+                    .unwrap_or_else(|e| format!("error: {e:#}"));
                 self.ctx.emit(&ToolResult(call.id.clone(), out.clone()));
                 out
             }
@@ -193,7 +223,11 @@ mod tests {
     struct Echo;
     impl Tool for Echo {
         fn spec(&self) -> ToolSpec {
-            ToolSpec { name: "echo".into(), description: "".into(), parameters: serde_json::json!({}) }
+            ToolSpec {
+                name: "echo".into(),
+                description: "".into(),
+                parameters: serde_json::json!({}),
+            }
         }
         fn mutating(&self) -> bool {
             false
@@ -205,7 +239,11 @@ mod tests {
     struct Writer;
     impl Tool for Writer {
         fn spec(&self) -> ToolSpec {
-            ToolSpec { name: "write".into(), description: "".into(), parameters: serde_json::json!({}) }
+            ToolSpec {
+                name: "write".into(),
+                description: "".into(),
+                parameters: serde_json::json!({}),
+            }
         }
         fn mutating(&self) -> bool {
             true
@@ -216,17 +254,34 @@ mod tests {
     }
 
     fn call(id: &str, name: &str) -> ToolCall {
-        ToolCall { id: id.into(), name: name.into(), args: serde_json::json!({"s": "hi"}) }
+        ToolCall {
+            id: id.into(),
+            name: name.into(),
+            args: serde_json::json!({"s": "hi"}),
+        }
     }
     fn asst(text: &str, calls: Vec<ToolCall>) -> Message {
-        Message::Assistant { text: text.into(), tool_calls: calls }
+        Message::Assistant {
+            text: text.into(),
+            tool_calls: calls,
+        }
     }
 
     #[test]
     fn tool_loop_then_final_answer() {
         let ctx = Context::new();
-        let llm = Script(RefCell::new(vec![asst("", vec![call("1", "echo")]), asst("done", vec![])]));
-        let agent = Agent { ctx: &ctx, llm: &llm, tools: vec![Box::new(Echo)], approver: &AllowAll, log: &SessionLog::none(), max_steps: 5 };
+        let llm = Script(RefCell::new(vec![
+            asst("", vec![call("1", "echo")]),
+            asst("done", vec![]),
+        ]));
+        let agent = Agent {
+            ctx: &ctx,
+            llm: &llm,
+            tools: vec![Box::new(Echo)],
+            approver: &AllowAll,
+            log: &SessionLog::none(),
+            max_steps: 5,
+        };
         let mut h = vec![];
         assert_eq!(agent.run_turn(&mut h, "go").unwrap(), "done");
         assert!(matches!(&h[2], Message::Tool { content, .. } if content == "hi"));
@@ -235,8 +290,18 @@ mod tests {
     #[test]
     fn read_only_policy_denies_mutating_tool() {
         let ctx = Context::new();
-        let llm = Script(RefCell::new(vec![asst("", vec![call("1", "write")]), asst("ok", vec![])]));
-        let agent = Agent { ctx: &ctx, llm: &llm, tools: vec![Box::new(Writer)], approver: &ReadOnly, log: &SessionLog::none(), max_steps: 5 };
+        let llm = Script(RefCell::new(vec![
+            asst("", vec![call("1", "write")]),
+            asst("ok", vec![]),
+        ]));
+        let agent = Agent {
+            ctx: &ctx,
+            llm: &llm,
+            tools: vec![Box::new(Writer)],
+            approver: &ReadOnly,
+            log: &SessionLog::none(),
+            max_steps: 5,
+        };
         let mut h = vec![];
         agent.run_turn(&mut h, "go").unwrap();
         assert!(matches!(&h[2], Message::Tool { content, .. } if content.starts_with("denied")));
@@ -245,9 +310,18 @@ mod tests {
     #[test]
     fn step_limit_stops_runaway_loops() {
         let ctx = Context::new();
-        let calls = (0..3).map(|i| asst("", vec![call(&i.to_string(), "echo")])).collect();
+        let calls = (0..3)
+            .map(|i| asst("", vec![call(&i.to_string(), "echo")]))
+            .collect();
         let llm = Script(RefCell::new(calls));
-        let agent = Agent { ctx: &ctx, llm: &llm, tools: vec![Box::new(Echo)], approver: &AllowAll, log: &SessionLog::none(), max_steps: 3 };
+        let agent = Agent {
+            ctx: &ctx,
+            llm: &llm,
+            tools: vec![Box::new(Echo)],
+            approver: &AllowAll,
+            log: &SessionLog::none(),
+            max_steps: 3,
+        };
         assert!(agent.run_turn(&mut vec![], "go").is_err());
     }
 }

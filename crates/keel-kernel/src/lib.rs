@@ -56,14 +56,23 @@ impl Context {
     }
 
     pub fn mount(&self, plugin: &dyn Plugin) -> Mounted {
-        let mut scope = Scope { ctx: self, effects: Vec::new() };
+        let mut scope = Scope {
+            ctx: self,
+            effects: Vec::new(),
+        };
         plugin.apply(&mut scope);
-        Mounted { effects: scope.effects }
+        Mounted {
+            effects: scope.effects,
+        }
     }
 
     pub fn service<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
         let g = self.0.lock().unwrap();
-        g.services.get(&TypeId::of::<T>()).cloned()?.downcast::<T>().ok()
+        g.services
+            .get(&TypeId::of::<T>())
+            .cloned()?
+            .downcast::<T>()
+            .ok()
     }
 
     /// Fire an event to every listener registered for `E`.
@@ -84,7 +93,12 @@ impl Context {
 impl Scope<'_> {
     pub fn provide<T: Any + Send + Sync>(&mut self, svc: T) {
         let id = TypeId::of::<T>();
-        self.ctx.0.lock().unwrap().services.insert(id, Arc::new(svc));
+        self.ctx
+            .0
+            .lock()
+            .unwrap()
+            .services
+            .insert(id, Arc::new(svc));
         let ctx = self.ctx.clone();
         self.effects.push(Box::new(move || {
             ctx.0.lock().unwrap().services.remove(&id);

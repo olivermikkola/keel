@@ -14,7 +14,9 @@ pub fn confine(root: &Path, rel: &str) -> Result<PathBuf> {
     if p.is_absolute() {
         bail!("absolute paths are not allowed: {rel}");
     }
-    if p.components().any(|c| matches!(c, Component::ParentDir | Component::Prefix(_))) {
+    if p.components()
+        .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
+    {
         bail!("path escapes workspace: {rel}");
     }
     Ok(root.join(p))
@@ -33,7 +35,8 @@ fn truncate(mut s: String) -> String {
 }
 
 fn arg<'a>(a: &'a Value, k: &str) -> Result<&'a str> {
-    a[k].as_str().with_context(|| format!("missing string argument `{k}`"))
+    a[k].as_str()
+        .with_context(|| format!("missing string argument `{k}`"))
 }
 
 pub struct ReadFile(pub PathBuf);
@@ -50,7 +53,45 @@ impl Tool for ReadFile {
     }
     fn run(&self, a: &Value) -> Result<String> {
         let p = confine(&self.0, arg(a, "path")?)?;
-        Ok(truncate(std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?))
+        if p.is_dir() {
+            bail!("{} is a directory; use list_dir", p.display());
+        }
+        Ok(truncate(
+            std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?,
+        ))
+    }
+}
+
+/// Read-only directory listing. Exists so models never need `shell` just to `ls`
+/// (a weak model wastes whole steps on denied shell calls otherwise).
+pub struct ListDir(pub PathBuf);
+impl Tool for ListDir {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "list_dir".into(),
+            description: "List entries of a directory relative to the workspace (default '.'). Directories end with '/'.".into(),
+            parameters: json!({"type":"object","properties":{"path":{"type":"string"}}}),
+        }
+    }
+    fn mutating(&self) -> bool {
+        false
+    }
+    fn run(&self, a: &Value) -> Result<String> {
+        let p = confine(&self.0, a["path"].as_str().unwrap_or("."))?;
+        let mut names: Vec<String> = std::fs::read_dir(&p)
+            .with_context(|| format!("listing {}", p.display()))?
+            .filter_map(|e| e.ok())
+            .map(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                if e.path().is_dir() {
+                    format!("{n}/")
+                } else {
+                    n
+                }
+            })
+            .collect();
+        names.sort();
+        Ok(truncate(names.join("\n")))
     }
 }
 
@@ -82,7 +123,8 @@ impl Tool for Shell {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "shell".into(),
-            description: "Run a shell command in the workspace; returns exit code, stdout, stderr.".into(),
+            description: "Run a shell command in the workspace; returns exit code, stdout, stderr."
+                .into(),
             parameters: json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}),
         }
     }
@@ -106,7 +148,12 @@ impl Tool for Shell {
 }
 
 pub fn builtin(root: &Path) -> Vec<Box<dyn Tool>> {
-    vec![Box::new(ReadFile(root.into())), Box::new(WriteFile(root.into())), Box::new(Shell(root.into()))]
+    vec![
+        Box::new(ReadFile(root.into())),
+        Box::new(ListDir(root.into())),
+        Box::new(WriteFile(root.into())),
+        Box::new(Shell(root.into())),
+    ]
 }
 
 #[cfg(test)]
@@ -126,8 +173,13 @@ mod tests {
     fn write_then_read_roundtrip() {
         let d = std::env::temp_dir().join(format!("keel-test-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
-        WriteFile(d.clone()).run(&json!({"path":"x/y.txt","content":"hello"})).unwrap();
-        assert_eq!(ReadFile(d.clone()).run(&json!({"path":"x/y.txt"})).unwrap(), "hello");
+        WriteFile(d.clone())
+            .run(&json!({"path":"x/y.txt","content":"hello"}))
+            .unwrap();
+        assert_eq!(
+            ReadFile(d.clone()).run(&json!({"path":"x/y.txt"})).unwrap(),
+            "hello"
+        );
         std::fs::remove_dir_all(d).unwrap();
     }
 }

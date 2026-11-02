@@ -4,29 +4,45 @@
 //! KEEL_MODEL (default deepseek-chat). Flags: --yolo (allow mutating tools), --log <file>.
 //! Default policy is read-only: mutating tools are denied unless --yolo is given.
 
-use keel_agent::{provider::OpenAiCompat, tools, Agent, AllowAll, Approver, Message, ReadOnly, SessionLog};
+use keel_agent::{
+    provider::OpenAiCompat, tools, Agent, AllowAll, Approver, Message, ReadOnly, SessionLog,
+};
 use keel_kernel::Context;
 
 fn main() -> anyhow::Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let yolo = take_flag(&mut args, "--yolo");
     let log = take_opt(&mut args, "--log");
+    let root_opt = take_opt(&mut args, "--root");
     let prompt = args.join(" ");
     if prompt.is_empty() {
-        eprintln!("usage: keel [--yolo] [--log FILE] \"prompt\"");
+        eprintln!("usage: keel [--yolo] [--root DIR] [--log FILE] \"prompt\"");
         std::process::exit(2);
     }
 
     let llm = OpenAiCompat {
-        base_url: std::env::var("KEEL_BASE_URL").unwrap_or_else(|_| "https://api.deepseek.com".into()),
-        api_key: std::env::var("KEEL_API_KEY").or_else(|_| std::env::var("DEEPSEEK_API_KEY")).ok(),
+        base_url: std::env::var("KEEL_BASE_URL")
+            .unwrap_or_else(|_| "https://api.deepseek.com".into()),
+        api_key: std::env::var("KEEL_API_KEY")
+            .or_else(|_| std::env::var("DEEPSEEK_API_KEY"))
+            .ok(),
         model: std::env::var("KEEL_MODEL").unwrap_or_else(|_| "deepseek-chat".into()),
     };
     let ctx = Context::new();
     let session = log.map(SessionLog::file).unwrap_or_else(SessionLog::none);
     let approver: &dyn Approver = if yolo { &AllowAll } else { &ReadOnly };
-    let root = std::env::current_dir()?;
-    let agent = Agent { ctx: &ctx, llm: &llm, tools: tools::builtin(&root), approver, log: &session, max_steps: 40 };
+    let root = match root_opt {
+        Some(r) => std::fs::canonicalize(r)?,
+        None => std::env::current_dir()?,
+    };
+    let agent = Agent {
+        ctx: &ctx,
+        llm: &llm,
+        tools: tools::builtin(&root),
+        approver,
+        log: &session,
+        max_steps: 40,
+    };
 
     let mut history = vec![Message::System {
         text: format!("You are a coding agent working in {}. Use tools to inspect and change files. Be concise.", root.display()),
