@@ -47,7 +47,9 @@ fn main() -> anyhow::Result<()> {
     let yolo = take_flag(&mut args, "--yolo");
     let no_sandbox = take_flag(&mut args, "--no-sandbox");
     let dump_config = take_flag(&mut args, "--dump-config");
-    let log = take_opt(&mut args, "--log");
+    let interactive = take_flag(&mut args, "-i") || take_flag(&mut args, "--interactive");
+    let mut log_opt = take_opt(&mut args, "--log");
+    let resume_opt = take_opt(&mut args, "--resume");
     let root_opt = take_opt(&mut args, "--root");
     let verify_cmd = take_opt(&mut args, "--verify");
     let runs: usize = take_opt(&mut args, "--runs")
@@ -58,11 +60,17 @@ fn main() -> anyhow::Result<()> {
         args.remove(0);
     }
     let prompt = args.join(" ");
-    if prompt.is_empty() && !bench_mode && !dump_config {
+    if take_flag(&mut args, "--help") || take_flag(&mut args, "-h") {
         eprintln!(
-            "usage: keel [--yolo] [--no-sandbox] [--dump-config] [--verify CMD] [--root DIR] [--log FILE] \"prompt\""
+            "usage: keel [--yolo] [--no-sandbox] [--dump-config] [--verify CMD] [--root DIR] [--log FILE] [--resume FILE] [-i|--interactive] [\"prompt\"]"
         );
-        std::process::exit(2);
+        return Ok(());
+    }
+
+    if log_opt.is_none() {
+        if let Some(r) = &resume_opt {
+            log_opt = Some(r.clone());
+        }
     }
 
     let llm = Arc::new(OpenAiCompat {
@@ -82,7 +90,9 @@ fn main() -> anyhow::Result<()> {
         Some(r) => std::fs::canonicalize(r)?,
         None => std::env::current_dir()?,
     };
-    let session = log.map(SessionLog::file).unwrap_or_else(SessionLog::none);
+    let session = log_opt
+        .map(SessionLog::file)
+        .unwrap_or_else(SessionLog::none);
     let approver: Arc<dyn Approver> = if yolo {
         Arc::new(AllowAll)
     } else {
@@ -134,8 +144,56 @@ fn main() -> anyhow::Result<()> {
         }
     }
     let mut history = vec![Message::System { text: sys_text }];
-    Agent::run_from_context(&ctx, &mut history, &prompt, 40)?;
-    println!();
+
+    if let Some(res_path) = &resume_opt {
+        match SessionLog::read_history(res_path) {
+            Ok(prev) => {
+                println!("Loaded {} previous messages from {}", prev.len(), res_path);
+                history.extend(prev);
+            }
+            Err(e) => eprintln!("warning: failed to resume from {res_path}: {e:#}"),
+        }
+    }
+
+    if prompt.is_empty() || interactive {
+        println!("keel v0.0.1 (interactive REPL, root: {})", root.display());
+        println!("Commands: /clear, /history, exit, quit.\n");
+        let stdin = std::io::stdin();
+        loop {
+            print!("keel> ");
+            let _ = std::io::stdout().flush();
+            let mut line = String::new();
+            if stdin.read_line(&mut line)? == 0 {
+                println!();
+                break;
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if matches!(trimmed, "exit" | "quit") {
+                break;
+            }
+            if trimmed == "/clear" {
+                history.truncate(1);
+                println!("History cleared.\n");
+                continue;
+            }
+            if trimmed == "/history" {
+                println!("Active conversation depth: {} messages.\n", history.len());
+                continue;
+            }
+            if let Err(e) = Agent::run_from_context(&ctx, &mut history, trimmed, 40) {
+                eprintln!("\nerror: {e:#}\n");
+            } else {
+                println!();
+            }
+        }
+    } else {
+        Agent::run_from_context(&ctx, &mut history, &prompt, 40)?;
+        println!();
+    }
+
     Ok(())
 }
 
