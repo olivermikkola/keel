@@ -13,7 +13,15 @@ A **model-agnostic, Rust, everything-is-a-plugin CLI coding agent harness.** Pri
 
 ## Status
 
-Kernel skeleton only (`cargo test` passes: effects unwind on unload). Everything else is plan.
+**M1 first cut works** (8 tests, clippy clean): turn/step agent loop, OpenAI-compatible provider (DeepSeek default), `read_file`/`write_file`/`shell` tools, approval policy (read-only by default, `--yolo` to allow mutation), JSONL session log.
+
+```
+export DEEPSEEK_API_KEY=...        # or KEEL_BASE_URL / KEEL_API_KEY / KEEL_MODEL for any compatible API
+keel "explain this repo"           # read-only
+keel --yolo --log s.jsonl "fix the failing test"
+```
+
+**Known gaps (honest list):** not yet exercised against a live model; no streaming; the loop takes its seams as struct fields rather than kernel services (the next refactor); path confinement is lexical, so symlinks inside the workspace can escape (needs `canonicalize` + Landlock); `shell` is unsandboxed; no compaction, no MCP, no TUI.
 
 ## Roadmap
 

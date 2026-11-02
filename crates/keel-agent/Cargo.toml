@@ -1,0 +1,13 @@
+[package]
+name = "keel-agent"
+description = "Agent loop, tools, approvals, session log, providers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+keel-kernel = { path = "../keel-kernel" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+ureq = { version = "2", features = ["json"] }
