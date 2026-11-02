@@ -11,6 +11,8 @@
 //! until the model stops requesting tools. Lifecycle events are emitted on the
 //! kernel [`Context`] so other plugins can observe them.
 
+pub mod compaction;
+pub mod guard;
 pub mod provider;
 pub mod sandbox;
 pub mod tools;
@@ -334,6 +336,9 @@ impl Agent<'_> {
 
         for step in 0..self.max_steps {
             self.ctx.emit(&StepStart(step));
+            if let Some(pruner) = self.ctx.service::<compaction::ToolResultPruner>() {
+                pruner.prune_history(history);
+            }
             let mut reply = self
                 .llm
                 .complete_streaming(history, &specs, &mut |c| self.ctx.emit(&c))?;
@@ -360,7 +365,12 @@ impl Agent<'_> {
                 return Ok(text);
             }
             for call in tool_calls {
-                let out = self.execute(&call);
+                let mut out = self.execute(&call);
+                if let Some(guard) = self.ctx.service::<guard::RepeatToolGuard>() {
+                    if let Some(reminder) = guard.observe(&call) {
+                        out.push_str(&reminder);
+                    }
+                }
                 self.log
                     .append("tool", serde_json::json!({"id": call.id, "content": out}))?;
                 history.push(Message::Tool {

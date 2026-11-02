@@ -3,8 +3,9 @@
 //! and `shell` is confined by Linux Landlock to the task temp dir + `/tmp`.
 
 use keel_agent::{
-    sandbox::LandlockPlugin, tools::BuiltinToolsPlugin, Agent, AllowAll, ApproverPlugin, Chunk,
-    Llm, LlmPlugin, Message, SessionLog, SessionLogPlugin,
+    compaction::ToolResultPrunerPlugin, guard::RepeatToolReminderPlugin, sandbox::LandlockPlugin,
+    tools::BuiltinToolsPlugin, Agent, AllowAll, ApproverPlugin, Chunk, Llm, LlmPlugin, Message,
+    SessionLog, SessionLogPlugin,
 };
 use keel_kernel::{Context, Plugin, Scope};
 use std::path::Path;
@@ -217,6 +218,8 @@ pub fn run(llm: &dyn Llm, filter: Option<&str>, runs: usize) -> anyhow::Result<(
                 root: dir.clone(),
                 landlock_enabled: true,
             });
+            let _p_guard = ctx.mount(&RepeatToolReminderPlugin::default());
+            let _p_pruner = ctx.mount(&ToolResultPrunerPlugin::default());
 
             let mut history = vec![Message::System {
                 text: format!(

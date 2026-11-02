@@ -1,10 +1,11 @@
 //! keel-kernel: everything is a plugin.
 //!
-//! A [`Context`] hosts services (typed singletons) and event listeners.
+//! A [`Context`] hosts services (typed singletons), event listeners, and a manifest
+//! of mounted plugins (like `dsh --dump-config`).
 //! Plugins mount onto a context and register services/listeners through a
 //! [`Scope`]. Every registration is an *effect* that is undone, in reverse
 //! order, when the plugin unloads. There is no privileged core: the model
-//! adapter, tools, session log and agent loop are all plugins.
+//! adapter, tools, session log, guards, compaction, and agent loop are all plugins.
 //!
 //! Inspired by Cordis (as used by DeepSeek Harness); written from scratch.
 
@@ -18,6 +19,7 @@ type Listener = Arc<dyn Fn(&dyn Any) + Send + Sync>;
 struct Inner {
     services: HashMap<TypeId, Arc<dyn Any + Send + Sync>>,
     listeners: HashMap<TypeId, Vec<(u64, Listener)>>,
+    mounted: Vec<(u64, String)>,
     next_id: u64,
 }
 
@@ -60,10 +62,37 @@ impl Context {
             ctx: self,
             effects: Vec::new(),
         };
+        let pid = {
+            let mut g = self.0.lock().unwrap();
+            g.next_id += 1;
+            let pid = g.next_id;
+            g.mounted.push((pid, plugin.name().to_string()));
+            pid
+        };
+        let ctx_clone = self.clone();
+        scope.effects.push(Box::new(move || {
+            ctx_clone
+                .0
+                .lock()
+                .unwrap()
+                .mounted
+                .retain(|(id, _)| *id != pid);
+        }));
         plugin.apply(&mut scope);
         Mounted {
             effects: scope.effects,
         }
+    }
+
+    /// Returns the ordered list of currently mounted plugin names (for `--dump-config`).
+    pub fn mounted_plugins(&self) -> Vec<String> {
+        self.0
+            .lock()
+            .unwrap()
+            .mounted
+            .iter()
+            .map(|(_, name)| name.clone())
+            .collect()
     }
 
     pub fn service<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
@@ -159,6 +188,7 @@ mod tests {
         let ctx = Context::new();
         let n = Arc::new(AtomicUsize::new(0));
         let m = ctx.mount(&Demo(n.clone()));
+        assert_eq!(ctx.mounted_plugins(), vec!["demo"]);
         assert_eq!(ctx.service::<Greeter>().unwrap().0, "hi");
         ctx.emit(&Ping);
         assert_eq!(n.load(Ordering::SeqCst), 1);
@@ -166,5 +196,6 @@ mod tests {
         ctx.emit(&Ping);
         assert_eq!(n.load(Ordering::SeqCst), 1);
         assert!(ctx.service::<Greeter>().is_none());
+        assert!(ctx.mounted_plugins().is_empty());
     }
 }

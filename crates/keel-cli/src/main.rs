@@ -6,8 +6,13 @@
 
 use keel_agent::Chunk;
 use keel_agent::{
-    provider::OpenAiCompat, sandbox::LandlockPlugin, tools::BuiltinToolsPlugin, Agent, AllowAll,
-    Approver, ApproverPlugin, LlmPlugin, Message, ReadOnly, SessionLog, SessionLogPlugin,
+    compaction::{ToolResultPrunerPlugin, WorkspaceContextPlugin, WorkspaceInstructions},
+    guard::RepeatToolReminderPlugin,
+    provider::OpenAiCompat,
+    sandbox::LandlockPlugin,
+    tools::BuiltinToolsPlugin,
+    Agent, AllowAll, Approver, ApproverPlugin, LlmPlugin, Message, ReadOnly, SessionLog,
+    SessionLogPlugin,
 };
 use keel_kernel::{Context, Plugin, Scope};
 use std::io::Write;
@@ -39,6 +44,7 @@ fn main() -> anyhow::Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let yolo = take_flag(&mut args, "--yolo");
     let no_sandbox = take_flag(&mut args, "--no-sandbox");
+    let dump_config = take_flag(&mut args, "--dump-config");
     let log = take_opt(&mut args, "--log");
     let root_opt = take_opt(&mut args, "--root");
     let runs: usize = take_opt(&mut args, "--runs")
@@ -49,8 +55,10 @@ fn main() -> anyhow::Result<()> {
         args.remove(0);
     }
     let prompt = args.join(" ");
-    if prompt.is_empty() && !bench_mode {
-        eprintln!("usage: keel [--yolo] [--no-sandbox] [--root DIR] [--log FILE] \"prompt\"");
+    if prompt.is_empty() && !bench_mode && !dump_config {
+        eprintln!(
+            "usage: keel [--yolo] [--no-sandbox] [--dump-config] [--root DIR] [--log FILE] \"prompt\""
+        );
         std::process::exit(2);
     }
 
@@ -92,13 +100,29 @@ fn main() -> anyhow::Result<()> {
         root: root.clone(),
         landlock_enabled: !no_sandbox,
     });
+    let _p_guard = ctx.mount(&RepeatToolReminderPlugin::default());
+    let _p_pruner = ctx.mount(&ToolResultPrunerPlugin::default());
+    let _p_ws = ctx.mount(&WorkspaceContextPlugin { root: root.clone() });
 
-    let mut history = vec![Message::System {
-        text: format!(
-            "You are a coding agent working in {}. Use tools to inspect and change files. Be concise.",
-            root.display()
-        ),
-    }];
+    if dump_config {
+        println!("# keel composed plugin tree (root: {})", root.display());
+        for (i, name) in ctx.mounted_plugins().iter().enumerate() {
+            println!("{}. {}", i + 1, name);
+        }
+        return Ok(());
+    }
+
+    let mut sys_text = format!(
+        "You are a coding agent working in {}. Use tools to inspect and change files. Be concise.",
+        root.display()
+    );
+    if let Some(ws) = ctx.service::<WorkspaceInstructions>() {
+        if !ws.extra_system_prompt.is_empty() {
+            sys_text.push_str("\n\n");
+            sys_text.push_str(&ws.extra_system_prompt);
+        }
+    }
+    let mut history = vec![Message::System { text: sys_text }];
     Agent::run_from_context(&ctx, &mut history, &prompt, 40)?;
     println!();
     Ok(())
