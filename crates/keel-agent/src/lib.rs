@@ -11,6 +11,7 @@
 //! until the model stops requesting tools. Lifecycle events are emitted on the
 //! kernel [`Context`] so other plugins can observe them.
 
+pub mod checkpoint;
 pub mod compaction;
 pub mod guard;
 pub mod patch;
@@ -368,6 +369,21 @@ impl Agent<'_> {
 
     /// Run one turn against `history` (mutated in place). Returns the final assistant text.
     pub fn run_turn(&self, history: &mut Vec<Message>, user: &str) -> Result<String> {
+        let policy = self
+            .ctx
+            .service::<checkpoint::CheckpointPolicy>()
+            .map(|p| (*p).clone())
+            .unwrap_or_default();
+        let pre_turn_ckpt = if policy.auto_checkpoint || policy.auto_rollback {
+            if let Some(mgr) = self.ctx.service::<checkpoint::CheckpointManager>() {
+                mgr.save("pre-turn automatic checkpoint").ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         self.ctx.emit(&TurnStart);
         history.push(Message::User { text: user.into() });
         self.log
@@ -429,6 +445,13 @@ impl Agent<'_> {
                     id: call.id,
                     content: out,
                 });
+            }
+        }
+        if policy.auto_rollback {
+            if let Some(ckpt) = &pre_turn_ckpt {
+                if let Some(mgr) = self.ctx.service::<checkpoint::CheckpointManager>() {
+                    let _ = mgr.restore(&ckpt.id);
+                }
             }
         }
         anyhow::bail!(
@@ -686,5 +709,80 @@ mod tests {
             matches!(&history[2], Message::Tool { id, content } if id == "c1" && content == "ok")
         );
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn auto_rollback_reverts_workspace_on_turn_failure() {
+        let tmp = std::env::temp_dir().join(format!("keel-rollback-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let ctx = Context::new();
+        let _p_ckpt = ctx.mount(&checkpoint::CheckpointPlugin {
+            root: tmp.clone(),
+            auto_checkpoint: true,
+            auto_rollback: true,
+        });
+
+        // Initialize file
+        std::fs::write(tmp.join("state.txt"), "original state\n").unwrap();
+
+        struct Mutator(PathBuf);
+        impl Tool for Mutator {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "mutate".into(),
+                    description: "mutate state".into(),
+                    parameters: serde_json::json!({}),
+                }
+            }
+            fn mutating(&self) -> bool {
+                true
+            }
+            fn run(&self, _: &serde_json::Value) -> Result<String> {
+                std::fs::write(self.0.join("state.txt"), "corrupted in turn\n")?;
+                std::fs::write(self.0.join("new_file.txt"), "unwanted file\n")?;
+                Ok("mutated".into())
+            }
+        }
+
+        // Step 0 calls mutating tool; Step 1 & 2 try to finish but verification fails
+        let llm = Script(Mutex::new(vec![
+            asst("Mutating", vec![call("c1", "mutate")]),
+            asst("Done", vec![]),
+            asst("Retry", vec![]),
+        ]));
+
+        let _p_plan = ctx.mount(&plan::PlanPlugin {
+            root: tmp.clone(),
+            verify_command: Some("exit 1".into()),
+        });
+
+        let agent = Agent {
+            ctx: &ctx,
+            llm: &llm,
+            tools: vec![Box::new(Mutator(tmp.clone()))],
+            approver: &AllowAll,
+            log: &SessionLog::none(),
+            max_steps: 2,
+        };
+
+        let mut h = vec![];
+        let res = agent.run_turn(&mut h, "please finish");
+        assert!(
+            res.is_err(),
+            "must fail due to verification gate & step limit"
+        );
+
+        // The auto_rollback must have restored state.txt to "original state\n" and deleted new_file.txt!
+        assert_eq!(
+            std::fs::read_to_string(tmp.join("state.txt")).unwrap(),
+            "original state\n"
+        );
+        assert!(
+            !tmp.join("new_file.txt").exists(),
+            "new_file.txt should have been rolled back"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
