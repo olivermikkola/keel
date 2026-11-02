@@ -13,6 +13,7 @@
 
 pub mod checkpoint;
 pub mod compaction;
+pub mod epistemic;
 pub mod guard;
 pub mod mcp;
 pub mod patch;
@@ -386,6 +387,17 @@ impl Agent<'_> {
         };
 
         self.ctx.emit(&TurnStart);
+        if let Some(store) = self.ctx.service::<epistemic::EpistemicStore>() {
+            let memory_md = store.get().render_markdown();
+            if !memory_md.is_empty() {
+                if let Some(Message::System { text }) = history.first_mut() {
+                    if !text.contains("## Epistemic Working Memory") {
+                        text.push_str("\n\n");
+                        text.push_str(&memory_md);
+                    }
+                }
+            }
+        }
         history.push(Message::User { text: user.into() });
         self.log
             .append("user", serde_json::json!({ "text": user }))?;
@@ -421,6 +433,13 @@ impl Agent<'_> {
                 if let Some(gate) = self.ctx.service::<plan::VerificationGate>() {
                     if let Err(err) = gate.verify() {
                         let cmd_str = gate.command.as_deref().unwrap_or("verification");
+                        if let Some(store) = self.ctx.service::<epistemic::EpistemicStore>() {
+                            let summary = err.lines().take(2).collect::<Vec<_>>().join(" ");
+                            let _ = store.record_failure(
+                                &format!("attempt at step {}", step + 1),
+                                &format!("`{cmd_str}` failed: {summary}"),
+                            );
+                        }
                         let feedback = format!(
                             "[verification gate failed]\nCommand: `{cmd_str}`\n{err}\nDo not finish until verification passes. Fix the issue and verify again."
                         );
@@ -784,6 +803,63 @@ mod tests {
             !tmp.join("new_file.txt").exists(),
             "new_file.txt should have been rolled back"
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn epistemic_memory_injects_into_system_and_captures_gate_failure() {
+        let tmp =
+            std::env::temp_dir().join(format!("keel-epistemic-test-turn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let ctx = Context::new();
+        let _p_epistemic = ctx.mount(&epistemic::EpistemicMemoryPlugin { root: tmp.clone() });
+        let _p_plan = ctx.mount(&plan::PlanPlugin {
+            root: tmp.clone(),
+            verify_command: Some("exit 1".into()),
+        });
+
+        let store = ctx.service::<epistemic::EpistemicStore>().unwrap();
+        store.add_fact("sqlite DB is in /var/db").unwrap();
+        store
+            .set_hypothesis(Some("off by one index".into()))
+            .unwrap();
+
+        let llm = Script(Mutex::new(vec![
+            asst("Trying to finish", vec![]),
+            asst("Second attempt", vec![]),
+        ]));
+
+        let agent = Agent {
+            ctx: &ctx,
+            llm: &llm,
+            tools: vec![Box::new(Echo)],
+            approver: &AllowAll,
+            log: &SessionLog::none(),
+            max_steps: 2,
+        };
+
+        let mut h = vec![Message::System {
+            text: "You are a coding assistant.".into(),
+        }];
+
+        let _ = agent.run_turn(&mut h, "fix it");
+
+        // 1. Verify system message had epistemic memory injected
+        let sys_text = match &h[0] {
+            Message::System { text } => text,
+            _ => panic!("first message must be system"),
+        };
+        assert!(sys_text.contains("## Epistemic Working Memory"));
+        assert!(sys_text.contains("sqlite DB is in /var/db"));
+        assert!(sys_text.contains("off by one index"));
+
+        // 2. Verify that gate failure was recorded as negative knowledge in EpistemicStore
+        let state = store.get();
+        assert!(!state.failed_attempts.is_empty());
+        assert!(state.failed_attempts[0].failure_reason.contains("exit 1"));
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
