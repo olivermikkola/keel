@@ -13,8 +13,10 @@
 use anyhow::Context as _;
 use keel_agent::Chunk;
 use keel_agent::{
+    cascade::CascadeProvider,
     checkpoint::{CheckpointManager, CheckpointPlugin},
     compaction::{ToolResultPrunerPlugin, WorkspaceContextPlugin, WorkspaceInstructions},
+    daemon::{serve_acp, DaemonConfig},
     epistemic::{EpistemicMemoryPlugin, EpistemicStore},
     guard::RepeatToolReminderPlugin,
     lsp::{LspPlugin, LspService},
@@ -26,7 +28,7 @@ use keel_agent::{
     subagent::SubagentPlugin,
     tools::BuiltinToolsPlugin,
     vfs::{TransactionalVfs, VfsMode, VfsPlugin},
-    Agent, AllowAll, ApprovalPolicy, Approver, ApproverPlugin, InteractiveApprover, LlmPlugin,
+    Agent, AllowAll, ApprovalPolicy, Approver, ApproverPlugin, InteractiveApprover, Llm, LlmPlugin,
     Message, ReadOnly, SessionLog, SessionLogPlugin, ToolResult, ToolStart,
 };
 use keel_kernel::{Context, Plugin, Scope};
@@ -114,6 +116,7 @@ fn print_usage() {
   keel lsp <check|def|hover>       Language Server & compiler diagnostics hub
   keel vfs <status|diff|commit|rollback> transactional CoW / shadow VFS control
   keel speculate "prompt" [opts]   parallel best-of-N speculative sandbox tournament
+  keel daemon [options]            ACP bidirectional JSON-RPC 2.0 server over stdio
   keel memory <cmd>                epistemic belief state (show, add-fact, set-hypothesis, clear)
   keel bench [filter] [--runs N]   run benchmark suite
 
@@ -710,7 +713,13 @@ fn main() -> anyhow::Result<()> {
     let candidates_opt: usize = take_opt(&mut args, "--candidates")
         .and_then(|c| c.parse().ok())
         .unwrap_or(2);
+    let cascade_model_opt = take_opt(&mut args, "--cascade")
+        .or_else(|| std::env::var("KEEL_CASCADE_MODEL").ok());
     let apply_winner = take_flag(&mut args, "--apply");
+    let daemon_mode = args.first().map(String::as_str) == Some("daemon");
+    if daemon_mode {
+        args.remove(0);
+    }
     let speculate_mode = args.first().map(String::as_str) == Some("speculate");
     if speculate_mode {
         args.remove(0);
@@ -733,7 +742,7 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    let llm = Arc::new(OpenAiCompat {
+    let primary_llm: Arc<dyn Llm> = Arc::new(OpenAiCompat {
         base_url: std::env::var("KEEL_BASE_URL")
             .unwrap_or_else(|_| "https://api.deepseek.com".into()),
         api_key: std::env::var("KEEL_API_KEY")
@@ -742,6 +751,20 @@ fn main() -> anyhow::Result<()> {
         model: std::env::var("KEEL_MODEL").unwrap_or_else(|_| "deepseek-chat".into()),
         enable_thinking: std::env::var("KEEL_THINKING").ok().map(|v| v != "0"),
     });
+    let llm: Arc<dyn Llm> = if let Some(frontier_model) = cascade_model_opt {
+        let frontier: Arc<dyn Llm> = Arc::new(OpenAiCompat {
+            base_url: std::env::var("KEEL_CASCADE_URL")
+                .unwrap_or_else(|_| "https://api.deepseek.com".into()),
+            api_key: std::env::var("DEEPSEEK_API_KEY")
+                .or_else(|_| std::env::var("KEEL_API_KEY"))
+                .ok(),
+            model: frontier_model,
+            enable_thinking: Some(true),
+        });
+        Arc::new(CascadeProvider::new(primary_llm, frontier, 2))
+    } else {
+        primary_llm
+    };
     if bench_mode {
         return bench::run(llm, args.first().map(String::as_str), runs);
     }
@@ -750,6 +773,33 @@ fn main() -> anyhow::Result<()> {
         Some(r) => std::fs::canonicalize(r)?,
         None => std::env::current_dir()?,
     };
+    if daemon_mode {
+        let policy = if yolo {
+            ApprovalPolicy::Yolo
+        } else if read_only {
+            ApprovalPolicy::ReadOnly
+        } else {
+            safety_mode_opt
+                .or_else(|| std::env::var("KEEL_SAFETY_MODE").ok())
+                .map(|s| ApprovalPolicy::from_str_lossy(&s))
+                .unwrap_or(ApprovalPolicy::Standard)
+        };
+        let cfg = DaemonConfig {
+            root,
+            policy,
+            landlock_enabled: !no_sandbox,
+            vfs_mode: if shadow_vfs {
+                VfsMode::ShadowMemory
+            } else {
+                VfsMode::MaterializedCow
+            },
+            verify_command: verify_cmd,
+        };
+        let stdin = std::io::stdin();
+        let reader = std::io::BufReader::new(stdin.lock());
+        let writer = Box::new(std::io::stdout());
+        return serve_acp(reader, writer, cfg, llm);
+    }
     if speculate_mode {
         if prompt.trim().is_empty() {
             eprintln!(
