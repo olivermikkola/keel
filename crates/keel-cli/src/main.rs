@@ -24,7 +24,7 @@ use keel_agent::{
     subagent::SubagentPlugin,
     tools::BuiltinToolsPlugin,
     Agent, AllowAll, Approver, ApproverPlugin, LlmPlugin, Message, ReadOnly, SessionLog,
-    SessionLogPlugin,
+    SessionLogPlugin, ToolResult, ToolStart,
 };
 use keel_kernel::{Context, Plugin, Scope};
 use std::io::Write;
@@ -69,6 +69,26 @@ impl Plugin for JsonPrinter {
                     serde_json::json!({ "type": "reasoning", "content": t })
                 );
             }
+        });
+        s.on::<ToolStart, _>(|ts| {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "type": "tool_call",
+                    "name": ts.0.name,
+                    "arguments": ts.0.args,
+                })
+            );
+        });
+        s.on::<ToolResult, _>(|tr| {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "type": "tool_result",
+                    "id": tr.0,
+                    "output": tr.1,
+                })
+            );
         });
     }
 }
@@ -550,6 +570,12 @@ fn main() -> anyhow::Result<()> {
     if log_opt.is_none() {
         if let Some(r) = &resume_opt {
             log_opt = Some(r.clone());
+        } else if let Ok(home) = std::env::var("HOME") {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            log_opt = Some(format!("{home}/.keel/sessions/session-{ts}.jsonl"));
         }
     }
 
