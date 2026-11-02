@@ -1,9 +1,12 @@
 //! `keel "prompt"` - one-shot headless run. `keel bench [filter]` - run the benchmark tasks.
+//! `keel patch <file> [diff]` - apply unified diff or search/replace hunks (supports stdin).
+//! `keel edit <file> --old <str> --new <str>` - surgical fuzzy replacement.
 //!
 //! Env: KEEL_THINKING=0 disables model thinking (Qwen templates). KEEL_BASE_URL (default https://api.deepseek.com), KEEL_API_KEY (or DEEPSEEK_API_KEY),
 //! KEEL_MODEL (default deepseek-chat). Flags: --yolo (allow mutating tools), --no-sandbox (disable Landlock), --log <file>.
 //! Default policy is read-only: mutating tools are denied unless --yolo is given.
 
+use anyhow::Context as _;
 use keel_agent::Chunk;
 use keel_agent::{
     compaction::{ToolResultPrunerPlugin, WorkspaceContextPlugin, WorkspaceInstructions},
@@ -42,12 +45,172 @@ impl Plugin for Printer {
     }
 }
 
+/// Machine-readable NDJSON streaming output for calling agents and automated harnesses.
+struct JsonPrinter;
+impl Plugin for JsonPrinter {
+    fn name(&self) -> &str {
+        "json-printer"
+    }
+    fn apply(&self, s: &mut Scope) {
+        s.on::<Chunk, _>(|c| match c {
+            Chunk::Text(t) => {
+                println!("{}", serde_json::json!({ "type": "text", "content": t }));
+            }
+            Chunk::Reasoning(t) => {
+                println!(
+                    "{}",
+                    serde_json::json!({ "type": "reasoning", "content": t })
+                );
+            }
+        });
+    }
+}
+
+fn print_usage() {
+    eprintln!(
+        r#"usage:
+  keel [options] "prompt"          run one-shot agent turn
+  keel run [options] "prompt"      explicit run command
+  keel repl [options]              interactive multi-turn REPL
+  keel patch <file> [diff]         apply diff or search/replace hunks (supports stdin)
+  keel edit <file> --old S --new S surgical fuzzy replacement
+  keel bench [filter] [--runs N]   run benchmark suite
+
+options:
+  --json                           emit machine-readable JSON output
+  --dry-run                        preview patch/edit without writing
+  --yolo                           allow mutating tools (write/edit/patch/shell)
+  --no-sandbox                     disable Linux Landlock sandbox
+  --verify <cmd>                   enforce verification command gate
+  --root <dir>                     workspace root directory
+  --log <file>                     session JSONL log path
+  --resume <file>                  resume session from previous JSONL log
+  --dump-config                    display composed kernel plugin tree"#
+    );
+}
+
+fn cli_patch(mut args: Vec<String>) -> anyhow::Result<()> {
+    let dry_run = take_flag(&mut args, "--dry-run");
+    let json_mode = take_flag(&mut args, "--json");
+    if args.is_empty() {
+        eprintln!("usage: keel patch <file> [patch_file_or_dash] [--dry-run] [--json]");
+        std::process::exit(2);
+    }
+    let target_path = &args[0];
+    let patch_content = if args.len() > 1 && args[1] != "-" {
+        std::fs::read_to_string(&args[1])
+            .with_context(|| format!("reading patch file {}", args[1]))?
+    } else {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .context("reading patch from stdin")?;
+        buf
+    };
+
+    let target_text = std::fs::read_to_string(target_path)
+        .with_context(|| format!("reading target file {target_path}"))?;
+    let outcome = keel_agent::patch::apply_patch(&target_text, &patch_content)?;
+
+    if !dry_run {
+        std::fs::write(target_path, &outcome.modified_text)
+            .with_context(|| format!("writing patched file {target_path}"))?;
+    }
+
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::json!({
+                "status": "ok",
+                "file": target_path,
+                "dry_run": dry_run,
+                "hunks_applied": outcome.hunks_applied,
+                "quality": outcome.quality.to_string(),
+            })
+        );
+    } else {
+        println!(
+            "{} {target_path} ({} hunk(s) applied via {})",
+            if dry_run { "would patch" } else { "patched" },
+            outcome.hunks_applied,
+            outcome.quality
+        );
+    }
+    Ok(())
+}
+
+fn cli_edit(mut args: Vec<String>) -> anyhow::Result<()> {
+    let dry_run = take_flag(&mut args, "--dry-run");
+    let json_mode = take_flag(&mut args, "--json");
+    let old_text = take_opt(&mut args, "--old");
+    let new_text = take_opt(&mut args, "--new");
+    if args.is_empty() || old_text.is_none() || new_text.is_none() {
+        eprintln!("usage: keel edit <file> --old <search> --new <replace> [--dry-run] [--json]");
+        std::process::exit(2);
+    }
+    let target_path = &args[0];
+    let old = old_text.unwrap();
+    let new = new_text.unwrap();
+
+    let target_text = std::fs::read_to_string(target_path)
+        .with_context(|| format!("reading target file {target_path}"))?;
+    let (modified, quality) = keel_agent::patch::fuzzy_replace(&target_text, &old, &new)?;
+
+    if !dry_run {
+        std::fs::write(target_path, &modified)
+            .with_context(|| format!("writing edited file {target_path}"))?;
+    }
+
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::json!({
+                "status": "ok",
+                "file": target_path,
+                "dry_run": dry_run,
+                "quality": quality.to_string(),
+            })
+        );
+    } else {
+        println!(
+            "{} {target_path} ({quality})",
+            if dry_run { "would edit" } else { "edited" },
+        );
+    }
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+
+    if take_flag(&mut args, "--help") || take_flag(&mut args, "-h") {
+        print_usage();
+        return Ok(());
+    }
+
+    if args.first().map(String::as_str) == Some("patch") {
+        args.remove(0);
+        return cli_patch(args);
+    }
+    if args.first().map(String::as_str) == Some("edit") {
+        args.remove(0);
+        return cli_edit(args);
+    }
+
+    let mut interactive = take_flag(&mut args, "-i") || take_flag(&mut args, "--interactive");
+    if args.first().map(String::as_str) == Some("repl") {
+        args.remove(0);
+        interactive = true;
+    }
+    if args.first().map(String::as_str) == Some("run") {
+        args.remove(0);
+    }
+
     let yolo = take_flag(&mut args, "--yolo");
     let no_sandbox = take_flag(&mut args, "--no-sandbox");
     let dump_config = take_flag(&mut args, "--dump-config");
-    let interactive = take_flag(&mut args, "-i") || take_flag(&mut args, "--interactive");
+    let json_mode = take_flag(&mut args, "--json");
     let mut log_opt = take_opt(&mut args, "--log");
     let resume_opt = take_opt(&mut args, "--resume");
     let root_opt = take_opt(&mut args, "--root");
@@ -60,12 +223,6 @@ fn main() -> anyhow::Result<()> {
         args.remove(0);
     }
     let prompt = args.join(" ");
-    if take_flag(&mut args, "--help") || take_flag(&mut args, "-h") {
-        eprintln!(
-            "usage: keel [--yolo] [--no-sandbox] [--dump-config] [--verify CMD] [--root DIR] [--log FILE] [--resume FILE] [-i|--interactive] [\"prompt\"]"
-        );
-        return Ok(());
-    }
 
     if log_opt.is_none() {
         if let Some(r) = &resume_opt {
@@ -101,7 +258,11 @@ fn main() -> anyhow::Result<()> {
 
     // Everything is mounted as a plugin onto the kernel Context.
     let ctx = Context::new();
-    let _p_printer = ctx.mount(&Printer);
+    if json_mode {
+        ctx.mount(&JsonPrinter);
+    } else {
+        ctx.mount(&Printer);
+    }
     let _p_llm = ctx.mount(&LlmPlugin(llm));
     let _p_approver = ctx.mount(&ApproverPlugin(approver));
     let _p_log = ctx.mount(&SessionLogPlugin(session));
@@ -148,7 +309,9 @@ fn main() -> anyhow::Result<()> {
     if let Some(res_path) = &resume_opt {
         match SessionLog::read_history(res_path) {
             Ok(prev) => {
-                println!("Loaded {} previous messages from {}", prev.len(), res_path);
+                if !json_mode {
+                    println!("Loaded {} previous messages from {}", prev.len(), res_path);
+                }
                 history.extend(prev);
             }
             Err(e) => eprintln!("warning: failed to resume from {res_path}: {e:#}"),
@@ -190,8 +353,37 @@ fn main() -> anyhow::Result<()> {
             }
         }
     } else {
-        Agent::run_from_context(&ctx, &mut history, &prompt, 40)?;
-        println!();
+        match Agent::run_from_context(&ctx, &mut history, &prompt, 40) {
+            Ok(ans) => {
+                if json_mode {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "type": "done",
+                            "status": "ok",
+                            "answer": ans,
+                        })
+                    );
+                } else {
+                    println!();
+                }
+            }
+            Err(e) => {
+                if json_mode {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "type": "done",
+                            "status": "error",
+                            "error": format!("{e:#}"),
+                        })
+                    );
+                    std::process::exit(1);
+                } else {
+                    return Err(e);
+                }
+            }
+        }
     }
 
     Ok(())

@@ -130,14 +130,14 @@ impl Tool for WriteFile {
     }
 }
 
-/// Surgical edit: replace exactly one occurrence of `old` with `new`.
-/// Ambiguity is an error, so a weak model can't silently edit the wrong place.
+/// Surgical edit: replace one occurrence of `old` with `new`.
+/// Supports exact match, whitespace-normalized line matching, and fuzzy matching.
 pub struct EditFile(pub PathBuf);
 impl Tool for EditFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "edit_file".into(),
-            description: "Replace one exact occurrence of `old` with `new` in a file. `old` must match exactly once; include surrounding lines if needed to make it unique.".into(),
+            description: "Replace one occurrence of `old` with `new` in a file. Resilient to whitespace and indentation differences. Include surrounding lines if needed to make it unique.".into(),
             parameters: json!({"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"}},"required":["path","old","new"]}),
         }
     }
@@ -147,25 +147,43 @@ impl Tool for EditFile {
     fn run(&self, a: &Value) -> Result<String> {
         let p = confine(&self.0, arg(a, "path")?)?;
         let (old, new) = (arg(a, "old")?, arg(a, "new")?);
-        if old.is_empty() {
-            bail!("`old` must not be empty");
-        }
         let text =
             std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
-        match text.matches(old).count() {
-            0 => bail!(
-                "`old` not found in {} (it must match exactly, including whitespace)",
-                p.display()
-            ),
-            1 => {
-                std::fs::write(&p, text.replacen(old, new, 1))?;
-                Ok(format!("edited {}", p.display()))
-            }
-            n => bail!(
-                "`old` matches {n} places in {}; add more surrounding context to make it unique",
-                p.display()
-            ),
+        let (updated, quality) = crate::patch::fuzzy_replace(&text, old, new)?;
+        std::fs::write(&p, updated)?;
+        match quality {
+            crate::patch::MatchQuality::Exact => Ok(format!("edited {}", p.display())),
+            other => Ok(format!("edited {} ({other})", p.display())),
         }
+    }
+}
+
+/// Multi-hunk patch tool: applies search/replace blocks or unified diff hunks.
+pub struct PatchFile(pub PathBuf);
+impl Tool for PatchFile {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "patch_file".into(),
+            description: "Apply unified diff hunks (@@ ... @@) or search/replace blocks (<<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE) to a file. Resilient to indentation and whitespace drift.".into(),
+            parameters: json!({"type":"object","properties":{"path":{"type":"string"},"patch":{"type":"string"}},"required":["path","patch"]}),
+        }
+    }
+    fn mutating(&self) -> bool {
+        true
+    }
+    fn run(&self, a: &Value) -> Result<String> {
+        let p = confine(&self.0, arg(a, "path")?)?;
+        let patch_text = arg(a, "patch")?;
+        let text =
+            std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
+        let outcome = crate::patch::apply_patch(&text, patch_text)?;
+        std::fs::write(&p, outcome.modified_text)?;
+        Ok(format!(
+            "patched {} ({} hunk(s) applied via {})",
+            p.display(),
+            outcome.hunks_applied,
+            outcome.quality
+        ))
     }
 }
 
@@ -284,6 +302,7 @@ pub fn builtin(root: &Path) -> Vec<Box<dyn Tool>> {
         Box::new(ListDir(root.into())),
         Box::new(Grep(root.into())),
         Box::new(EditFile(root.into())),
+        Box::new(PatchFile(root.into())),
         Box::new(WriteFile(root.into())),
         Box::new(Shell::new(root.into())),
     ]
@@ -310,6 +329,7 @@ impl Plugin for BuiltinToolsPlugin {
         reg.register(Arc::new(ListDir(r.clone())));
         reg.register(Arc::new(Grep(r.clone())));
         reg.register(Arc::new(EditFile(r.clone())));
+        reg.register(Arc::new(PatchFile(r.clone())));
         reg.register(Arc::new(WriteFile(r.clone())));
         reg.register(Arc::new(Shell {
             root: r.clone(),
@@ -389,5 +409,43 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(ws);
         let _ = std::fs::remove_file(outside);
+    }
+
+    #[test]
+    fn patch_file_tool_and_fuzzy_edit_work() {
+        let d = std::env::temp_dir().join(format!("keel-test-patch-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let target = d.join("app.rs");
+        std::fs::write(&target, "fn run() {\n    let count = 0;\n    count\n}\n").unwrap();
+
+        // 1. Test resilient edit with indentation discrepancy (2 spaces vs 4)
+        let edit = EditFile(d.clone());
+        let res = edit
+            .run(&json!({
+                "path": "app.rs",
+                "old": "  let count = 0;\n",
+                "new": "    let count = 10;\n"
+            }))
+            .unwrap();
+        assert!(res.contains("edited"));
+        assert!(std::fs::read_to_string(&target)
+            .unwrap()
+            .contains("let count = 10;"));
+
+        // 2. Test patch tool with Search/Replace block
+        let patch = PatchFile(d.clone());
+        let block = "<<<<<<< SEARCH\n    count\n=======\n    count + 1\n>>>>>>> REPLACE\n";
+        let res2 = patch
+            .run(&json!({
+                "path": "app.rs",
+                "patch": block
+            }))
+            .unwrap();
+        assert!(res2.contains("patched"));
+        assert!(std::fs::read_to_string(&target)
+            .unwrap()
+            .contains("count + 1"));
+
+        let _ = std::fs::remove_dir_all(d);
     }
 }
