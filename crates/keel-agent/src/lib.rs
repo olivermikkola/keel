@@ -14,6 +14,7 @@
 pub mod checkpoint;
 pub mod compaction;
 pub mod guard;
+pub mod mcp;
 pub mod patch;
 pub mod plan;
 pub mod provider;
