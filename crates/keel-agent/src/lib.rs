@@ -16,6 +16,7 @@ pub mod guard;
 pub mod plan;
 pub mod provider;
 pub mod sandbox;
+pub mod subagent;
 pub mod tools;
 
 use anyhow::Result;
