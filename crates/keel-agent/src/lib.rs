@@ -21,6 +21,7 @@ pub mod patch;
 pub mod plan;
 pub mod provider;
 pub mod sandbox;
+pub mod speculate;
 pub mod subagent;
 pub mod tools;
 pub mod vfs;
