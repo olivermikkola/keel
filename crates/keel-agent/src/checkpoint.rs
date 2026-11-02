@@ -72,6 +72,12 @@ impl CheckpointManager {
     }
 
     fn ensure_git_repo(&self) -> Result<()> {
+        if is_forbidden_checkpoint_root(&self.root) {
+            bail!(
+                "refusing to initialize or run git checkpoint in protected directory: {}",
+                self.root.display()
+            );
+        }
         if !self.root.join(".git").exists() {
             self.run_git(&["init"], &[])
                 .context("initializing git repo for checkpoints")?;
@@ -117,13 +123,13 @@ impl CheckpointManager {
         // 1. Stage all working tree files into the temporary index
         let add_res = self.run_git(&["add", "-A"], &[("GIT_INDEX_FILE", &tmp_idx_str)]);
         if let Err(e) = add_res {
-            let _ = std::fs::remove_file(&tmp_idx);
+            cleanup_temp_index(&tmp_idx);
             return Err(e);
         }
 
         // 2. Write tree object from temporary index
         let tree_res = self.run_git(&["write-tree"], &[("GIT_INDEX_FILE", &tmp_idx_str)]);
-        let _ = std::fs::remove_file(&tmp_idx);
+        cleanup_temp_index(&tmp_idx);
         let tree_hash = tree_res?.trim().to_string();
 
         // 3. Commit the tree
@@ -179,7 +185,7 @@ impl CheckpointManager {
             &[("GIT_INDEX_FILE", &tmp_idx_str)],
         );
         if let Err(e) = read_res {
-            let _ = std::fs::remove_file(&tmp_idx);
+            cleanup_temp_index(&tmp_idx);
             return Err(e);
         }
 
@@ -188,19 +194,33 @@ impl CheckpointManager {
             &["checkout-index", "-a", "-f"],
             &[("GIT_INDEX_FILE", &tmp_idx_str)],
         );
-        let _ = std::fs::remove_file(&tmp_idx);
-        checkout_res?;
+        if let Err(e) = checkout_res {
+            cleanup_temp_index(&tmp_idx);
+            return Err(e);
+        }
 
         // 3. Collect all files that belong to the checkpoint
         let ls_out = self.run_git(&["ls-tree", "-r", "--name-only", &target.tree_hash], &[])?;
         let tree_files: HashSet<String> = ls_out.lines().map(|s| s.trim().to_string()).collect();
 
-        // 4. Remove any files in the workspace that were created after the checkpoint
+        // 4. Remove any non-ignored files in the workspace that were created after the checkpoint.
+        // Using `git ls-files --cached --others --exclude-standard` respects `.gitignore` rules so
+        // ignored files (e.g., `.env`, `node_modules`, `.venv`, build caches) are never deleted.
+        let candidates_res = self.run_git(
+            &["ls-files", "--cached", "--others", "--exclude-standard"],
+            &[("GIT_INDEX_FILE", &tmp_idx_str)],
+        );
+        cleanup_temp_index(&tmp_idx);
+        let candidates = candidates_res?;
+
         let mut removed_count = 0;
-        let walk = walk_dir_relative(&self.root)?;
-        for rel in walk {
-            if !tree_files.contains(&rel) {
-                let full = self.root.join(&rel);
+        for line in candidates.lines() {
+            let rel = line.trim();
+            if rel.is_empty() || rel.starts_with(".keel/") || rel == ".keel" {
+                continue;
+            }
+            if !tree_files.contains(rel) {
+                let full = self.root.join(rel);
                 if full.is_file() {
                     let _ = std::fs::remove_file(&full);
                     removed_count += 1;
@@ -242,43 +262,41 @@ impl CheckpointManager {
 
         let add_res = self.run_git(&["add", "-A"], &[("GIT_INDEX_FILE", &tmp_idx_str)]);
         if let Err(e) = add_res {
-            let _ = std::fs::remove_file(&tmp_idx);
+            cleanup_temp_index(&tmp_idx);
             return Err(e);
         }
         let tree_res = self.run_git(&["write-tree"], &[("GIT_INDEX_FILE", &tmp_idx_str)]);
-        let _ = std::fs::remove_file(&tmp_idx);
+        cleanup_temp_index(&tmp_idx);
         let curr_tree = tree_res?.trim().to_string();
 
         self.run_git(&["diff", &target.tree_hash, &curr_tree], &[])
     }
 }
 
-fn walk_dir_relative(root: &Path) -> Result<Vec<String>> {
-    let mut files = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
+fn cleanup_temp_index(idx_path: &Path) {
+    let _ = std::fs::remove_file(idx_path);
+    let lock_path = idx_path.with_extension("lock");
+    let _ = std::fs::remove_file(lock_path);
+    let appended_lock = PathBuf::from(format!("{}.lock", idx_path.display()));
+    let _ = std::fs::remove_file(appended_lock);
+}
 
-    while let Some(dir) = stack.pop() {
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str == ".git" || name_str == "target" || name_str == ".keel" {
-                continue;
-            }
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.is_file() {
-                if let Ok(rel) = path.strip_prefix(root) {
-                    files.push(rel.to_string_lossy().to_string());
-                }
-            }
+/// Returns true if `root` is `$HOME` or a top-level system directory where
+/// automatic `git init` / `git add -A` must never run.
+pub fn is_forbidden_checkpoint_root(root: &Path) -> bool {
+    let canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    if let Ok(home) = std::env::var("HOME") {
+        let home_path = PathBuf::from(&home);
+        let canon_home = home_path.canonicalize().unwrap_or(home_path);
+        if canon == canon_home {
+            return true;
         }
     }
-    Ok(files)
+    let s = canon.to_string_lossy();
+    matches!(
+        s.as_ref(),
+        "/" | "/home" | "/root" | "/tmp" | "/var" | "/var/tmp" | "/etc" | "/usr"
+    )
 }
 
 /// Policy controlling automatic snapshot and auto-rollback behavior.
@@ -353,5 +371,58 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn checkpoint_restore_preserves_gitignored_and_keel_files() {
+        let tmp =
+            std::env::temp_dir().join(format!("keel-ckpt-gitignore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let mgr = CheckpointManager::new(tmp.clone());
+        mgr.ensure_git_repo().unwrap();
+
+        // Create .gitignore, tracked file, and ignored .env + node_modules file
+        std::fs::write(tmp.join(".gitignore"), ".env\nnode_modules/\n").unwrap();
+        std::fs::write(tmp.join("src.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(tmp.join(".env"), "SECRET_KEY=keep_me\n").unwrap();
+        std::fs::create_dir_all(tmp.join("node_modules/pkg")).unwrap();
+        std::fs::write(tmp.join("node_modules/pkg/index.js"), "module.exports = 1;\n").unwrap();
+        std::fs::create_dir_all(tmp.join(".keel")).unwrap();
+        std::fs::write(tmp.join(".keel/memory.json"), "{}\n").unwrap();
+
+        let _ckpt = mgr.save("with gitignore").unwrap();
+
+        // Mutate tracked file and add an untracked non-ignored file
+        std::fs::write(tmp.join("src.rs"), "broken\n").unwrap();
+        std::fs::write(tmp.join("temp_untracked.txt"), "delete me\n").unwrap();
+
+        let rep = mgr.undo().unwrap();
+        assert_eq!(rep.removed_files, 1);
+        assert_eq!(
+            std::fs::read_to_string(tmp.join("src.rs")).unwrap(),
+            "fn main() {}\n"
+        );
+        assert!(!tmp.join("temp_untracked.txt").exists());
+        // Ignored files and .keel metadata must still exist intact!
+        assert_eq!(
+            std::fs::read_to_string(tmp.join(".env")).unwrap(),
+            "SECRET_KEY=keep_me\n"
+        );
+        assert!(tmp.join("node_modules/pkg/index.js").exists());
+        assert!(tmp.join(".keel/memory.json").exists());
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn checkpoint_refuses_protected_roots() {
+        assert!(is_forbidden_checkpoint_root(Path::new("/")));
+        assert!(is_forbidden_checkpoint_root(Path::new("/tmp")));
+        if let Ok(home) = std::env::var("HOME") {
+            let mgr = CheckpointManager::new(PathBuf::from(home));
+            assert!(mgr.save("should fail").is_err());
+        }
     }
 }
