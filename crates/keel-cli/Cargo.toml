@@ -1,0 +1,13 @@
+[package]
+name = "keel-cli"
+description = "keel command line entrypoint"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "keel"
+path = "src/main.rs"
+
+[dependencies]
+keel-kernel = { path = "../keel-kernel" }
