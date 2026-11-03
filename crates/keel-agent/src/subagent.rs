@@ -255,9 +255,11 @@ impl Plugin for SubagentPlugin {
         let Some(llm) = scope.context().service::<Arc<dyn Llm>>() else {
             return;
         };
-        let Some(reg) = scope.context().service::<ToolRegistry>() else {
-            return;
-        };
+        let reg = scope
+            .context()
+            .service::<ToolRegistry>()
+            .map(|r| (*r).clone())
+            .unwrap_or_default();
         let cancel = scope
             .context()
             .service::<CancelToken>()
@@ -269,6 +271,7 @@ impl Plugin for SubagentPlugin {
             landlock_enabled: self.landlock_enabled,
             cancel_token: cancel,
         }));
+        scope.provide(reg);
     }
 }
 
