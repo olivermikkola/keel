@@ -118,9 +118,11 @@ fn print_usage() {
   keel speculate "prompt" [opts]   parallel best-of-N speculative sandbox tournament
   keel daemon [options]            ACP bidirectional JSON-RPC 2.0 daemon (stdio, socket, tcp)
   keel memory <cmd>                epistemic belief state (show, add-fact, set-hypothesis, clear)
+  keel handoff <cmd>               sovereign cross-harness context distillation (Helm swarm)
   keel bench [filter] [--runs N]   run benchmark suite
 
 options:
+  --handoff <file>                 bootstrap session directly from handoff envelope
   --listen <addr>                  listen on TCP address (e.g. 127.0.0.1:4040)
   --socket <path>                  listen on Unix domain socket (e.g. ~/.keel/daemon.sock)
   --auth-token <token>             enforce bearer authentication token
@@ -579,6 +581,103 @@ fn cli_memory(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result
     Ok(())
 }
 
+fn cli_handoff(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result<()> {
+    let sub = if !args.is_empty() {
+        args.remove(0)
+    } else {
+        "ingest".to_string()
+    };
+    let root = match root_opt {
+        Some(r) => std::fs::canonicalize(r)?,
+        None => std::env::current_dir()?,
+    };
+    match sub.as_str() {
+        "ingest" => {
+            use std::io::Read;
+            let file_arg = args.first().cloned();
+            let raw_json = if let Some(path) = file_arg {
+                if path == "-" {
+                    let mut s = String::new();
+                    std::io::stdin().read_to_string(&mut s)?;
+                    s
+                } else {
+                    std::fs::read_to_string(&path)
+                        .with_context(|| format!("reading handoff file {path}"))?
+                }
+            } else {
+                let mut s = String::new();
+                std::io::stdin().read_to_string(&mut s)?;
+                s
+            };
+            let envelope = keel_agent::swarm::HandoffEnvelope::from_json_str(&raw_json)?;
+            println!(
+                "Ingesting handoff envelope from {} (session: {})...",
+                envelope.source_harness, envelope.source_conversation_id
+            );
+            println!("  Goal: {}", envelope.goal);
+            println!("  Relevant files: {:?}", envelope.relevant_files);
+            println!(
+                "  Tasks: {} open / {} completed",
+                envelope.open_tasks.len(),
+                envelope.completed_tasks.len()
+            );
+
+            let epistemic = keel_agent::epistemic::EpistemicStore::new(Some(
+                keel_agent::epistemic::EpistemicMemoryPlugin::persist_file(&root),
+            ));
+            let _ = epistemic.set_hypothesis(Some(envelope.goal.clone()));
+            for f in &envelope.relevant_files {
+                let _ = epistemic.add_fact(&format!("Relevant file: {f}"));
+            }
+            if !envelope.context_summary.is_empty() {
+                let _ =
+                    epistemic.add_fact(&format!("Context summary: {}", envelope.context_summary));
+            }
+            let _ = epistemic.save_to_file();
+            println!("  Epistemic belief state updated in {}", root.display());
+            println!(
+                "\nSynthesized prompt:\n---\n{}\n---",
+                envelope.synth_prompt()
+            );
+            Ok(())
+        }
+        "export" => {
+            let target_harness = take_opt(&mut args, "--target").unwrap_or_else(|| "helm".into());
+            let epistemic = keel_agent::epistemic::EpistemicStore::new(Some(
+                keel_agent::epistemic::EpistemicMemoryPlugin::persist_file(&root),
+            ));
+            let state = epistemic.get();
+            let goal = state
+                .hypothesis
+                .clone()
+                .unwrap_or_else(|| "Keel workspace".into());
+            let mut relevant_files = Vec::new();
+            for f in &state.facts {
+                if let Some(p) = f.strip_prefix("Relevant file: ") {
+                    relevant_files.push(p.to_string());
+                }
+            }
+            relevant_files.sort();
+            let envelope = keel_agent::swarm::HandoffEnvelope {
+                source_conversation_id: format!("keel-{}", std::process::id()),
+                source_harness: "keel".into(),
+                target_harness,
+                goal,
+                relevant_files,
+                open_tasks: Vec::new(),
+                completed_tasks: Vec::new(),
+                context_summary: state.render_markdown(),
+            };
+            println!("{}", envelope.to_json_pretty()?);
+            Ok(())
+        }
+        other => {
+            eprintln!("unknown handoff subcommand `{other}`. Usage: keel handoff <ingest|export>");
+            std::process::exit(2);
+        }
+    }
+}
+
 fn cli_vfs(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result<()> {
     let json_mode = take_flag(&mut args, "--json");
     let root = match root_opt {
@@ -688,6 +787,10 @@ fn main() -> anyhow::Result<()> {
         args.remove(0);
         return cli_memory(args, root_opt);
     }
+    if args.first().map(String::as_str) == Some("handoff") {
+        args.remove(0);
+        return cli_handoff(args, root_opt);
+    }
 
     let mut interactive = take_flag(&mut args, "-i") || take_flag(&mut args, "--interactive");
     if args.first().map(String::as_str) == Some("repl") {
@@ -719,6 +822,7 @@ fn main() -> anyhow::Result<()> {
     let cascade_model_opt =
         take_opt(&mut args, "--cascade").or_else(|| std::env::var("KEEL_CASCADE_MODEL").ok());
     let apply_winner = take_flag(&mut args, "--apply");
+    let handoff_opt = take_opt(&mut args, "--handoff");
     let listen_opt = take_opt(&mut args, "--listen");
     let socket_opt = take_opt(&mut args, "--socket");
     let auth_token_opt =
@@ -735,7 +839,7 @@ fn main() -> anyhow::Result<()> {
     if bench_mode {
         args.remove(0);
     }
-    let prompt = args.join(" ");
+    let mut prompt = args.join(" ");
 
     if log_opt.is_none() {
         if let Some(r) = &resume_opt {
@@ -780,6 +884,32 @@ fn main() -> anyhow::Result<()> {
         Some(r) => std::fs::canonicalize(r)?,
         None => std::env::current_dir()?,
     };
+    if let Some(path) = handoff_opt {
+        use std::io::Read;
+        let raw_json = if path == "-" {
+            let mut s = String::new();
+            std::io::stdin().read_to_string(&mut s)?;
+            s
+        } else {
+            std::fs::read_to_string(&path)
+                .with_context(|| format!("reading handoff file {path}"))?
+        };
+        let envelope = keel_agent::swarm::HandoffEnvelope::from_json_str(&raw_json)?;
+        if prompt.trim().is_empty() {
+            prompt = envelope.synth_prompt();
+        }
+        let epistemic = keel_agent::epistemic::EpistemicStore::new(Some(
+            keel_agent::epistemic::EpistemicMemoryPlugin::persist_file(&root),
+        ));
+        let _ = epistemic.set_hypothesis(Some(envelope.goal.clone()));
+        for f in &envelope.relevant_files {
+            let _ = epistemic.add_fact(&format!("Relevant file: {f}"));
+        }
+        if !envelope.context_summary.is_empty() {
+            let _ = epistemic.add_fact(&format!("Context summary: {}", envelope.context_summary));
+        }
+        let _ = epistemic.save_to_file();
+    }
     if daemon_mode {
         let policy = if yolo {
             ApprovalPolicy::Yolo
