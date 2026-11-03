@@ -47,6 +47,55 @@ pub fn read_pipe_capped<R: Read>(mut pipe: R) -> Vec<u8> {
     buf
 }
 
+/// Run `cmd` to completion with a hard `timeout` and capped stdout/stderr.
+///
+/// On Unix the child leads its own process group and the whole group is killed on
+/// timeout, so grandchildren cannot outlive the call. Stdin is closed.
+pub fn run_command_bounded(
+    mut cmd: std::process::Command,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output> {
+    use std::process::Stdio;
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd.spawn().context("spawning command")?;
+    let out_pipe = child.stdout.take();
+    let err_pipe = child.stderr.take();
+    let out_t = std::thread::spawn(move || out_pipe.map(read_pipe_capped).unwrap_or_default());
+    let err_t = std::thread::spawn(move || err_pipe.map(read_pipe_capped).unwrap_or_default());
+
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) if start.elapsed() > timeout => {
+                kill_process_group(&mut child);
+                let _ = out_t.join();
+                let _ = err_t.join();
+                bail!("command timed out after {}s", timeout.as_secs());
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Err(e) => {
+                kill_process_group(&mut child);
+                let _ = out_t.join();
+                let _ = err_t.join();
+                return Err(e).context("waiting on command");
+            }
+        }
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: out_t.join().unwrap_or_default(),
+        stderr: err_t.join().unwrap_or_default(),
+    })
+}
+
 /// Resolve `rel` under `root`, rejecting absolute paths, `..` escapes, and symlinks
 /// that resolve outside the canonicalized workspace root.
 pub fn confine(root: &Path, rel: &str) -> Result<PathBuf> {
@@ -873,5 +922,26 @@ mod tests {
         assert!(!names.contains(&"shell".to_string()));
 
         let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_runner_times_out_and_kills_group() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "sleep 30 & sleep 30"]);
+        let t = std::time::Instant::now();
+        let err = run_command_bounded(cmd, std::time::Duration::from_millis(300)).unwrap_err();
+        assert!(format!("{err:#}").contains("timed out"), "{err:#}");
+        assert!(t.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn bounded_runner_captures_output() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "echo hi; echo err >&2; exit 3"]);
+        let out = run_command_bounded(cmd, std::time::Duration::from_secs(10)).unwrap();
+        assert_eq!(out.status.code(), Some(3));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hi");
+        assert_eq!(String::from_utf8_lossy(&out.stderr).trim(), "err");
     }
 }
