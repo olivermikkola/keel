@@ -14,6 +14,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Maximum checkpoints retained per workspace; older ones are pruned on save.
+pub const MAX_CHECKPOINTS: usize = 100;
+
 /// Upper bound for any single git invocation made by the checkpoint engine.
 const GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
@@ -155,6 +158,24 @@ impl CheckpointManager {
         Ok(())
     }
 
+    /// Drop the oldest entries beyond `max` and delete their shadow refs (best effort).
+    fn prune_excess(&self, list: &mut Vec<CheckpointInfo>, max: usize) {
+        if list.len() <= max {
+            return;
+        }
+        let excess = list.len() - max;
+        for old in list.drain(..excess) {
+            let _ = self.run_git(
+                &[
+                    "update-ref",
+                    "-d",
+                    &format!("refs/keel/checkpoints/{}", old.id),
+                ],
+                &[],
+            );
+        }
+    }
+
     /// Snapshot the entire working tree into git object storage under a shadow ref.
     pub fn save(&self, description: &str) -> Result<CheckpointInfo> {
         self.ensure_git_repo()?;
@@ -200,6 +221,8 @@ impl CheckpointManager {
 
         let mut list = self.list().unwrap_or_default();
         list.push(info.clone());
+        // Bound history: drop the oldest shadow refs so their objects become collectable.
+        self.prune_excess(&mut list, MAX_CHECKPOINTS);
         self.save_meta_list(&list)?;
 
         Ok(info)
@@ -512,5 +535,27 @@ mod tests {
             let mgr = CheckpointManager::new(PathBuf::from(home));
             assert!(mgr.save("should fail").is_err());
         }
+    }
+
+    #[test]
+    fn prune_excess_keeps_newest_and_deletes_old_refs() {
+        let dir = std::env::temp_dir().join(format!("keel-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f.txt"), "x").unwrap();
+        let mgr = CheckpointManager::new(dir.clone());
+        let mut list: Vec<CheckpointInfo> = (0..3)
+            .map(|i| mgr.save(&format!("c{i}")).unwrap())
+            .collect();
+        let oldest = list[0].id.clone();
+        mgr.prune_excess(&mut list, 2);
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].description, "c1");
+        let refs = mgr
+            .run_git(&["for-each-ref", "refs/keel/checkpoints/"], &[])
+            .unwrap();
+        assert!(!refs.contains(&oldest));
+        assert!(refs.contains(&list[1].id));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

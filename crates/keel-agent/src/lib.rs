@@ -27,6 +27,7 @@ pub mod plan;
 pub mod provider;
 pub mod recorder;
 pub mod repomap;
+pub mod retention;
 pub mod sandbox;
 pub mod speculate;
 pub mod subagent;
