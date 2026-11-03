@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -179,81 +179,22 @@ impl VerificationGate {
             return Ok(());
         };
         let mut command = Command::new("sh");
-        command
-            .arg("-c")
-            .arg(cmd)
-            .current_dir(&self.root)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        command.arg("-c").arg(cmd).current_dir(&self.root);
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
-        }
-
-        let mut child = command
-            .spawn()
-            .map_err(|e| format!("failed to spawn verification command `{cmd}`: {e:#}"))?;
-
-        let mut stdout_pipe = child.stdout.take();
-        let mut stderr_pipe = child.stderr.take();
-
-        let stdout_thread = std::thread::spawn(move || {
-            if let Some(pipe) = stdout_pipe.take() {
-                crate::tools::read_pipe_capped(pipe)
-            } else {
-                Vec::new()
-            }
-        });
-
-        let stderr_thread = std::thread::spawn(move || {
-            if let Some(pipe) = stderr_pipe.take() {
-                crate::tools::read_pipe_capped(pipe)
-            } else {
-                Vec::new()
-            }
-        });
-
-        let start = std::time::Instant::now();
-        let timeout = self.timeout;
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(st)) => break st,
-                Ok(None) => {
-                    if start.elapsed() > timeout {
-                        crate::tools::kill_process_group(&mut child);
-                        let _ = stdout_thread.join();
-                        let _ = stderr_thread.join();
-                        return Err(format!(
-                            "verification command `{cmd}` timed out after {}s",
-                            timeout.as_secs()
-                        ));
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                Err(e) => {
-                    crate::tools::kill_process_group(&mut child);
-                    let _ = stdout_thread.join();
-                    let _ = stderr_thread.join();
-                    return Err(format!("error waiting on verification command: {e:#}"));
+        match crate::tools::run_command_bounded(command, self.timeout) {
+            Ok(out) => {
+                if out.status.success() {
+                    Ok(())
+                } else {
+                    let code = out.status.code().unwrap_or(-1);
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    Err(format!(
+                        "exit code: {code}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+                    ))
                 }
             }
-        };
-
-        let stdout_bytes = stdout_thread.join().unwrap_or_default();
-        let stderr_bytes = stderr_thread.join().unwrap_or_default();
-
-        if status.success() {
-            Ok(())
-        } else {
-            let code = status.code().unwrap_or(-1);
-            let stdout = String::from_utf8_lossy(&stdout_bytes);
-            let stderr = String::from_utf8_lossy(&stderr_bytes);
-            Err(format!(
-                "exit code: {code}\nstdout:\n{stdout}\nstderr:\n{stderr}"
-            ))
+            Err(e) => Err(format!("verification command `{cmd}` failed: {e:#}")),
         }
     }
 }
@@ -277,9 +218,13 @@ impl Plugin for PlanPlugin {
             self.verify_command.clone(),
         ));
 
-        if let Some(reg) = scope.context().service::<crate::sandbox::ToolRegistry>() {
-            reg.register(Arc::new(TodoWrite::new(store)));
-        }
+        let reg = scope
+            .context()
+            .service::<crate::sandbox::ToolRegistry>()
+            .map(|r| (*r).clone())
+            .unwrap_or_default();
+        reg.register(Arc::new(TodoWrite::new(store)));
+        scope.provide(reg);
     }
 }
 

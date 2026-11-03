@@ -565,65 +565,8 @@ impl LspService {
 }
 
 /// Fast zero-daemon syntax and compiler check fallback for common languages.
-fn run_syntax_command_bounded(
-    mut cmd: Command,
-    timeout: Duration,
-) -> Option<(i32, Vec<u8>, Vec<u8>)> {
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-
-    let mut child = cmd.spawn().ok()?;
-    let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
-
-    let stdout_thread = std::thread::spawn(move || {
-        if let Some(p) = stdout_pipe.take() {
-            crate::tools::read_pipe_capped(p)
-        } else {
-            Vec::new()
-        }
-    });
-
-    let stderr_thread = std::thread::spawn(move || {
-        if let Some(p) = stderr_pipe.take() {
-            crate::tools::read_pipe_capped(p)
-        } else {
-            Vec::new()
-        }
-    });
-
-    let start = std::time::Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(st)) => break st,
-            Ok(None) => {
-                if start.elapsed() > timeout {
-                    crate::tools::kill_process_group(&mut child);
-                    let _ = stdout_thread.join();
-                    let _ = stderr_thread.join();
-                    return None;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(_) => {
-                crate::tools::kill_process_group(&mut child);
-                let _ = stdout_thread.join();
-                let _ = stderr_thread.join();
-                return None;
-            }
-        }
-    };
-
-    let stdout_bytes = stdout_thread.join().unwrap_or_default();
-    let stderr_bytes = stderr_thread.join().unwrap_or_default();
-    Some((status.code().unwrap_or(-1), stdout_bytes, stderr_bytes))
+fn run_syntax_command_bounded(cmd: Command, timeout: Duration) -> Option<std::process::Output> {
+    crate::tools::run_command_bounded(cmd, timeout).ok()
 }
 
 fn run_fast_syntax_check(
@@ -658,11 +601,9 @@ fn run_fast_syntax_check(
             let mut cmd = Command::new("python3");
             cmd.args(["-m", "py_compile", &full_path.to_string_lossy()])
                 .current_dir(root);
-            if let Some((code, _, stderr_bytes)) =
-                run_syntax_command_bounded(cmd, Duration::from_secs(10))
-            {
-                if code != 0 {
-                    let stderr = String::from_utf8_lossy(&stderr_bytes);
+            if let Some(out) = run_syntax_command_bounded(cmd, Duration::from_secs(10)) {
+                if !out.status.success() {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
                     let line = extract_line_number(&stderr).unwrap_or(1);
                     let msg = stderr
                         .lines()
@@ -687,11 +628,9 @@ fn run_fast_syntax_check(
             let mut cmd = Command::new("sh");
             cmd.args(["-n", &full_path.to_string_lossy()])
                 .current_dir(root);
-            if let Some((code, _, stderr_bytes)) =
-                run_syntax_command_bounded(cmd, Duration::from_secs(10))
-            {
-                if code != 0 {
-                    let stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
+            if let Some(out) = run_syntax_command_bounded(cmd, Duration::from_secs(10)) {
+                if !out.status.success() {
+                    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
                     let line = extract_line_number(&stderr).unwrap_or(1);
                     return vec![DiagnosticItem {
                         file: rel_path.to_string(),
@@ -709,11 +648,9 @@ fn run_fast_syntax_check(
             let mut cmd = Command::new("node");
             cmd.args(["--check", &full_path.to_string_lossy()])
                 .current_dir(root);
-            if let Some((code, _, stderr_bytes)) =
-                run_syntax_command_bounded(cmd, Duration::from_secs(10))
-            {
-                if code != 0 {
-                    let stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
+            if let Some(out) = run_syntax_command_bounded(cmd, Duration::from_secs(10)) {
+                if !out.status.success() {
+                    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
                     let line = extract_line_number(&stderr).unwrap_or(1);
                     return vec![DiagnosticItem {
                         file: rel_path.to_string(),
@@ -732,10 +669,8 @@ fn run_fast_syntax_check(
                 let mut cmd = Command::new("cargo");
                 cmd.args(["check", "-j", "2", "--message-format=json", "--quiet"])
                     .current_dir(root);
-                if let Some((_, stdout_bytes, _)) =
-                    run_syntax_command_bounded(cmd, Duration::from_secs(30))
-                {
-                    let stdout = String::from_utf8_lossy(&stdout_bytes);
+                if let Some(out) = run_syntax_command_bounded(cmd, Duration::from_secs(30)) {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
                     let mut items = Vec::new();
                     for line in stdout.lines() {
                         let Ok(val) = serde_json::from_str::<Value>(line) else {

@@ -87,12 +87,14 @@ pub struct SymbolSearchResult {
     pub score: u32,
 }
 
-#[derive(Default)]
 struct CachedOutline {
     mtime: Option<SystemTime>,
     file_size: u64,
+    loaded: std::time::Instant,
     outline: FileOutline,
 }
+
+const MAX_CACHED_OUTLINES: usize = 1_000;
 
 /// In-memory symbol index with filesystem mtime validation.
 #[derive(Default)]
@@ -107,9 +109,9 @@ impl SymbolIndex {
 
     /// Extract or retrieve cached structural outline for `path`.
     pub fn outline_file(&self, abs_path: &Path, rel_path: &str) -> Result<FileOutline> {
-        let meta = fs::metadata(abs_path)
+        let meta = fs::symlink_metadata(abs_path)
             .with_context(|| format!("reading metadata for {}", abs_path.display()))?;
-        if !meta.is_file() {
+        if !meta.file_type().is_file() {
             anyhow::bail!("path is not a regular file: {}", abs_path.display());
         }
         let file_size = meta.len();
@@ -123,9 +125,10 @@ impl SymbolIndex {
         let mtime = meta.modified().ok();
 
         {
-            let lock = self.cache.lock().unwrap();
-            if let Some(entry) = lock.get(abs_path) {
+            let mut lock = self.cache.lock().unwrap();
+            if let Some(entry) = lock.get_mut(abs_path) {
                 if entry.mtime == mtime && entry.file_size == file_size {
+                    entry.loaded = std::time::Instant::now();
                     let mut cached = entry.outline.clone();
                     cached.path = rel_path.to_string();
                     return Ok(cached);
@@ -139,11 +142,21 @@ impl SymbolIndex {
 
         {
             let mut lock = self.cache.lock().unwrap();
+            if lock.len() >= MAX_CACHED_OUTLINES && !lock.contains_key(abs_path) {
+                if let Some(oldest_key) = lock
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.loaded)
+                    .map(|(k, _)| k.clone())
+                {
+                    lock.remove(&oldest_key);
+                }
+            }
             lock.insert(
                 abs_path.to_path_buf(),
                 CachedOutline {
                     mtime,
                     file_size,
+                    loaded: std::time::Instant::now(),
                     outline: outline.clone(),
                 },
             );
@@ -181,10 +194,13 @@ impl SymbolIndex {
         limit: usize,
     ) -> Result<Vec<SymbolSearchResult>> {
         let q = query.trim().to_ascii_lowercase();
+        if q.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut results = Vec::new();
 
         let walker = walkdir_source_files(root)?;
-        for file in walker {
+        for file in walker.into_iter().take(2_000) {
             let rel = match file.strip_prefix(root) {
                 Ok(r) => r.to_string_lossy().to_string(),
                 Err(_) => continue,
@@ -1401,5 +1417,37 @@ pub fn broadcast_message() {}
         let rendered = render_outline_markdown(&outline);
         assert!(rendered.contains("RpcBroadcaster"));
         assert!(rendered.contains("broadcast_message"));
+    }
+
+    #[test]
+    fn search_symbols_empty_query_and_symlink_rejection() {
+        let tmp = std::env::temp_dir().join(format!("keel-sym-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let file_path = tmp.join("code.rs");
+        fs::write(&file_path, "pub fn active_symbol() {}\n").unwrap();
+
+        let index = SymbolIndex::new();
+        // Empty query returns empty immediately
+        let results = index.search_symbols(&tmp, "   ", None, 10).unwrap();
+        assert!(results.is_empty());
+
+        // Valid search returns match
+        let found = index.search_symbols(&tmp, "active", None, 10).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].symbol.name, "active_symbol");
+
+        // Symlink rejection
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let link_path = tmp.join("link.rs");
+            symlink(&file_path, &link_path).unwrap();
+
+            let err = index.outline_file(&link_path, "link.rs").unwrap_err();
+            assert!(err.to_string().contains("not a regular file"));
+        }
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 }
