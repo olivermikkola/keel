@@ -13,11 +13,15 @@ use crate::epistemic::EpistemicStore;
 use crate::plan::{PlanStore, TodoItem, TodoStatus};
 use crate::vfs::TransactionalVfs;
 use crate::Message;
-use anyhow::{Context as _, Result};
+use anyhow::{bail, Context as _, Result};
 use keel_kernel::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
+
+pub const MAX_HANDOFF_JSON_BYTES: usize = 4 * 1024 * 1024; // 4MB maximum handoff envelope JSON
+pub const MAX_HANDOFF_STRING_CHARS: usize = 32_768; // 32KB max per string field
+pub const MAX_HANDOFF_ITEMS: usize = 200; // max 200 items per array
 
 /// Cross-harness distilled handoff envelope, 100% interoperable with Helm Swarm.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -34,9 +38,53 @@ pub struct HandoffEnvelope {
 
 impl HandoffEnvelope {
     pub fn from_json_str(s: &str) -> Result<Self> {
-        let env: Self = serde_json::from_str(s.trim())
+        let trimmed = s.trim();
+        if trimmed.len() > MAX_HANDOFF_JSON_BYTES {
+            bail!(
+                "HandoffEnvelope JSON ({} bytes) exceeds maximum allowable size of 4MB",
+                trimmed.len()
+            );
+        }
+        let env: Self = serde_json::from_str(trimmed)
             .with_context(|| "Failed to parse HandoffEnvelope JSON")?;
+        env.validate()?;
         Ok(env)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.goal.chars().count() > MAX_HANDOFF_STRING_CHARS {
+            bail!("HandoffEnvelope `goal` exceeds maximum allowable length (32,768 characters)");
+        }
+        if self.context_summary.chars().count() > MAX_HANDOFF_STRING_CHARS {
+            bail!("HandoffEnvelope `context_summary` exceeds maximum allowable length (32,768 characters)");
+        }
+        if self.open_tasks.len() > MAX_HANDOFF_ITEMS {
+            bail!(
+                "HandoffEnvelope `open_tasks` contains {} items, exceeding maximum limit of {}",
+                self.open_tasks.len(),
+                MAX_HANDOFF_ITEMS
+            );
+        }
+        if self.completed_tasks.len() > MAX_HANDOFF_ITEMS {
+            bail!(
+                "HandoffEnvelope `completed_tasks` contains {} items, exceeding maximum limit of {}",
+                self.completed_tasks.len(),
+                MAX_HANDOFF_ITEMS
+            );
+        }
+        if self.relevant_files.len() > MAX_HANDOFF_ITEMS {
+            bail!(
+                "HandoffEnvelope `relevant_files` contains {} items, exceeding maximum limit of {}",
+                self.relevant_files.len(),
+                MAX_HANDOFF_ITEMS
+            );
+        }
+        for f in &self.relevant_files {
+            if f.contains('\0') {
+                bail!("HandoffEnvelope `relevant_files` contains null byte");
+            }
+        }
+        Ok(())
     }
 
     pub fn to_json_pretty(&self) -> Result<String> {
@@ -51,22 +99,40 @@ impl HandoffEnvelope {
         );
         if !self.open_tasks.is_empty() {
             out.push_str("Tasks to execute:\n");
-            for t in &self.open_tasks {
+            for t in self.open_tasks.iter().take(50) {
                 out.push_str(&format!("- [ ] {t}\n"));
+            }
+            if self.open_tasks.len() > 50 {
+                out.push_str(&format!(
+                    "- ... ({} more open tasks)\n",
+                    self.open_tasks.len() - 50
+                ));
             }
             out.push('\n');
         }
         if !self.completed_tasks.is_empty() {
             out.push_str("Already completed:\n");
-            for t in &self.completed_tasks {
+            for t in self.completed_tasks.iter().take(30) {
                 out.push_str(&format!("- [x] {t}\n"));
+            }
+            if self.completed_tasks.len() > 30 {
+                out.push_str(&format!(
+                    "- ... ({} more completed tasks)\n",
+                    self.completed_tasks.len() - 30
+                ));
             }
             out.push('\n');
         }
         if !self.relevant_files.is_empty() {
             out.push_str("Key files:\n");
-            for f in &self.relevant_files {
+            for f in self.relevant_files.iter().take(50) {
                 out.push_str(&format!("- `{f}`\n"));
+            }
+            if self.relevant_files.len() > 50 {
+                out.push_str(&format!(
+                    "- ... ({} more key files)\n",
+                    self.relevant_files.len() - 50
+                ));
             }
             out.push('\n');
         }
@@ -253,8 +319,10 @@ pub fn export_handoff(
     for m in history.iter().rev().take(3).rev() {
         if let Message::Assistant { text, .. } = m {
             if !text.is_empty() {
-                let snippet = if text.len() > 300 {
-                    format!("{}…", &text[..300])
+                let char_count = text.chars().count();
+                let snippet = if char_count > 300 {
+                    let truncated: String = text.chars().take(300).collect();
+                    format!("{truncated}…")
                 } else {
                     text.clone()
                 };
@@ -390,6 +458,69 @@ mod tests {
             vec!["Increase connection pool max capacity"]
         );
         assert_eq!(exported.completed_tasks, vec!["Reproduce deadlock in test"]);
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn handoff_envelope_validation_bounds() {
+        // Test null byte rejection
+        let env_null = HandoffEnvelope {
+            source_conversation_id: "s1".into(),
+            source_harness: "helm".into(),
+            target_harness: "keel".into(),
+            goal: "Task".into(),
+            relevant_files: vec!["foo\0bar.rs".into()],
+            open_tasks: vec![],
+            completed_tasks: vec![],
+            context_summary: "".into(),
+        };
+        assert!(env_null.validate().is_err());
+
+        // Test excessive task count rejection
+        let env_tasks = HandoffEnvelope {
+            source_conversation_id: "s1".into(),
+            source_harness: "helm".into(),
+            target_harness: "keel".into(),
+            goal: "Task".into(),
+            relevant_files: vec![],
+            open_tasks: (0..201).map(|i| format!("task {i}")).collect(),
+            completed_tasks: vec![],
+            context_summary: "".into(),
+        };
+        assert!(env_tasks.validate().is_err());
+
+        // Test oversized string rejection
+        let env_goal = HandoffEnvelope {
+            source_conversation_id: "s1".into(),
+            source_harness: "helm".into(),
+            target_harness: "keel".into(),
+            goal: "x".repeat(32_769),
+            relevant_files: vec![],
+            open_tasks: vec![],
+            completed_tasks: vec![],
+            context_summary: "".into(),
+        };
+        assert!(env_goal.validate().is_err());
+    }
+
+    #[test]
+    fn handoff_export_utf8_char_boundary_safety() {
+        let tmp = std::env::temp_dir().join(format!("keel-swarm-utf8-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let ctx = Context::new();
+        // Construct assistant message where byte 300 lands inside a multi-byte UTF-8 char
+        let mut msg_text = "a".repeat(299);
+        msg_text.push_str("🦀 Finnish text: äöå!");
+        let history = vec![Message::Assistant {
+            text: msg_text,
+            tool_calls: vec![],
+        }];
+
+        let exported = export_handoff("conv-utf8", "helm", &ctx, &history).unwrap();
+        assert!(exported.context_summary.contains('🦀'));
 
         let _ = std::fs::remove_dir_all(tmp);
     }

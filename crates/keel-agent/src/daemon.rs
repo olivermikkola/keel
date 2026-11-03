@@ -865,6 +865,10 @@ pub fn handle_acp_client<R: BufRead>(
                             .unwrap_or(0);
                         format!("acp-{}-{}", std::process::id(), ts)
                     });
+                if let Err(e) = crate::recorder::validate_session_id(&new_sid) {
+                    rpc_writer.send_error(id, -32602, &format!("invalid `session_id`: {e:#}"));
+                    continue;
+                }
                 let session = server.registry.get_or_create(
                     &new_sid,
                     &server.cfg,
@@ -900,6 +904,10 @@ pub fn handle_acp_client<R: BufRead>(
                     .and_then(|v| v.as_str())
                     .map(String::from)
                     .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                if let Err(e) = crate::recorder::validate_session_id(&sid) {
+                    rpc_writer.send_error(id, -32602, &format!("invalid `session_id`: {e:#}"));
+                    continue;
+                }
                 let session = server.registry.get_or_create(
                     &sid,
                     &server.cfg,
@@ -1087,6 +1095,7 @@ pub fn handle_acp_client<R: BufRead>(
                         }
                     }
                 });
+                active_workers.retain(|h| !h.is_finished());
                 active_workers.push(handle);
             }
             "vfs/status" => {

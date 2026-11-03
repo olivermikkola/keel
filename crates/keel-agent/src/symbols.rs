@@ -109,8 +109,18 @@ impl SymbolIndex {
     pub fn outline_file(&self, abs_path: &Path, rel_path: &str) -> Result<FileOutline> {
         let meta = fs::metadata(abs_path)
             .with_context(|| format!("reading metadata for {}", abs_path.display()))?;
-        let mtime = meta.modified().ok();
+        if !meta.is_file() {
+            anyhow::bail!("path is not a regular file: {}", abs_path.display());
+        }
         let file_size = meta.len();
+        if file_size > 10 * 1024 * 1024 {
+            anyhow::bail!(
+                "file size ({} bytes) exceeds 10MB limit for symbol indexing: {}",
+                file_size,
+                abs_path.display()
+            );
+        }
+        let mtime = meta.modified().ok();
 
         {
             let lock = self.cache.lock().unwrap();

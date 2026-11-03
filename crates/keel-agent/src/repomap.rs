@@ -363,6 +363,11 @@ impl RepoMap {
                 if path.is_dir() {
                     walk(&path, root, ignored, out);
                 } else if path.is_file() {
+                    if let Ok(meta) = path.metadata() {
+                        if meta.len() > 5 * 1024 * 1024 {
+                            continue;
+                        }
+                    }
                     let ext = path
                         .extension()
                         .and_then(|e| e.to_str())

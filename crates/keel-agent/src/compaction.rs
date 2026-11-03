@@ -97,10 +97,17 @@ impl WorkspaceInstructions {
         let mut sections = Vec::new();
         for doc in ["AGENTS.md", "CLAUDE.md"] {
             let p = root.join(doc);
-            if let Ok(text) = std::fs::read_to_string(&p) {
-                let trimmed: String = text.chars().take(4000).collect();
-                sections.push(format!("### Workspace `{doc}`\n{trimmed}"));
-                break;
+            if p.is_file() {
+                if let Ok(meta) = std::fs::metadata(&p) {
+                    if meta.len() > 10 * 1024 * 1024 {
+                        continue;
+                    }
+                }
+                if let Ok(text) = std::fs::read_to_string(&p) {
+                    let trimmed: String = text.chars().take(4000).collect();
+                    sections.push(format!("### Workspace `{doc}`\n{trimmed}"));
+                    break;
+                }
             }
         }
         let skills_dir = root.join(".agents/skills");
@@ -360,7 +367,7 @@ impl DeterministicSummarizer {
         let mut errors: Vec<String> = Vec::new();
         for msg in messages {
             if let Message::Tool { content, .. } = msg {
-                for line in content.lines() {
+                for line in content.lines().take(500) {
                     let l = line.trim();
                     if l.contains("error:")
                         || l.contains("Error:")
@@ -474,7 +481,12 @@ impl AdaptiveCompactor {
 
     /// Estimate token count of a single message using character heuristics and tool overhead.
     pub fn estimate_message_tokens(&self, msg: &Message) -> usize {
-        let chars_per_tok = self.budget.chars_per_token.max(1.0);
+        let raw = self.budget.chars_per_token;
+        let chars_per_tok = if raw.is_finite() && raw >= 1.0 {
+            raw
+        } else {
+            1.0
+        };
         match msg {
             Message::System { text } | Message::User { text } => {
                 ((text.chars().count() as f32) / chars_per_tok).ceil() as usize
@@ -831,5 +843,31 @@ mod tests {
         assert!(!compactor.should_compact(&history));
         assert!(compactor.compact_history(&mut history).is_none());
         assert_eq!(history.len(), 2);
+    }
+
+    #[test]
+    fn workspace_instructions_directory_safety_and_token_budget_nan() {
+        let tmp = std::env::temp_dir().join(format!("keel-ws-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Create directory named AGENTS.md (should not cause panic or blocking)
+        std::fs::create_dir_all(tmp.join("AGENTS.md")).unwrap();
+        let ws = WorkspaceInstructions::discover(&tmp);
+        assert!(ws.extra_system_prompt.is_empty());
+
+        // Test non-finite chars_per_token safety
+        let budget = ContextBudget {
+            chars_per_token: f32::NAN,
+            ..Default::default()
+        };
+        let compactor = AdaptiveCompactor::with_default_summarizer(budget);
+        let msg = Message::User {
+            text: "Hello world".into(),
+        };
+        let est = compactor.estimate_message_tokens(&msg);
+        assert!(est >= 11);
+
+        let _ = std::fs::remove_dir_all(tmp);
     }
 }
