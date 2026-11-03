@@ -375,8 +375,7 @@ mod tests {
 
     #[test]
     fn checkpoint_restore_preserves_gitignored_and_keel_files() {
-        let tmp =
-            std::env::temp_dir().join(format!("keel-ckpt-gitignore-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("keel-ckpt-gitignore-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
 
@@ -388,7 +387,11 @@ mod tests {
         std::fs::write(tmp.join("src.rs"), "fn main() {}\n").unwrap();
         std::fs::write(tmp.join(".env"), "SECRET_KEY=keep_me\n").unwrap();
         std::fs::create_dir_all(tmp.join("node_modules/pkg")).unwrap();
-        std::fs::write(tmp.join("node_modules/pkg/index.js"), "module.exports = 1;\n").unwrap();
+        std::fs::write(
+            tmp.join("node_modules/pkg/index.js"),
+            "module.exports = 1;\n",
+        )
+        .unwrap();
         std::fs::create_dir_all(tmp.join(".keel")).unwrap();
         std::fs::write(tmp.join(".keel/memory.json"), "{}\n").unwrap();
 

@@ -124,12 +124,7 @@ impl EphemeralSandbox {
     fn cleanup(&self) {
         if self.used_git_worktree {
             let _ = Command::new("git")
-                .args([
-                    "worktree",
-                    "remove",
-                    "--force",
-                    &self.dir.to_string_lossy(),
-                ])
+                .args(["worktree", "remove", "--force", &self.dir.to_string_lossy()])
                 .current_dir(&self.parent_root)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -215,8 +210,7 @@ impl SpeculationEngine {
                 let mut handles = Vec::with_capacity(n);
                 for (idx, sb) in sandboxes.iter().enumerate() {
                     let candidate_id = idx + 1;
-                    let strategy =
-                        STRATEGY_HINTS[idx % STRATEGY_HINTS.len()].to_string();
+                    let strategy = STRATEGY_HINTS[idx % STRATEGY_HINTS.len()].to_string();
                     let sb_dir = sb.dir.clone();
                     let llm = self.llm.clone();
                     let verify_cmd = self.config.verify_command.clone();

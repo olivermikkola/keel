@@ -310,7 +310,11 @@ impl TransactionalVfs {
             out.push(VfsFileStatus {
                 path: rel.clone(),
                 status: status_str.into(),
-                original_bytes: entry.original_content.as_ref().map(|s| s.len()).unwrap_or(0),
+                original_bytes: entry
+                    .original_content
+                    .as_ref()
+                    .map(|s| s.len())
+                    .unwrap_or(0),
                 staged_bytes: current.as_ref().map(|s| s.len()).unwrap_or(0),
             });
         }

@@ -686,7 +686,10 @@ impl Agent<'_> {
                         self.ctx.emit(&ToolResult(call.id.clone(), out.clone()));
                         return out;
                     }
-                    if matches!(call.name.as_str(), "write_file" | "edit_file" | "patch_file") {
+                    if matches!(
+                        call.name.as_str(),
+                        "write_file" | "edit_file" | "patch_file"
+                    ) {
                         if let Some(rel_path) = call.args.get("path").and_then(|val| val.as_str()) {
                             let _ = v.capture_pre_image(rel_path);
                         }
@@ -698,7 +701,10 @@ impl Agent<'_> {
                     .run(&call.args)
                     .unwrap_or_else(|e| format!("error: {e:#}"));
                 if !out.starts_with("error:")
-                    && matches!(call.name.as_str(), "write_file" | "edit_file" | "patch_file")
+                    && matches!(
+                        call.name.as_str(),
+                        "write_file" | "edit_file" | "patch_file"
+                    )
                 {
                     if let Some(rel_path) = call.args.get("path").and_then(|v| v.as_str()) {
                         if let Some(ref v) = vfs_svc {
@@ -1112,7 +1118,10 @@ mod tests {
             name: "shell".into(),
             args: serde_json::json!({"command": "cargo test"}),
         };
-        assert!(matches!(approver.decide(&shell_call, true), Decision::Deny(_)));
+        assert!(matches!(
+            approver.decide(&shell_call, true),
+            Decision::Deny(_)
+        ));
 
         // 4. Next shell call -> consumes "a\n" (always) -> Allow and whitelists "shell"
         assert_eq!(approver.decide(&shell_call, true), Decision::Allow);
@@ -1123,8 +1132,7 @@ mod tests {
 
     #[test]
     fn post_edit_diagnostics_injected_on_broken_file_write() {
-        let tmp =
-            std::env::temp_dir().join(format!("keel-lsp-turn-test-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("keel-lsp-turn-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
 

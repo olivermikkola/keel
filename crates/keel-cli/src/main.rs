@@ -16,7 +16,7 @@ use keel_agent::{
     cascade::CascadeProvider,
     checkpoint::{CheckpointManager, CheckpointPlugin},
     compaction::{ToolResultPrunerPlugin, WorkspaceContextPlugin, WorkspaceInstructions},
-    daemon::{serve_acp, DaemonConfig},
+    daemon::DaemonConfig,
     epistemic::{EpistemicMemoryPlugin, EpistemicStore},
     guard::RepeatToolReminderPlugin,
     lsp::{LspPlugin, LspService},
@@ -116,11 +116,14 @@ fn print_usage() {
   keel lsp <check|def|hover>       Language Server & compiler diagnostics hub
   keel vfs <status|diff|commit|rollback> transactional CoW / shadow VFS control
   keel speculate "prompt" [opts]   parallel best-of-N speculative sandbox tournament
-  keel daemon [options]            ACP bidirectional JSON-RPC 2.0 server over stdio
+  keel daemon [options]            ACP bidirectional JSON-RPC 2.0 daemon (stdio, socket, tcp)
   keel memory <cmd>                epistemic belief state (show, add-fact, set-hypothesis, clear)
   keel bench [filter] [--runs N]   run benchmark suite
 
 options:
+  --listen <addr>                  listen on TCP address (e.g. 127.0.0.1:4040)
+  --socket <path>                  listen on Unix domain socket (e.g. ~/.keel/daemon.sock)
+  --auth-token <token>             enforce bearer authentication token
   --json                           emit machine-readable JSON output
   --dry-run                        preview patch/edit without writing
   --yolo                           allow mutating tools (write/edit/patch/shell)
@@ -713,9 +716,13 @@ fn main() -> anyhow::Result<()> {
     let candidates_opt: usize = take_opt(&mut args, "--candidates")
         .and_then(|c| c.parse().ok())
         .unwrap_or(2);
-    let cascade_model_opt = take_opt(&mut args, "--cascade")
-        .or_else(|| std::env::var("KEEL_CASCADE_MODEL").ok());
+    let cascade_model_opt =
+        take_opt(&mut args, "--cascade").or_else(|| std::env::var("KEEL_CASCADE_MODEL").ok());
     let apply_winner = take_flag(&mut args, "--apply");
+    let listen_opt = take_opt(&mut args, "--listen");
+    let socket_opt = take_opt(&mut args, "--socket");
+    let auth_token_opt =
+        take_opt(&mut args, "--auth-token").or_else(|| std::env::var("KEEL_DAEMON_TOKEN").ok());
     let daemon_mode = args.first().map(String::as_str) == Some("daemon");
     if daemon_mode {
         args.remove(0);
@@ -795,10 +802,26 @@ fn main() -> anyhow::Result<()> {
             },
             verify_command: verify_cmd,
         };
+        if let Some(addr) = listen_opt {
+            return keel_agent::daemon::serve_acp_tcp(&addr, cfg, llm, auth_token_opt);
+        }
+        #[cfg(unix)]
+        if let Some(sock_path) = socket_opt {
+            return keel_agent::daemon::serve_acp_unix(
+                std::path::Path::new(&sock_path),
+                cfg,
+                llm,
+                auth_token_opt,
+            );
+        }
+        #[cfg(not(unix))]
+        if let Some(_) = socket_opt {
+            anyhow::bail!("Unix domain sockets are not supported on this platform");
+        }
         let stdin = std::io::stdin();
         let reader = std::io::BufReader::new(stdin.lock());
         let writer = Box::new(std::io::stdout());
-        return serve_acp(reader, writer, cfg, llm);
+        return keel_agent::daemon::serve_acp_with_auth(reader, writer, cfg, llm, auth_token_opt);
     }
     if speculate_mode {
         if prompt.trim().is_empty() {
@@ -829,11 +852,7 @@ fn main() -> anyhow::Result<()> {
             for c in &rep.candidates {
                 println!(
                     "  [Candidate #{}] verified={} steps={} time={}ms files={:?}",
-                    c.candidate_id,
-                    c.verification_passed,
-                    c.steps,
-                    c.elapsed_ms,
-                    c.modified_files
+                    c.candidate_id, c.verification_passed, c.steps, c.elapsed_ms, c.modified_files
                 );
             }
         }

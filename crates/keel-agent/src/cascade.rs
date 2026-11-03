@@ -49,11 +49,7 @@ impl CascadeProvider {
         CascadeSnapshot {
             fast_calls: self.fast_calls.load(Ordering::Relaxed),
             frontier_calls: self.frontier_calls.load(Ordering::Relaxed),
-            last_escalation_reason: self
-                .last_reason
-                .lock()
-                .ok()
-                .and_then(|g| g.clone()),
+            last_escalation_reason: self.last_reason.lock().ok().and_then(|g| g.clone()),
         }
     }
 
@@ -203,7 +199,9 @@ mod tests {
             text: "simple question".into(),
         }];
         let reply = cascade.complete(&history, &[]).unwrap();
-        assert!(matches!(reply, Message::Assistant { ref text, .. } if text == "handled by fast model"));
+        assert!(
+            matches!(reply, Message::Assistant { ref text, .. } if text == "handled by fast model")
+        );
         assert_eq!(cascade.snapshot().fast_calls, 1);
         assert_eq!(cascade.snapshot().frontier_calls, 0);
 
