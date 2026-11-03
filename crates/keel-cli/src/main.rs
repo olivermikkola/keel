@@ -194,6 +194,8 @@ const REPL_COMMANDS: &[&str] = &[
     "/recordings",
     "/clear",
     "/history",
+    "/test",
+    "/oracle",
 ];
 
 const REPL_HELP: &str = "REPL commands:
@@ -203,6 +205,8 @@ const REPL_HELP: &str = "REPL commands:
   /undo                 revert workspace to the most recent checkpoint
   /checkpoint [cmd]     manage checkpoints (list, save <desc>, restore <id>, diff <id>)
   /vfs [cmd]            transactional VFS (status, diff, commit, rollback)
+  /test [filter]        run workspace tests through the diagnostic oracle
+  /oracle               alias for /test
   /context              show token budget usage and compaction metrics
   /memory               show epistemic working memory
   /tree                 show the branching exploration tree
@@ -2414,6 +2418,63 @@ fn main() -> anyhow::Result<()> {
                         }
                     } else {
                         println!("Transactional VFS is not active.\n");
+                    }
+                    continue;
+                }
+                if cmd == "/test" || cmd == "/oracle" {
+                    if let Some(oracle) = ctx.service::<Arc<keel_agent::oracle::DiagnosticOracle>>()
+                    {
+                        let filter = if args.is_empty() { None } else { Some(args) };
+                        println!("Running workspace tests...");
+                        match oracle.run_tests_filtered(filter) {
+                            Ok(snap) => {
+                                println!(
+                                    "Tests completed in {}ms: {} total, {} passed, {} failed, {} ignored.",
+                                    snap.elapsed_ms, snap.total, snap.passed, snap.failed, snap.ignored
+                                );
+                                if let Some(baseline) = oracle.get_baseline() {
+                                    let delta = keel_agent::oracle::RegressionDelta::compute(
+                                        &baseline, &snap,
+                                    );
+                                    if !delta.is_clean {
+                                        println!(
+                                            "\n⚠️ Regression detected vs baseline ({} new regressions):",
+                                            delta.new_regressions.len()
+                                        );
+                                        for f in &delta.new_regressions {
+                                            println!("  ❌ {}", f.name);
+                                            if let Some(loc) = &f.location {
+                                                println!("     Location: {loc}");
+                                            }
+                                            if let Some(assert_msg) = &f.assertion {
+                                                println!("     Assertion: {assert_msg}");
+                                            }
+                                        }
+                                    }
+                                    if !delta.resolved_tests.is_empty() {
+                                        println!(
+                                            "\n✅ Fixed tests: {}",
+                                            delta.resolved_tests.join(", ")
+                                        );
+                                    }
+                                } else if !snap.failures.is_empty() {
+                                    println!("\nFailures:");
+                                    for f in &snap.failures {
+                                        println!("  ❌ {}", f.name);
+                                        if let Some(loc) = &f.location {
+                                            println!("     Location: {loc}");
+                                        }
+                                        if let Some(assert_msg) = &f.assertion {
+                                            println!("     Assertion: {assert_msg}");
+                                        }
+                                    }
+                                }
+                                println!();
+                            }
+                            Err(e) => eprintln!("Test execution failed: {e:#}\n"),
+                        }
+                    } else {
+                        println!("Diagnostic oracle service is not active.\n");
                     }
                     continue;
                 }
