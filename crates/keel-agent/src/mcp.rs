@@ -16,8 +16,10 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerConfig {
@@ -42,24 +44,27 @@ pub struct McpToolDef {
     pub input_schema: Value,
 }
 
-const MAX_MCP_LINE_BYTES: usize = 16 * 1024 * 1024; // 16 MB max JSON-RPC line
+pub const MAX_MCP_LINE_BYTES: usize = 16 * 1024 * 1024; // 16 MB max JSON-RPC line
+pub const DEFAULT_MCP_TIMEOUT: Duration = Duration::from_secs(60);
+pub const DEFAULT_MCP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct McpProcess {
-    _child: Child,
+    child: Child,
     stdin: ChildStdin,
-    reader: BufReader<ChildStdout>,
+    rx: Receiver<std::io::Result<String>>,
     next_id: u64,
+    timeout: Duration,
 }
 
 impl Drop for McpProcess {
     fn drop(&mut self) {
-        let _ = self._child.kill();
-        let _ = self._child.wait();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
 impl McpProcess {
-    fn send_request(&mut self, method: &str, params: Value) -> Result<Value> {
+    fn send_request(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
         self.next_id += 1;
         let id = self.next_id;
         let req = json!({
@@ -76,20 +81,32 @@ impl McpProcess {
             .with_context(|| format!("writing request to MCP server for `{method}`"))?;
         self.stdin.flush()?;
 
+        let deadline = std::time::Instant::now() + timeout;
         loop {
-            let mut res_line = String::new();
-            use std::io::Read;
-            let n = self
-                .reader
-                .by_ref()
-                .take((MAX_MCP_LINE_BYTES + 1) as u64)
-                .read_line(&mut res_line)?;
-            if n == 0 {
-                bail!("MCP server terminated stream unexpectedly while awaiting `{method}`");
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                bail!("MCP server timed out after {timeout:?} awaiting `{method}`");
             }
-            if res_line.len() > MAX_MCP_LINE_BYTES {
-                bail!("MCP server response line exceeds maximum allowable size (16MB)");
-            }
+            let wait = deadline.saturating_duration_since(now);
+            let res_line = match self.rx.recv_timeout(wait) {
+                Ok(Ok(l)) => l,
+                Ok(Err(e)) => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    bail!("MCP server stream error while awaiting `{method}`: {e}");
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    bail!("MCP server timed out after {timeout:?} awaiting `{method}`");
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    bail!("MCP server terminated stream unexpectedly while awaiting `{method}`");
+                }
+            };
+
             let trimmed = res_line.trim();
             if trimmed.is_empty() {
                 continue;
@@ -151,13 +168,45 @@ impl McpClient {
             .stdout
             .take()
             .with_context(|| format!("capturing stdout for `{server_name}`"))?;
-        let reader = BufReader::new(stdout);
+
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let mut res_line = String::new();
+                use std::io::Read;
+                match reader
+                    .by_ref()
+                    .take((MAX_MCP_LINE_BYTES + 1) as u64)
+                    .read_line(&mut res_line)
+                {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if res_line.len() > MAX_MCP_LINE_BYTES {
+                            let _ = tx.send(Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "MCP server response line exceeds maximum allowable size (16MB)",
+                            )));
+                            break;
+                        }
+                        if tx.send(Ok(res_line)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                        break;
+                    }
+                }
+            }
+        });
 
         let mut proc = McpProcess {
-            _child: child,
+            child,
             stdin,
-            reader,
+            rx,
             next_id: 0,
+            timeout: DEFAULT_MCP_TIMEOUT,
         };
 
         // 1. Initialize
@@ -169,7 +218,7 @@ impl McpClient {
                 "version": "0.0.1"
             }
         });
-        proc.send_request("initialize", init_params)
+        proc.send_request("initialize", init_params, DEFAULT_MCP_HANDSHAKE_TIMEOUT)
             .with_context(|| format!("MCP initialize handshake failed with `{server_name}`"))?;
 
         // 2. Initialized notification
@@ -177,7 +226,7 @@ impl McpClient {
 
         // 3. List tools
         let tools_res = proc
-            .send_request("tools/list", json!({}))
+            .send_request("tools/list", json!({}), DEFAULT_MCP_HANDSHAKE_TIMEOUT)
             .with_context(|| format!("listing tools for MCP server `{server_name}`"))?;
 
         let mut tools = Vec::new();
@@ -204,15 +253,24 @@ impl McpClient {
         &self.tools
     }
 
+    /// Set tool execution timeout.
+    pub fn with_timeout(&self, timeout: Duration) {
+        if let Ok(mut proc) = self.process.lock() {
+            proc.timeout = timeout;
+        }
+    }
+
     /// Invoke a tool on the remote MCP server.
     pub fn call_tool(&self, name: &str, arguments: &Value) -> Result<String> {
         let mut proc = self.process.lock().unwrap();
+        let timeout = proc.timeout;
         let res = proc.send_request(
             "tools/call",
             json!({
                 "name": name,
                 "arguments": arguments,
             }),
+            timeout,
         )?;
 
         let is_error = res
@@ -278,8 +336,14 @@ pub struct McpPlugin {
 impl McpPlugin {
     pub fn load_config(root: &Path) -> HashMap<String, McpServerConfig> {
         let config_path = root.join(".keel").join("mcp.json");
-        if !config_path.exists() {
+        if !config_path.is_file() {
             return HashMap::new();
+        }
+        if let Ok(meta) = std::fs::metadata(&config_path) {
+            if meta.len() > 10 * 1024 * 1024 {
+                eprintln!("warning: .keel/mcp.json exceeds 10MB limit; skipping");
+                return HashMap::new();
+            }
         }
         let data = match std::fs::read_to_string(&config_path) {
             Ok(d) => d,
@@ -393,6 +457,83 @@ done
         // Test tool call
         let out = client.call_tool("ping", &json!({"msg": "hello"})).unwrap();
         assert_eq!(out, "pong: hello from mock mcp");
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn mcp_server_timeout_kills_and_reports_error() {
+        let tmp = std::env::temp_dir().join(format!("keel-mcp-timeout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Create an MCP server that completes handshake but sleeps indefinitely on tools/call
+        let script = r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *initialize*)
+      echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"hang-mcp","version":"0.1"}}}'
+      ;;
+    *tools/list*)
+      echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"slow_tool","description":"hangs","inputSchema":{}}]}}'
+      ;;
+    *tools/call*)
+      sleep 10
+      ;;
+  esac
+done
+"#;
+        let script_path = tmp.join("hang_mcp.sh");
+        std::fs::write(&script_path, script).unwrap();
+        let _ = Command::new("chmod").arg("+x").arg(&script_path).status();
+
+        let cfg = McpServerConfig {
+            command: "sh".into(),
+            args: vec![script_path.to_str().unwrap().into()],
+            env: HashMap::new(),
+        };
+
+        let client = McpClient::spawn("hang_test", &cfg).unwrap();
+        client.with_timeout(Duration::from_millis(300));
+
+        let start = std::time::Instant::now();
+        let res = client.call_tool("slow_tool", &json!({}));
+        let elapsed = start.elapsed();
+
+        assert!(res.is_err());
+        let err_msg = res.unwrap_err().to_string();
+        assert!(err_msg.contains("timed out"));
+        assert!(elapsed < Duration::from_secs(3));
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn mcp_load_config_safety() {
+        let tmp = std::env::temp_dir().join(format!("keel-mcp-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let keel_dir = tmp.join(".keel");
+        std::fs::create_dir_all(&keel_dir).unwrap();
+
+        // 1. Directory named mcp.json should be safely ignored
+        let dir_mcp = keel_dir.join("mcp.json");
+        std::fs::create_dir_all(&dir_mcp).unwrap();
+        assert!(McpPlugin::load_config(&tmp).is_empty());
+        let _ = std::fs::remove_dir_all(&dir_mcp);
+
+        // 2. Valid mcp.json parses cleanly
+        let valid_json = r#"{
+            "mcpServers": {
+                "test": {
+                    "command": "echo",
+                    "args": ["hello"]
+                }
+            }
+        }"#;
+        std::fs::write(&dir_mcp, valid_json).unwrap();
+        let cfgs = McpPlugin::load_config(&tmp);
+        assert_eq!(cfgs.len(), 1);
+        assert_eq!(cfgs["test"].command, "echo");
 
         let _ = std::fs::remove_dir_all(tmp);
     }

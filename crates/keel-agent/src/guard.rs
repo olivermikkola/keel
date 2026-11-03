@@ -18,12 +18,10 @@ use std::sync::{Arc, Mutex};
 const GENTLE_REMINDER: &str = "\n\n[repeat-tool-reminder] You are repeating the exact same tool call with identical arguments. Carefully analyze the previous result before calling again: if the task is not complete, try a different approach or different arguments instead of repeating the call.";
 
 fn detailed_reminder(tool_name: &str, count: usize, canonical_args: &str) -> String {
-    let preview = if canonical_args.len() > 500 {
-        format!(
-            "{}… (+{} more chars)",
-            &canonical_args[..500],
-            canonical_args.len() - 500
-        )
+    let char_count = canonical_args.chars().count();
+    let preview = if char_count > 500 {
+        let truncated: String = canonical_args.chars().take(500).collect();
+        format!("{}… (+{} more chars)", truncated, char_count - 500)
     } else {
         canonical_args.to_string()
     };
@@ -461,5 +459,16 @@ mod tests {
         assert!(adv.contains("[environment-circuit-breaker] CRITICAL"));
         assert!(adv.contains("Permission denied"));
         assert!(adv.contains("Remedy:"));
+    }
+
+    #[test]
+    fn detailed_reminder_utf8_char_boundary_safety() {
+        // Construct canonical args where byte 500 would land inside a 4-byte emoji or multi-byte char
+        let mut args = "a".repeat(499);
+        args.push_str("🦀 Finnish: äö åäö ääääääääää");
+        let reminder = detailed_reminder("test_tool", 4, &args);
+        assert!(reminder.contains("[repeat-tool-reminder] Repeated tool call detected"));
+        assert!(reminder.contains("test_tool"));
+        assert!(reminder.contains("… (+"));
     }
 }

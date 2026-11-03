@@ -332,6 +332,10 @@ impl Approver for InteractiveApprover {
 }
 
 /// Append-only JSONL log; the source of truth for a session.
+pub const MAX_LOG_FILE_BYTES: u64 = 64 * 1024 * 1024; // 64MB max log file
+pub const MAX_LOG_LINE_BYTES: usize = 16 * 1024 * 1024; // 16MB max log line
+pub const MAX_LOG_MESSAGES: usize = 50_000;
+
 #[derive(Clone)]
 pub struct SessionLog {
     path: Option<PathBuf>,
@@ -369,15 +373,39 @@ impl SessionLog {
     /// Read an existing JSONL session log file and reconstruct previous conversation messages.
     pub fn read_history(path: impl AsRef<std::path::Path>) -> Result<Vec<Message>> {
         use std::io::BufRead;
-        let file = std::fs::File::open(path)?;
-        let reader = std::io::BufReader::new(file);
+        let p = path.as_ref();
+        if !p.is_file() {
+            anyhow::bail!("session log path is not a regular file: {}", p.display());
+        }
+        let meta = std::fs::metadata(p)?;
+        if meta.len() > MAX_LOG_FILE_BYTES {
+            anyhow::bail!(
+                "session log file size ({} bytes) exceeds maximum allowable limit (64MB): {}",
+                meta.len(),
+                p.display()
+            );
+        }
+        let file = std::fs::File::open(p)?;
+        let mut reader = std::io::BufReader::new(file);
         let mut messages = Vec::new();
-        for line in reader.lines() {
-            let line = line?;
-            if line.trim().is_empty() {
+        loop {
+            let mut line = String::new();
+            use std::io::Read;
+            let n = reader
+                .by_ref()
+                .take((MAX_LOG_LINE_BYTES + 1) as u64)
+                .read_line(&mut line)?;
+            if n == 0 {
+                break;
+            }
+            if line.len() > MAX_LOG_LINE_BYTES {
+                anyhow::bail!("session log line exceeds maximum allowable size (16MB)");
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
                 continue;
             }
-            if let Ok(val) = serde_json::from_str::<Value>(&line) {
+            if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
                 let kind = val["kind"].as_str().unwrap_or("");
                 let data = &val["data"];
                 match kind {
@@ -397,6 +425,9 @@ impl SessionLog {
                         messages.push(Message::Tool { id, content });
                     }
                     _ => {}
+                }
+                if messages.len() >= MAX_LOG_MESSAGES {
+                    break;
                 }
             }
         }
@@ -1472,6 +1503,45 @@ mod tests {
         assert!(
             summary_found,
             "Expected history to contain compacted summary"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn session_log_read_history_safety() {
+        let tmp = std::env::temp_dir().join(format!("keel-log-safety-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // 1. Non-existent file errors
+        assert!(SessionLog::read_history(tmp.join("missing.jsonl")).is_err());
+
+        // 2. Directory path errors
+        assert!(SessionLog::read_history(&tmp).is_err());
+
+        // 3. Valid session log roundtrips
+        let log_file = tmp.join("session.jsonl");
+        let log = SessionLog::file(&log_file);
+        log.append("user", serde_json::json!({"text": "Hello"}))
+            .unwrap();
+        log.append(
+            "assistant",
+            serde_json::to_value(Message::Assistant {
+                text: "Hi".into(),
+                tool_calls: vec![],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let msgs = SessionLog::read_history(&log_file).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(
+            msgs[0],
+            Message::User {
+                text: "Hello".into()
+            }
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
