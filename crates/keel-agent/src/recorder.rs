@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
@@ -118,7 +119,13 @@ pub struct FlightRecorder {
     workspace_root: PathBuf,
     model: String,
     start_time_ms: u64,
+    /// Bytes in the recording file, used to stop before it becomes too big to load.
+    written: AtomicU64,
 }
+
+/// Number of recordings (and total bytes) retained per recordings directory.
+pub const MAX_RETAINED_RECORDINGS: usize = 100;
+pub const MAX_RETAINED_RECORDING_BYTES: u64 = 1024 * 1024 * 1024;
 
 impl FlightRecorder {
     /// Create or open a recording file in `recordings_dir` for `session_id`.
@@ -146,7 +153,17 @@ impl FlightRecorder {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
 
+        crate::retention::prune_oldest(
+            dir,
+            "keelrec",
+            MAX_RETAINED_RECORDINGS,
+            MAX_RETAINED_RECORDING_BYTES,
+            Some(&path),
+        );
+        let existing = file.metadata().map(|m| m.len()).unwrap_or(0);
+
         let recorder = Self {
+            written: AtomicU64::new(existing),
             path,
             file: Mutex::new(file),
             session_id: session_id.to_string(),
@@ -169,6 +186,14 @@ impl FlightRecorder {
     /// Record a single frame into the `.keelrec` stream atomically.
     pub fn record(&self, frame: &RecordFrame) -> Result<()> {
         let line = serde_json::to_string(frame).context("serializing RecordFrame")?;
+        // Stop recording before the file exceeds what `load_from_file` accepts; a
+        // truncated-but-loadable recording is more useful than an unreadable one.
+        let len = line.len() as u64 + 1;
+        let prev = self.written.fetch_add(len, Ordering::Relaxed);
+        if prev.saturating_add(len) > MAX_RECORDING_FILE_BYTES {
+            self.written.fetch_sub(len, Ordering::Relaxed);
+            return Ok(());
+        }
         let mut guard = self.file.lock().expect("flight recorder mutex poisoned");
         writeln!(guard, "{line}").context("writing flight recorder frame")?;
         guard.flush().context("flushing flight recorder frame")?;
@@ -854,6 +879,30 @@ mod tests {
             )
             .is_err());
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn recorder_stops_before_exceeding_loadable_size() {
+        let tmp = std::env::temp_dir().join(format!("keel-reccap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let rec = FlightRecorder::create(&tmp, "capped", tmp.clone(), "m", None).unwrap();
+        // Pretend the file is almost at the limit; the next frame must be dropped.
+        rec.written
+            .store(MAX_RECORDING_FILE_BYTES - 10, Ordering::Relaxed);
+        let before = std::fs::metadata(rec.recording_path()).unwrap().len();
+        rec.record(&RecordFrame::SessionEnd {
+            total_turns: 1,
+            total_steps: 1,
+            duration_ms: 1,
+            status: "x".repeat(64),
+        })
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(rec.recording_path()).unwrap().len(),
+            before
+        );
+        assert!(RecordedSession::load_from_file(rec.recording_path()).is_ok());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

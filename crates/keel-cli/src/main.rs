@@ -1780,7 +1780,15 @@ fn main() -> anyhow::Result<()> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis())
                 .unwrap_or(0);
-            log_opt = Some(format!("{home}/.keel/sessions/session-{ts}.jsonl"));
+            let dir = format!("{home}/.keel/sessions");
+            keel_agent::retention::prune_oldest(
+                std::path::Path::new(&dir),
+                "jsonl",
+                199,
+                512 * 1024 * 1024,
+                None,
+            );
+            log_opt = Some(format!("{dir}/session-{ts}.jsonl"));
         }
     }
 
