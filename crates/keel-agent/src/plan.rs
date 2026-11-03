@@ -16,6 +16,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -137,15 +138,38 @@ impl Tool for TodoWrite {
 }
 
 /// Verification command runner.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct VerificationGate {
     pub command: Option<String>,
     pub root: PathBuf,
+    pub timeout: Duration,
+}
+
+impl Default for VerificationGate {
+    fn default() -> Self {
+        Self {
+            command: None,
+            root: PathBuf::new(),
+            timeout: Duration::from_secs(120),
+        }
+    }
 }
 
 impl VerificationGate {
     pub fn new(root: PathBuf, command: Option<String>) -> Self {
-        Self { command, root }
+        Self {
+            command,
+            root,
+            timeout: Duration::from_secs(120),
+        }
+    }
+
+    pub fn with_timeout(root: PathBuf, command: Option<String>, timeout: Duration) -> Self {
+        Self {
+            command,
+            root,
+            timeout,
+        }
     }
 
     /// Run the verification command. Returns `Ok(())` if command passed or if no verification is set.
@@ -154,20 +178,79 @@ impl VerificationGate {
         let Some(cmd) = &self.command else {
             return Ok(());
         };
-        let out = Command::new("sh")
+        let mut command = Command::new("sh");
+        command
             .arg("-c")
             .arg(cmd)
             .current_dir(&self.root)
             .stdin(Stdio::null())
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+
+        let mut child = command
+            .spawn()
             .map_err(|e| format!("failed to spawn verification command `{cmd}`: {e:#}"))?;
 
-        if out.status.success() {
+        let mut stdout_pipe = child.stdout.take();
+        let mut stderr_pipe = child.stderr.take();
+
+        let stdout_thread = std::thread::spawn(move || {
+            if let Some(pipe) = stdout_pipe.take() {
+                crate::tools::read_pipe_capped(pipe)
+            } else {
+                Vec::new()
+            }
+        });
+
+        let stderr_thread = std::thread::spawn(move || {
+            if let Some(pipe) = stderr_pipe.take() {
+                crate::tools::read_pipe_capped(pipe)
+            } else {
+                Vec::new()
+            }
+        });
+
+        let start = std::time::Instant::now();
+        let timeout = self.timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(st)) => break st,
+                Ok(None) => {
+                    if start.elapsed() > timeout {
+                        crate::tools::kill_process_group(&mut child);
+                        let _ = stdout_thread.join();
+                        let _ = stderr_thread.join();
+                        return Err(format!(
+                            "verification command `{cmd}` timed out after {}s",
+                            timeout.as_secs()
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => {
+                    crate::tools::kill_process_group(&mut child);
+                    let _ = stdout_thread.join();
+                    let _ = stderr_thread.join();
+                    return Err(format!("error waiting on verification command: {e:#}"));
+                }
+            }
+        };
+
+        let stdout_bytes = stdout_thread.join().unwrap_or_default();
+        let stderr_bytes = stderr_thread.join().unwrap_or_default();
+
+        if status.success() {
             Ok(())
         } else {
-            let code = out.status.code().unwrap_or(-1);
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
+            let code = status.code().unwrap_or(-1);
+            let stdout = String::from_utf8_lossy(&stdout_bytes);
+            let stderr = String::from_utf8_lossy(&stderr_bytes);
             Err(format!(
                 "exit code: {code}\nstdout:\n{stdout}\nstderr:\n{stderr}"
             ))
@@ -243,9 +326,18 @@ mod tests {
         let ok_gate = VerificationGate::new(root.clone(), Some("true".into()));
         assert!(ok_gate.verify().is_ok());
 
-        let fail_gate = VerificationGate::new(root, Some("echo 'err text' >&2; exit 42".into()));
+        let fail_gate =
+            VerificationGate::new(root.clone(), Some("echo 'err text' >&2; exit 42".into()));
         let err = fail_gate.verify().unwrap_err();
         assert!(err.contains("exit code: 42"));
         assert!(err.contains("err text"));
+
+        let timeout_gate = VerificationGate::with_timeout(
+            root,
+            Some("sleep 10".into()),
+            Duration::from_millis(200),
+        );
+        let timeout_err = timeout_gate.verify().unwrap_err();
+        assert!(timeout_err.contains("timed out"));
     }
 }

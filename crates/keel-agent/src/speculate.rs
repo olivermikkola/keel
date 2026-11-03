@@ -199,7 +199,7 @@ fn copy_workspace_filtered(src: &Path, dst: &Path) -> Result<()> {
 
 impl SpeculationEngine {
     pub fn run(&self, prompt: &str) -> Result<SpeculationReport> {
-        let n = self.config.candidates.clamp(1, 8);
+        let n = self.config.candidates.clamp(1, 4);
         let mut sandboxes = Vec::with_capacity(n);
         for i in 0..n {
             sandboxes.push(EphemeralSandbox::create(&self.config.root, i + 1)?);
@@ -378,10 +378,7 @@ fn run_single_candidate(
     };
 
     let verification_passed = if let Some(ref cmd) = verify_cmd {
-        let gate = VerificationGate {
-            root: sb_dir.clone(),
-            command: Some(cmd.clone()),
-        };
+        let gate = VerificationGate::new(sb_dir.clone(), Some(cmd.clone()));
         gate.verify().is_ok()
     } else {
         turn_succeeded
@@ -395,8 +392,12 @@ fn run_single_candidate(
         diff = vfs.diff();
         for st in vfs.status() {
             let full = sb_dir.join(&st.path);
-            let content_opt = if full.is_file() {
-                std::fs::read_to_string(&full).ok()
+            let content_opt = if let Ok(meta) = std::fs::symlink_metadata(&full) {
+                if meta.file_type().is_file() && meta.len() <= crate::vfs::MAX_VFS_FILE_BYTES {
+                    std::fs::read_to_string(&full).ok()
+                } else {
+                    None
+                }
             } else {
                 None
             };

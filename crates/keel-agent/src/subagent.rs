@@ -9,8 +9,8 @@ use crate::sandbox::{LandlockPlugin, ToolRegistry};
 use crate::symbols::SymbolPlugin;
 use crate::tools::ReadOnlyToolsPlugin;
 use crate::{
-    Agent, ApproverPlugin, Llm, LlmPlugin, Message, ReadOnly, SessionLog, SessionLogPlugin, Tool,
-    ToolSpec,
+    Agent, ApproverPlugin, CancelToken, CancelTokenPlugin, Llm, LlmPlugin, Message, ReadOnly,
+    SessionLog, SessionLogPlugin, Tool, ToolSpec,
 };
 use anyhow::{Context as _, Result};
 use keel_kernel::{Context, Plugin, Scope};
@@ -77,6 +77,8 @@ pub struct SubagentReport {
     pub success: bool,
 }
 
+pub const MAX_SUBAGENT_PROMPT_CHARS: usize = 65_536;
+
 /// Execute an isolated, read-only subagent turn in a fresh kernel context.
 pub fn run_subagent(
     root: &Path,
@@ -85,8 +87,13 @@ pub fn run_subagent(
     role: SubagentRole,
     max_steps: usize,
     landlock_enabled: bool,
+    cancel_token: Option<CancelToken>,
 ) -> Result<SubagentReport> {
+    if prompt.chars().count() > MAX_SUBAGENT_PROMPT_CHARS {
+        anyhow::bail!("subagent prompt exceeds {MAX_SUBAGENT_PROMPT_CHARS} characters");
+    }
     let child_ctx = Context::new();
+    let _p_cancel = cancel_token.map(|c| child_ctx.mount(&CancelTokenPlugin(c)));
     let _p_llm = child_ctx.mount(&LlmPlugin(llm));
     let _p_app = child_ctx.mount(&ApproverPlugin(Arc::new(ReadOnly)));
     let _p_log = child_ctx.mount(&SessionLogPlugin(SessionLog::none()));
@@ -167,6 +174,7 @@ pub struct SubagentTool {
     pub root: PathBuf,
     pub llm: Arc<dyn Llm>,
     pub landlock_enabled: bool,
+    pub cancel_token: Option<CancelToken>,
 }
 
 impl Tool for SubagentTool {
@@ -218,6 +226,7 @@ impl Tool for SubagentTool {
             role,
             max_steps,
             self.landlock_enabled,
+            self.cancel_token.clone(),
         )?;
 
         if rep.success {
@@ -249,11 +258,16 @@ impl Plugin for SubagentPlugin {
         let Some(reg) = scope.context().service::<ToolRegistry>() else {
             return;
         };
+        let cancel = scope
+            .context()
+            .service::<CancelToken>()
+            .map(|c| (*c).clone());
 
         reg.register(Arc::new(SubagentTool {
             root: self.root.clone(),
             llm: (*llm).clone(),
             landlock_enabled: self.landlock_enabled,
+            cancel_token: cancel,
         }));
     }
 }
@@ -282,6 +296,7 @@ mod tests {
             root,
             llm,
             landlock_enabled: false,
+            cancel_token: None,
         };
 
         let out = tool.run(&json!({"prompt": "find the secret"})).unwrap();
@@ -345,6 +360,7 @@ mod tests {
             SubagentRole::Navigator,
             5,
             false,
+            None,
         )
         .unwrap();
 
@@ -354,6 +370,47 @@ mod tests {
         assert_eq!(rep.steps_taken, 2);
         assert_eq!(rep.tools_called, vec!["list_dir"]);
         assert!(rep.answer.contains("Directory is clean and verified."));
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn subagent_prompt_length_bound_and_cancellation() {
+        let tmp = std::env::temp_dir().join(format!("keel-subagent-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let llm: Arc<dyn Llm> = Arc::new(ScriptLlm(Mutex::new(vec![])));
+
+        // 1. Oversized prompt is rejected
+        let huge_prompt = "x".repeat(MAX_SUBAGENT_PROMPT_CHARS + 10);
+        let err = run_subagent(
+            &tmp,
+            llm.clone(),
+            &huge_prompt,
+            SubagentRole::Researcher,
+            5,
+            false,
+            None,
+        );
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("exceeds"));
+
+        // 2. Cancellation stops subagent immediately
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let res = run_subagent(
+            &tmp,
+            llm,
+            "Valid prompt",
+            SubagentRole::Researcher,
+            5,
+            false,
+            Some(cancel),
+        );
+        let rep = res.expect("run_subagent returns structured report on agent error");
+        assert!(!rep.success);
+        assert!(rep.answer.contains("cancelled"));
 
         let _ = std::fs::remove_dir_all(tmp);
     }

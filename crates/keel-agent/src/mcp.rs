@@ -58,8 +58,7 @@ struct McpProcess {
 
 impl Drop for McpProcess {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        crate::tools::kill_process_group(&mut self.child);
     }
 }
 
@@ -85,21 +84,18 @@ impl McpProcess {
         loop {
             let now = std::time::Instant::now();
             if now >= deadline {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
+                crate::tools::kill_process_group(&mut self.child);
                 bail!("MCP server timed out after {timeout:?} awaiting `{method}`");
             }
             let wait = deadline.saturating_duration_since(now);
             let res_line = match self.rx.recv_timeout(wait) {
                 Ok(Ok(l)) => l,
                 Ok(Err(e)) => {
-                    let _ = self.child.kill();
-                    let _ = self.child.wait();
+                    crate::tools::kill_process_group(&mut self.child);
                     bail!("MCP server stream error while awaiting `{method}`: {e}");
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    let _ = self.child.kill();
-                    let _ = self.child.wait();
+                    crate::tools::kill_process_group(&mut self.child);
                     bail!("MCP server timed out after {timeout:?} awaiting `{method}`");
                 }
                 Err(RecvTimeoutError::Disconnected) => {
@@ -155,6 +151,12 @@ impl McpClient {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
 
         let mut child = cmd.spawn().with_context(|| {
             format!("spawning MCP server `{}`: {}", server_name, config.command)

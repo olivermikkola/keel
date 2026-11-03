@@ -367,6 +367,12 @@ impl DiagnosticOracle {
             .env("CARGO_BUILD_JOBS", "2")
             .env("RAYON_NUM_THREADS", "2");
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+
         let mut child = cmd
             .spawn()
             .with_context(|| format!("spawning test command: {cmd_str}"))?;
@@ -409,8 +415,7 @@ impl DiagnosticOracle {
                 Ok(Some(_status)) => break,
                 Ok(None) => {
                     if start.elapsed() > self.timeout {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        crate::tools::kill_process_group(&mut child);
                         anyhow::bail!(
                             "test execution timed out after {}s (killed)",
                             self.timeout.as_secs()
@@ -419,8 +424,7 @@ impl DiagnosticOracle {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
                 Err(e) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    crate::tools::kill_process_group(&mut child);
                     return Err(e).context("waiting on test runner process");
                 }
             }
