@@ -956,7 +956,10 @@ impl Agent<'_> {
                 let shadow_active = vfs_svc
                     .as_ref()
                     .is_some_and(|v| v.mode() == vfs::VfsMode::ShadowMemory);
-                if call.name == "read_file" && !shadow_active {
+                let has_slicing = call.args.get("offset").is_some()
+                    || call.args.get("limit").is_some()
+                    || call.args.get("line_numbers").is_some();
+                if call.name == "read_file" && !shadow_active && !has_slicing {
                     if let Some(prewarm) = self.ctx.service::<Arc<interceptor::PrewarmEngine>>() {
                         if let Some(p) = call.args.get("path").and_then(|val| val.as_str()) {
                             if let Some(content) = prewarm.get_warmed(std::path::Path::new(p)) {

@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -163,6 +163,63 @@ fn truncate(mut s: String) -> String {
     s
 }
 
+/// Slice lines from file content given optional 1-indexed `offset`, line count `limit`, and `line_numbers`.
+pub fn slice_file_lines(
+    content: &str,
+    rel_path: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    line_numbers: bool,
+) -> String {
+    if offset.is_none() && limit.is_none() && !line_numbers {
+        return truncate(content.to_string());
+    }
+
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+    let start = offset.unwrap_or(1).max(1) - 1;
+
+    if start >= total && total > 0 {
+        return format!(
+            "[offset {} exceeds file length ({} lines) in {}]",
+            start + 1,
+            total,
+            rel_path
+        );
+    }
+
+    let end = if let Some(lim) = limit {
+        (start + lim).min(total)
+    } else {
+        total
+    };
+
+    let slice = if start < total {
+        &lines[start..end]
+    } else {
+        &[]
+    };
+    let mut out = format!(
+        "[lines {}-{} of {} in {}]\n",
+        start + 1,
+        end,
+        total,
+        rel_path
+    );
+
+    if line_numbers {
+        let width = end.to_string().len().max(3);
+        for (i, line) in slice.iter().enumerate() {
+            let line_no = start + i + 1;
+            out.push_str(&format!("{:>width$} | {}\n", line_no, line, width = width));
+        }
+    } else {
+        out.push_str(&slice.join("\n"));
+    }
+
+    truncate(out)
+}
+
 fn arg<'a>(a: &'a Value, k: &str) -> Result<&'a str> {
     a[k].as_str()
         .with_context(|| format!("missing string argument `{k}`"))
@@ -173,15 +230,25 @@ impl Tool for ReadFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "read_file".into(),
-            description: "Read a UTF-8 text file relative to the workspace.".into(),
-            parameters: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+            description: "Read a UTF-8 text file relative to the workspace. Supports optional 1-indexed line `offset`, `limit` (max lines), and `line_numbers` (prefix lines with line numbers).".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Relative path to file in workspace" },
+                    "offset": { "type": "integer", "description": "Optional 1-indexed line number to start reading from" },
+                    "limit": { "type": "integer", "description": "Optional maximum number of lines to read" },
+                    "line_numbers": { "type": "boolean", "description": "Optional boolean to prepend line numbers formatted as `N | ...`" }
+                },
+                "required": ["path"]
+            }),
         }
     }
     fn mutating(&self) -> bool {
         false
     }
     fn run(&self, a: &Value) -> Result<String> {
-        let p = confine(&self.0, arg(a, "path")?)?;
+        let rel = arg(a, "path")?;
+        let p = confine(&self.0, rel)?;
         let meta = std::fs::symlink_metadata(&p)
             .with_context(|| format!("checking metadata for {}", p.display()))?;
         if meta.is_dir() {
@@ -193,26 +260,52 @@ impl Tool for ReadFile {
         if meta.len() > crate::vfs::MAX_VFS_FILE_BYTES {
             bail!("{} exceeds 64MB limit ({} bytes)", p.display(), meta.len());
         }
-        let mut file =
-            std::fs::File::open(&p).with_context(|| format!("opening {}", p.display()))?;
-        let mut buf = Vec::new();
-        file.by_ref()
-            .take((MAX_OUT * 2) as u64)
-            .read_to_end(&mut buf)
-            .with_context(|| format!("reading {}", p.display()))?;
-        let text = match String::from_utf8(buf) {
-            Ok(s) => s,
-            Err(e) => {
-                let valid = e.into_bytes();
-                let lossy = String::from_utf8_lossy(&valid);
-                format!(
-                    "[binary or non-UTF-8 content; size: {} bytes]\n{}",
-                    meta.len(),
-                    lossy
-                )
+
+        let offset = a.get("offset").and_then(|v| v.as_u64()).map(|n| n as usize);
+        let limit = a.get("limit").and_then(|v| v.as_u64()).map(|n| n as usize);
+        let line_numbers = a
+            .get("line_numbers")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let text = if offset.is_none() && limit.is_none() && !line_numbers {
+            let mut file =
+                std::fs::File::open(&p).with_context(|| format!("opening {}", p.display()))?;
+            let mut buf = Vec::new();
+            file.by_ref()
+                .take((MAX_OUT * 2) as u64)
+                .read_to_end(&mut buf)
+                .with_context(|| format!("reading {}", p.display()))?;
+            match String::from_utf8(buf) {
+                Ok(s) => s,
+                Err(e) => {
+                    let valid = e.into_bytes();
+                    let lossy = String::from_utf8_lossy(&valid);
+                    format!(
+                        "[binary or non-UTF-8 content; size: {} bytes]\n{}",
+                        meta.len(),
+                        lossy
+                    )
+                }
+            }
+        } else {
+            let raw_bytes =
+                std::fs::read(&p).with_context(|| format!("reading {}", p.display()))?;
+            match String::from_utf8(raw_bytes) {
+                Ok(s) => s,
+                Err(e) => {
+                    let valid = e.into_bytes();
+                    let lossy = String::from_utf8_lossy(&valid);
+                    format!(
+                        "[binary or non-UTF-8 content; size: {} bytes]\n{}",
+                        meta.len(),
+                        lossy
+                    )
+                }
             }
         };
-        Ok(truncate(text))
+
+        Ok(slice_file_lines(&text, rel, offset, limit, line_numbers))
     }
 }
 
@@ -353,14 +446,22 @@ impl Tool for PatchFile {
     }
 }
 
-/// Literal substring search across the workspace (skips .git, target, node_modules).
+/// Literal substring or case-insensitive search across the workspace (skips .git, target, node_modules).
 pub struct Grep(pub PathBuf);
 impl Tool for Grep {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "grep".into(),
-            description: "Search files for a literal text pattern. Returns path:line:text. Optional `path` narrows to a subdirectory or file.".into(),
-            parameters: json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern"]}),
+            description: "Search files for a text pattern. Returns path:line:text. Optional `path` narrows to a subdirectory or file; optional `case_insensitive` enables case-insensitive matching.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "pattern": { "type": "string", "description": "Text pattern to search for" },
+                    "path": { "type": "string", "description": "Optional subdirectory or file path to search within" },
+                    "case_insensitive": { "type": "boolean", "description": "Optional boolean to ignore letter casing" }
+                },
+                "required": ["pattern"]
+            }),
         }
     }
     fn mutating(&self) -> bool {
@@ -369,8 +470,21 @@ impl Tool for Grep {
     fn run(&self, a: &Value) -> Result<String> {
         let pat = arg(a, "pattern")?;
         let start = confine(&self.0, a["path"].as_str().unwrap_or("."))?;
+        let case_insensitive = a
+            .get("case_insensitive")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let mut hits = Vec::new();
-        walk(&start, &self.0, pat, &mut hits);
+        let mut visited = 0usize;
+        walk(
+            &start,
+            &self.0,
+            pat,
+            case_insensitive,
+            0,
+            &mut visited,
+            &mut hits,
+        );
         if hits.is_empty() {
             return Ok("no matches".into());
         }
@@ -379,12 +493,31 @@ impl Tool for Grep {
 }
 
 const MAX_HITS: usize = 100;
+const MAX_GREP_DEPTH: usize = 32;
+const MAX_GREP_VISITED: usize = 100_000;
 
-fn walk(p: &Path, root: &Path, pat: &str, hits: &mut Vec<String>) {
-    if hits.len() >= MAX_HITS {
+fn walk(
+    p: &Path,
+    root: &Path,
+    pat: &str,
+    case_insensitive: bool,
+    depth: usize,
+    visited: &mut usize,
+    hits: &mut Vec<String>,
+) {
+    if hits.len() >= MAX_HITS || *visited >= MAX_GREP_VISITED || depth > MAX_GREP_DEPTH {
         return;
     }
-    if p.is_dir() {
+    *visited += 1;
+
+    let Ok(meta) = std::fs::symlink_metadata(p) else {
+        return;
+    };
+    if meta.file_type().is_symlink() {
+        return;
+    }
+
+    if meta.is_dir() {
         let Ok(rd) = std::fs::read_dir(p) else { return };
         let mut entries: Vec<_> = rd.filter_map(|e| e.ok()).collect();
         entries.sort_by_key(|e| e.file_name());
@@ -396,14 +529,21 @@ fn walk(p: &Path, root: &Path, pat: &str, hits: &mut Vec<String>) {
             ) {
                 continue;
             }
-            // file_type() does not follow symlinks, so links can't pull in files outside the root.
             if e.file_type().map(|t| t.is_symlink()).unwrap_or(true) {
                 continue;
             }
-            walk(&e.path(), root, pat, hits);
+            walk(
+                &e.path(),
+                root,
+                pat,
+                case_insensitive,
+                depth + 1,
+                visited,
+                hits,
+            );
         }
-    } else if let Ok(meta) = p.metadata() {
-        if !meta.file_type().is_file() || meta.len() > MAX_GREP_FILE_SIZE {
+    } else if meta.file_type().is_file() {
+        if meta.len() > MAX_GREP_FILE_SIZE {
             return;
         }
         let Ok(file) = std::fs::File::open(p) else {
@@ -411,12 +551,23 @@ fn walk(p: &Path, root: &Path, pat: &str, hits: &mut Vec<String>) {
         };
         let reader = BufReader::new(file);
         let rel = p.strip_prefix(root).unwrap_or(p).display().to_string();
+        let pat_lower = if case_insensitive {
+            Some(pat.to_ascii_lowercase())
+        } else {
+            None
+        };
+
         for (i, line_res) in reader.lines().enumerate() {
             if hits.len() >= MAX_HITS {
                 break;
             }
             if let Ok(line) = line_res {
-                if line.contains(pat) {
+                let matched = if let Some(ref pl) = pat_lower {
+                    line.to_ascii_lowercase().contains(pl)
+                } else {
+                    line.contains(pat)
+                };
+                if matched {
                     hits.push(format!("{rel}:{}:{}", i + 1, line.trim()));
                 }
             }
@@ -501,22 +652,13 @@ impl Tool for Shell {
         let mut cmd = Command::new("sh");
         cmd.arg("-c")
             .arg(arg(a, "command")?)
-            .current_dir(&self.root)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .current_dir(&self.root);
 
         // Scrub sensitive environment variables to prevent credential exfiltration
         for (k, _) in std::env::vars() {
             if is_sensitive_env_var(&k) {
                 cmd.env_remove(&k);
             }
-        }
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
         }
 
         unsafe {
@@ -533,56 +675,13 @@ impl Tool for Shell {
             .map(Duration::from_secs)
             .unwrap_or(self.timeout);
 
-        let mut child = cmd.spawn()?;
-        let mut stdout_pipe = child.stdout.take();
-        let mut stderr_pipe = child.stderr.take();
-
-        let stdout_thread = std::thread::spawn(move || {
-            if let Some(pipe) = stdout_pipe.take() {
-                read_pipe_capped(pipe)
-            } else {
-                Vec::new()
-            }
-        });
-
-        let stderr_thread = std::thread::spawn(move || {
-            if let Some(pipe) = stderr_pipe.take() {
-                read_pipe_capped(pipe)
-            } else {
-                Vec::new()
-            }
-        });
-
-        let start = std::time::Instant::now();
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(st)) => break st,
-                Ok(None) => {
-                    if start.elapsed() > timeout {
-                        kill_process_group(&mut child);
-                        let _ = stdout_thread.join();
-                        let _ = stderr_thread.join();
-                        bail!("command timed out after {}s", timeout.as_secs());
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                Err(e) => {
-                    kill_process_group(&mut child);
-                    let _ = stdout_thread.join();
-                    let _ = stderr_thread.join();
-                    return Err(e).context("waiting on child process");
-                }
-            }
-        };
-
-        let stdout_bytes = stdout_thread.join().unwrap_or_default();
-        let stderr_bytes = stderr_thread.join().unwrap_or_default();
+        let out = run_command_bounded(cmd, timeout)?;
 
         Ok(truncate(format!(
             "exit: {}\nstdout:\n{}\nstderr:\n{}",
-            status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&stdout_bytes),
-            String::from_utf8_lossy(&stderr_bytes)
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
         )))
     }
 }
@@ -943,5 +1042,78 @@ mod tests {
         assert_eq!(out.status.code(), Some(3));
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hi");
         assert_eq!(String::from_utf8_lossy(&out.stderr).trim(), "err");
+    }
+
+    #[test]
+    fn read_file_slicing_and_line_numbers() {
+        let ws = std::env::temp_dir().join(format!("keel-slice-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+
+        let doc = (1..=20)
+            .map(|i| format!("Line {i} content"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(ws.join("doc.txt"), &doc).unwrap();
+
+        let rf = ReadFile(ws.clone());
+
+        // Verbatim read (no offset/limit)
+        let verbatim = rf.run(&json!({"path": "doc.txt"})).unwrap();
+        assert_eq!(verbatim, doc);
+
+        // Sliced read lines 5..=8
+        let sliced = rf
+            .run(&json!({"path": "doc.txt", "offset": 5, "limit": 4}))
+            .unwrap();
+        assert!(sliced.contains("[lines 5-8 of 20 in doc.txt]"));
+        assert!(sliced.contains("Line 5 content"));
+        assert!(sliced.contains("Line 8 content"));
+        assert!(!sliced.contains("Line 4 content"));
+        assert!(!sliced.contains("Line 9 content"));
+
+        // Line numbers formatted read
+        let num_sliced = rf
+            .run(&json!({"path": "doc.txt", "offset": 5, "limit": 2, "line_numbers": true}))
+            .unwrap();
+        assert!(num_sliced.contains("  5 | Line 5 content"));
+        assert!(num_sliced.contains("  6 | Line 6 content"));
+
+        // Exceeding offset reports cleanly
+        let oob = rf
+            .run(&json!({"path": "doc.txt", "offset": 100, "limit": 5}))
+            .unwrap();
+        assert!(oob.contains("exceeds file length"));
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn grep_case_insensitive_and_symlink_skipping() {
+        let ws = std::env::temp_dir().join(format!("keel-grep-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+
+        std::fs::write(
+            ws.join("mixed.txt"),
+            "Hello World\nhello world\nHELLO WORLD\n",
+        )
+        .unwrap();
+
+        let grep = Grep(ws.clone());
+
+        // Exact case match
+        let exact = grep
+            .run(&json!({"pattern": "Hello World", "path": "mixed.txt"}))
+            .unwrap();
+        assert_eq!(exact.lines().count(), 1);
+
+        // Case-insensitive match finds all 3
+        let ci = grep
+            .run(&json!({"pattern": "hello world", "path": "mixed.txt", "case_insensitive": true}))
+            .unwrap();
+        assert_eq!(ci.lines().count(), 3);
+
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

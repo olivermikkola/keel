@@ -287,7 +287,31 @@ impl TransactionalVfs {
         }
         let rel = args.get("path").and_then(|v| v.as_str())?;
         match tool_name {
-            "read_file" => Some(self.read_to_string(Path::new(rel))),
+            "read_file" => {
+                let full = match self.read_to_string(Path::new(rel)) {
+                    Ok(s) => s,
+                    Err(e) => return Some(Err(e)),
+                };
+                let offset = args
+                    .get("offset")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize);
+                let limit = args
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize);
+                let line_numbers = args
+                    .get("line_numbers")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                Some(Ok(crate::tools::slice_file_lines(
+                    &full,
+                    rel,
+                    offset,
+                    limit,
+                    line_numbers,
+                )))
+            }
             "write_file" => {
                 let content = match args.get("content").and_then(|v| v.as_str()) {
                     Some(c) => c,
