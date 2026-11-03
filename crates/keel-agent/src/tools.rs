@@ -199,6 +199,11 @@ impl Tool for WriteFile {
         if let Some(d) = p.parent() {
             std::fs::create_dir_all(d)?;
         }
+        if let Ok(meta) = std::fs::symlink_metadata(&p) {
+            if !meta.file_type().is_file() {
+                bail!("{} is not a regular file", p.display());
+            }
+        }
         let c = arg(a, "content")?;
         std::fs::write(&p, c)?;
         Ok(format!("wrote {} bytes to {}", c.len(), p.display()))
@@ -221,6 +226,11 @@ impl Tool for EditFile {
     }
     fn run(&self, a: &Value) -> Result<String> {
         let p = confine(&self.0, arg(a, "path")?)?;
+        let meta = std::fs::symlink_metadata(&p)
+            .with_context(|| format!("checking metadata for {}", p.display()))?;
+        if !meta.file_type().is_file() {
+            bail!("{} is not a regular file", p.display());
+        }
         let (old, new) = (arg(a, "old")?, arg(a, "new")?);
         let text =
             std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
@@ -248,6 +258,11 @@ impl Tool for PatchFile {
     }
     fn run(&self, a: &Value) -> Result<String> {
         let p = confine(&self.0, arg(a, "path")?)?;
+        let meta = std::fs::symlink_metadata(&p)
+            .with_context(|| format!("checking metadata for {}", p.display()))?;
+        if !meta.file_type().is_file() {
+            bail!("{} is not a regular file", p.display());
+        }
         let patch_text = arg(a, "patch")?;
         let text =
             std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
@@ -588,6 +603,34 @@ mod tests {
         let out = Grep(d.clone()).run(&json!({"pattern":"B"})).unwrap();
         assert_eq!(out, "f.txt:2:B");
         std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn mutating_tools_enforce_regular_files() {
+        let d = std::env::temp_dir().join(format!("keel-reg-test-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let sub = d.join("subdir");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        // WriteFile on directory
+        let w = WriteFile(d.clone());
+        assert!(w
+            .run(&json!({"path": "subdir", "content": "text"}))
+            .is_err());
+
+        // EditFile on directory
+        let e = EditFile(d.clone());
+        assert!(e
+            .run(&json!({"path": "subdir", "old": "a", "new": "b"}))
+            .is_err());
+
+        // PatchFile on directory
+        let p = PatchFile(d.clone());
+        assert!(p
+            .run(&json!({"path": "subdir", "patch": "@@ -1 +1 @@"}))
+            .is_err());
+
+        let _ = std::fs::remove_dir_all(d);
     }
 
     #[test]

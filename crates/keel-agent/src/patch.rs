@@ -13,6 +13,12 @@
 
 use anyhow::{bail, Context, Result};
 
+/// Maximum line length for Levenshtein quadratic comparison to prevent DoS.
+pub const MAX_LEVENSHTEIN_LINE_LEN: usize = 1024;
+
+/// Maximum number of hunks permitted in a single patch payload.
+pub const MAX_HUNKS: usize = 500;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum MatchQuality {
     Exact,
@@ -37,17 +43,27 @@ pub struct PatchOutcome {
     pub quality: MatchQuality,
 }
 
-/// Compute Levenshtein edit distance between two strings.
+/// Compute Levenshtein edit distance between two strings with O(min(m, n)) space.
 pub fn levenshtein(a: &str, b: &str) -> usize {
+    if a == b {
+        return 0;
+    }
+    if a.is_empty() {
+        return b.chars().count();
+    }
+    if b.is_empty() {
+        return a.chars().count();
+    }
+
     let a_chars: Vec<char> = a.chars().collect();
     let b_chars: Vec<char> = b.chars().collect();
     let (m, n) = (a_chars.len(), b_chars.len());
-    if m == 0 {
-        return n;
+
+    // Swap if needed so that b is the shorter string for O(min(m, n)) allocation
+    if n > m {
+        return levenshtein(b, a);
     }
-    if n == 0 {
-        return m;
-    }
+
     let mut dp: Vec<usize> = (0..=n).collect();
     for i in 1..=m {
         let mut prev = dp[0];
@@ -66,16 +82,38 @@ pub fn levenshtein(a: &str, b: &str) -> usize {
     dp[n]
 }
 
-/// Line similarity in range [0.0, 1.0].
+/// Line similarity in range [0.0, 1.0], bounded against algorithmic complexity DoS.
 fn line_similarity(a: &str, b: &str) -> f64 {
     let a_t = a.trim();
     let b_t = b.trim();
     if a_t == b_t {
         return 1.0;
     }
-    let max_len = a_t.chars().count().max(b_t.chars().count());
+    let a_len = a_t.chars().count();
+    let b_len = b_t.chars().count();
+    let max_len = a_len.max(b_len);
     if max_len == 0 {
         return 1.0;
+    }
+    let diff = a_len.abs_diff(b_len);
+    // Edit distance is at least `diff`. If length diff alone exceeds 20%,
+    // similarity can never reach the 0.80 fuzzy match threshold.
+    if (diff as f64) / (max_len as f64) > 0.20 {
+        return 0.0;
+    }
+    // Cap quadratic Levenshtein on lines exceeding 1024 characters
+    if max_len > MAX_LEVENSHTEIN_LINE_LEN {
+        let a_prefix: String = a_t.chars().take(256).collect();
+        let b_prefix: String = b_t.chars().take(256).collect();
+        if a_prefix != b_prefix {
+            return 0.0;
+        }
+        let a_suffix: String = a_t.chars().rev().take(256).collect();
+        let b_suffix: String = b_t.chars().rev().take(256).collect();
+        if a_suffix != b_suffix {
+            return 0.0;
+        }
+        return 0.85;
     }
     let dist = levenshtein(a_t, b_t);
     if dist >= max_len {
@@ -222,6 +260,15 @@ pub fn fuzzy_replace(text: &str, old: &str, new: &str) -> Result<(String, MatchQ
 
         for i in 0..=text_lines.len() - k {
             let window = &text_lines[i..i + k];
+            // Quick boundary check: if neither boundary matches, skip full O(k) Levenshtein
+            if k >= 3 {
+                let first_sim = line_similarity(window[0], old_lines[0]);
+                let last_sim = line_similarity(window[k - 1], old_lines[k - 1]);
+                if first_sim < 0.35 && last_sim < 0.35 {
+                    continue;
+                }
+            }
+
             let sum_sim: f64 = window
                 .iter()
                 .zip(&old_lines)
@@ -300,6 +347,9 @@ pub fn parse_hunks(patch_str: &str) -> Result<Vec<Hunk>> {
     if patch_str.contains("<<<<<<< SEARCH") {
         let parts: Vec<&str> = patch_str.split("<<<<<<< SEARCH").collect();
         for part in parts.iter().skip(1) {
+            if hunks.len() >= MAX_HUNKS {
+                bail!("patch exceeds maximum allowed hunk count ({MAX_HUNKS})");
+            }
             let Some((search_part, rest)) = part.split_once("=======") else {
                 continue;
             };
@@ -353,6 +403,9 @@ pub fn parse_hunks(patch_str: &str) -> Result<Vec<Hunk>> {
             }
 
             if !search_buf.is_empty() || !replace_buf.is_empty() {
+                if hunks.len() >= MAX_HUNKS {
+                    bail!("patch exceeds maximum allowed hunk count ({MAX_HUNKS})");
+                }
                 hunks.push(Hunk {
                     search: search_buf,
                     replace: replace_buf,
@@ -469,5 +522,41 @@ GAMMA_MODIFIED
             outcome.modified_text,
             "line1\nline2_updated\nline3\nline4\n"
         );
+    }
+
+    #[test]
+    fn levenshtein_and_similarity_dos_protection() {
+        assert_eq!(levenshtein("hello", "hello"), 0);
+        assert_eq!(levenshtein("", "world"), 5);
+        assert_eq!(levenshtein("world", ""), 5);
+
+        // Disparate lengths immediately pruned without quadratic loop
+        let short = "abc";
+        let long = "abcdefghijklmnopqrstuvwxyz";
+        assert_eq!(line_similarity(short, long), 0.0);
+
+        // Lines exceeding MAX_LEVENSHTEIN_LINE_LEN
+        let huge_a = "x".repeat(2000);
+        let huge_b = "x".repeat(2000);
+        assert_eq!(line_similarity(&huge_a, &huge_b), 1.0);
+
+        let huge_diff = format!("{}different", "y".repeat(1500));
+        assert_eq!(line_similarity(&huge_a, &huge_diff), 0.0);
+    }
+
+    #[test]
+    fn parse_hunks_rejects_excessive_hunks() {
+        let mut malformed = String::new();
+        for i in 0..MAX_HUNKS + 5 {
+            malformed.push_str(&format!(
+                "<<<<<<< SEARCH\nold_{i}\n=======\nnew_{i}\n>>>>>>> REPLACE\n"
+            ));
+        }
+        let res = parse_hunks(&malformed);
+        assert!(res.is_err());
+        assert!(res
+            .unwrap_err()
+            .to_string()
+            .contains("maximum allowed hunk count"));
     }
 }

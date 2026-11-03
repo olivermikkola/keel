@@ -368,11 +368,41 @@ impl EpistemicStore {
         if !p.exists() {
             return Ok(());
         }
+        let meta = match std::fs::symlink_metadata(p) {
+            Ok(m) => m,
+            Err(_) => return Ok(()),
+        };
+        if !meta.file_type().is_file() {
+            anyhow::bail!(
+                "epistemic memory path is not a regular file: {}",
+                p.display()
+            );
+        }
         let data = std::fs::read_to_string(p)
             .with_context(|| format!("reading epistemic memory from {}", p.display()))?;
-        let state: EpistemicState = serde_json::from_str(&data)?;
-        *self.state.lock().unwrap() = state;
-        Ok(())
+        if data.trim().is_empty() {
+            return Ok(());
+        }
+        match serde_json::from_str::<EpistemicState>(&data) {
+            Ok(state) => {
+                *self.state.lock().unwrap() = state;
+                Ok(())
+            }
+            Err(e) => {
+                let now = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let backup = p.with_extension(format!("corrupt.{now}.json"));
+                let _ = std::fs::rename(p, &backup);
+                eprintln!(
+                    "warning: epistemic memory file at {} was corrupt ({e}); archived to {}",
+                    p.display(),
+                    backup.display()
+                );
+                Ok(())
+            }
+        }
     }
 
     pub fn save_to_file(&self) -> Result<()> {
@@ -384,8 +414,11 @@ impl EpistemicStore {
         }
         let state = self.state.lock().unwrap();
         let json = serde_json::to_string_pretty(&*state)?;
-        std::fs::write(p, json)
-            .with_context(|| format!("writing epistemic memory to {}", p.display()))?;
+        let tmp = p.with_extension(format!("tmp.{}", std::process::id()));
+        std::fs::write(&tmp, json)
+            .with_context(|| format!("writing temp epistemic memory to {}", tmp.display()))?;
+        std::fs::rename(&tmp, p)
+            .with_context(|| format!("atomically updating epistemic memory at {}", p.display()))?;
         Ok(())
     }
 
@@ -826,5 +859,30 @@ mod tests {
 
         let merged = store.get();
         assert_eq!(merged.nodes.len(), 3);
+    }
+
+    #[test]
+    fn epistemic_store_recovers_from_corrupted_json() {
+        let tmp =
+            std::env::temp_dir().join(format!("keel-epistemic-corrupt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let mem_file = tmp.join("memory.json");
+        // Write invalid corrupted JSON
+        std::fs::write(&mem_file, "{ this is not json }").unwrap();
+
+        // Store initialization should not panic or fail; it should archive the corrupt file
+        let store = EpistemicStore::new(Some(mem_file.clone()));
+        assert!(store.get().is_empty());
+
+        // A new fact can be cleanly saved
+        store.add_fact("Rust compiler guarantees safety").unwrap();
+        assert!(mem_file.exists());
+
+        let state = store.get();
+        assert_eq!(state.facts.len(), 1);
+
+        let _ = std::fs::remove_dir_all(tmp);
     }
 }
