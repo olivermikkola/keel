@@ -31,6 +31,7 @@ use crate::speculate::SpeculatePlugin;
 use crate::subagent::SubagentPlugin;
 use crate::symbols::{SymbolIndex, SymbolPlugin};
 use crate::tools::BuiltinToolsPlugin;
+use crate::tree::{ExplorationTree, TreePlugin};
 use crate::vfs::{TransactionalVfs, VfsMode, VfsPlugin};
 use crate::{
     Agent, ApprovalPolicy, Approver, ApproverPlugin, CancelToken, CancelTokenPlugin, Chunk,
@@ -558,6 +559,9 @@ fn create_session(
         ctx.mount(&SymbolPlugin {
             root: cfg.root.clone(),
         }),
+        ctx.mount(&TreePlugin {
+            root: cfg.root.clone(),
+        }),
     ];
 
     let mut sys_text = format!(
@@ -720,6 +724,8 @@ pub fn handle_acp_client<R: BufRead>(
                             "regressionSentinel": true,
                             "structuralSymbols": true,
                             "symbolOutline": true,
+                            "explorationTree": true,
+                            "multiStepBacktracking": true,
                         }
                     }),
                 );
@@ -1555,6 +1561,210 @@ pub fn handle_acp_client<R: BufRead>(
                     rpc_writer.send_error(id, -32000, "SymbolIndex not mounted");
                 }
             }
+            "tree/status" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                if let Some(tree_arc) = session.ctx.service::<Arc<Mutex<ExplorationTree>>>() {
+                    let tree = tree_arc.lock().unwrap();
+                    let ascii = tree.render_ascii();
+                    rpc_writer.send_response(
+                        id,
+                        json!({
+                            "session_id": sid,
+                            "current_id": tree.current_id,
+                            "root_id": tree.root_id,
+                            "nodes": tree.nodes,
+                            "ascii": ascii,
+                        }),
+                    );
+                } else {
+                    rpc_writer.send_error(id, -32000, "ExplorationTree not mounted");
+                }
+            }
+            "tree/fork" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let label = params
+                    .get("label")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Branch");
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                let cp = CheckpointManager::new(server.cfg.root.clone());
+                if let Some(tree_arc) = session.ctx.service::<Arc<Mutex<ExplorationTree>>>() {
+                    let mut tree = tree_arc.lock().unwrap();
+                    match tree.fork(label, &cp) {
+                        Ok(node) => {
+                            let ascii = tree.render_ascii();
+                            rpc_writer.send_response(
+                                id,
+                                json!({
+                                    "session_id": sid,
+                                    "node": node,
+                                    "current_id": tree.current_id,
+                                    "ascii": ascii,
+                                }),
+                            );
+                        }
+                        Err(e) => rpc_writer.send_error(id, -32000, &format!("{e:#}")),
+                    }
+                } else {
+                    rpc_writer.send_error(id, -32000, "ExplorationTree not mounted");
+                }
+            }
+            "tree/switch" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let node_id = params.get("node_id").and_then(|v| v.as_str()).unwrap_or("");
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                let cp = CheckpointManager::new(server.cfg.root.clone());
+                if let Some(tree_arc) = session.ctx.service::<Arc<Mutex<ExplorationTree>>>() {
+                    let mut tree = tree_arc.lock().unwrap();
+                    match tree.switch_to(node_id, &cp) {
+                        Ok(node) => {
+                            let ascii = tree.render_ascii();
+                            rpc_writer.send_response(
+                                id,
+                                json!({
+                                    "session_id": sid,
+                                    "node": node,
+                                    "current_id": tree.current_id,
+                                    "ascii": ascii,
+                                }),
+                            );
+                        }
+                        Err(e) => rpc_writer.send_error(id, -32000, &format!("{e:#}")),
+                    }
+                } else {
+                    rpc_writer.send_error(id, -32000, "ExplorationTree not mounted");
+                }
+            }
+            "tree/backtrack" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                let cp = CheckpointManager::new(server.cfg.root.clone());
+                if let Some(tree_arc) = session.ctx.service::<Arc<Mutex<ExplorationTree>>>() {
+                    let mut tree = tree_arc.lock().unwrap();
+                    match tree.backtrack(&cp) {
+                        Ok(parent) => {
+                            let ascii = tree.render_ascii();
+                            rpc_writer.send_response(
+                                id,
+                                json!({
+                                    "session_id": sid,
+                                    "parent": parent,
+                                    "current_id": tree.current_id,
+                                    "ascii": ascii,
+                                }),
+                            );
+                        }
+                        Err(e) => rpc_writer.send_error(id, -32000, &format!("{e:#}")),
+                    }
+                } else {
+                    rpc_writer.send_error(id, -32000, "ExplorationTree not mounted");
+                }
+            }
+            "tree/prune" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let node_id = params.get("node_id").and_then(|v| v.as_str()).unwrap_or("");
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                if let Some(tree_arc) = session.ctx.service::<Arc<Mutex<ExplorationTree>>>() {
+                    let mut tree = tree_arc.lock().unwrap();
+                    match tree.prune(node_id) {
+                        Ok(count) => {
+                            let ascii = tree.render_ascii();
+                            rpc_writer.send_response(
+                                id,
+                                json!({
+                                    "session_id": sid,
+                                    "pruned_count": count,
+                                    "current_id": tree.current_id,
+                                    "ascii": ascii,
+                                }),
+                            );
+                        }
+                        Err(e) => rpc_writer.send_error(id, -32000, &format!("{e:#}")),
+                    }
+                } else {
+                    rpc_writer.send_error(id, -32000, "ExplorationTree not mounted");
+                }
+            }
+            "tree/accept" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let node_id = params.get("node_id").and_then(|v| v.as_str()).unwrap_or("");
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                if let Some(tree_arc) = session.ctx.service::<Arc<Mutex<ExplorationTree>>>() {
+                    let mut tree = tree_arc.lock().unwrap();
+                    match tree.accept(node_id) {
+                        Ok(node) => {
+                            let ascii = tree.render_ascii();
+                            rpc_writer.send_response(
+                                id,
+                                json!({
+                                    "session_id": sid,
+                                    "accepted_node": node,
+                                    "current_id": tree.current_id,
+                                    "ascii": ascii,
+                                }),
+                            );
+                        }
+                        Err(e) => rpc_writer.send_error(id, -32000, &format!("{e:#}")),
+                    }
+                } else {
+                    rpc_writer.send_error(id, -32000, "ExplorationTree not mounted");
+                }
+            }
             "shutdown" | "exit" => {
                 if !id.is_null() {
                     rpc_writer.send_response(id, json!({ "status": "shutting_down" }));
@@ -2190,6 +2400,95 @@ impl WorkerService {
             .as_str()
             .unwrap()
             .contains("pub struct WorkerService"));
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn acp_daemon_tree_fork_and_backtrack_rpc() {
+        let tmp = std::env::temp_dir().join(format!("keel-tree-rpc-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&tmp)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Keel Test"])
+            .current_dir(&tmp)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@keel.dev"])
+            .current_dir(&tmp)
+            .status()
+            .unwrap();
+        std::fs::write(tmp.join("init.txt"), "initial").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "init.txt"])
+            .current_dir(&tmp)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init", "-q"])
+            .current_dir(&tmp)
+            .status()
+            .unwrap();
+
+        let out_buf = Arc::new(Mutex::new(Vec::new()));
+
+        let requests = [
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tree/status", "params": {}}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tree/fork", "params": {"label": "Attempt A: regex"}}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 4, "method": "tree/backtrack", "params": {}}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 5, "method": "shutdown", "params": {}}).to_string(),
+        ]
+        .join("\n")
+            + "\n";
+
+        let cfg = DaemonConfig {
+            root: tmp.clone(),
+            policy: ApprovalPolicy::Yolo,
+            landlock_enabled: false,
+            vfs_mode: VfsMode::MaterializedCow,
+            verify_command: None,
+        };
+
+        serve_acp(
+            BufReader::new(std::io::Cursor::new(requests.into_bytes())),
+            Box::new(SharedVecWriter(out_buf.clone())),
+            cfg,
+            Arc::new(DaemonTestLlm),
+        )
+        .unwrap();
+
+        let raw_output = String::from_utf8(out_buf.lock().unwrap().clone()).unwrap();
+        let lines: Vec<Value> = raw_output
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .collect();
+
+        // 1. Verify capability
+        assert!(lines.iter().any(|v| v["id"] == 1
+            && v["result"]["capabilities"]["explorationTree"] == true
+            && v["result"]["capabilities"]["multiStepBacktracking"] == true));
+
+        // 2. Verify tree status
+        let status_res = lines.iter().find(|v| v["id"] == 2).unwrap();
+        assert_eq!(status_res["result"]["current_id"], "root");
+
+        // 3. Verify fork response
+        let fork_res = lines.iter().find(|v| v["id"] == 3).unwrap();
+        assert_eq!(fork_res["result"]["node"]["id"], "node_1");
+        assert_eq!(fork_res["result"]["node"]["label"], "Attempt A: regex");
+
+        // 4. Verify backtrack response
+        let back_res = lines.iter().find(|v| v["id"] == 4).unwrap();
+        assert_eq!(back_res["result"]["parent"]["id"], "root");
+        assert_eq!(back_res["result"]["current_id"], "root");
 
         let _ = std::fs::remove_dir_all(tmp);
     }

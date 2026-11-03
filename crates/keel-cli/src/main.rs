@@ -860,6 +860,119 @@ fn cli_symbols(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Resul
     }
 }
 
+fn cli_tree(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result<()> {
+    let sub = if !args.is_empty() && !args[0].starts_with('-') {
+        args.remove(0)
+    } else {
+        "status".to_string()
+    };
+    let json_mode = take_flag(&mut args, "--json");
+    let root = match root_opt {
+        Some(r) => std::fs::canonicalize(r)?,
+        None => std::env::current_dir()?,
+    };
+    let cp = keel_agent::checkpoint::CheckpointManager::new(root.clone());
+    let mut tree = keel_agent::ExplorationTree::load_or_init(&root, &cp)?;
+
+    match sub.as_str() {
+        "status" => {
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&tree)?);
+            } else {
+                println!("Exploration Tree (current: `{}`):", tree.current_id);
+                print!("{}", tree.render_ascii());
+            }
+            Ok(())
+        }
+        "fork" => {
+            let label = args.join(" ");
+            let label = if label.is_empty() {
+                "Branch".to_string()
+            } else {
+                label
+            };
+            let node = tree.fork(&label, &cp)?;
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&node)?);
+            } else {
+                println!(
+                    "Forked new branch `{}` (node `{}`) from `{}`.",
+                    node.label,
+                    node.id,
+                    node.parent_id.as_deref().unwrap_or("none")
+                );
+            }
+            Ok(())
+        }
+        "switch" => {
+            let node_id = args.first().cloned().unwrap_or_default();
+            if node_id.is_empty() {
+                eprintln!("Usage: keel tree switch <node_id> [--json]");
+                std::process::exit(2);
+            }
+            let node = tree.switch_to(&node_id, &cp)?;
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&node)?);
+            } else {
+                println!(
+                    "Switched to node `{}` (\"{}\"). Workspace restored.",
+                    node.id, node.label
+                );
+            }
+            Ok(())
+        }
+        "backtrack" => {
+            let parent = tree.backtrack(&cp)?;
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&parent)?);
+            } else {
+                println!(
+                    "Backtracked to parent node `{}` (\"{}\"). Workspace restored.",
+                    parent.id, parent.label
+                );
+            }
+            Ok(())
+        }
+        "prune" => {
+            let node_id = args.first().cloned().unwrap_or_default();
+            if node_id.is_empty() {
+                eprintln!("Usage: keel tree prune <node_id> [--json]");
+                std::process::exit(2);
+            }
+            let count = tree.prune(&node_id)?;
+            if json_mode {
+                println!("{}", serde_json::json!({ "pruned_count": count }));
+            } else {
+                println!("Pruned {count} nodes under `{node_id}`.");
+            }
+            Ok(())
+        }
+        "accept" => {
+            let node_id = args.first().cloned().unwrap_or_default();
+            if node_id.is_empty() {
+                eprintln!("Usage: keel tree accept <node_id> [--json]");
+                std::process::exit(2);
+            }
+            let node = tree.accept(&node_id)?;
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&node)?);
+            } else {
+                println!(
+                    "Accepted node `{}` (\"{}\") as active state.",
+                    node.id, node.label
+                );
+            }
+            Ok(())
+        }
+        other => {
+            eprintln!(
+                "unknown tree subcommand `{other}`. Usage: keel tree <status|fork|switch|backtrack|prune|accept> ..."
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
 fn cli_vfs(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result<()> {
     let json_mode = take_flag(&mut args, "--json");
     let root = match root_opt {
@@ -980,6 +1093,10 @@ fn main() -> anyhow::Result<()> {
     if args.first().map(String::as_str) == Some("symbols") {
         args.remove(0);
         return cli_symbols(args, root_opt);
+    }
+    if args.first().map(String::as_str) == Some("tree") {
+        args.remove(0);
+        return cli_tree(args, root_opt);
     }
 
     let mut interactive = take_flag(&mut args, "-i") || take_flag(&mut args, "--interactive");
@@ -1257,6 +1374,7 @@ fn main() -> anyhow::Result<()> {
         auto_baseline: sentinel_opt.is_some(),
     });
     let _p_symbols = ctx.mount(&keel_agent::SymbolPlugin { root: root.clone() });
+    let _p_tree = ctx.mount(&keel_agent::TreePlugin { root: root.clone() });
 
     let mut extra_servers = std::collections::HashMap::new();
     for spec in mcp_server_opts {
@@ -1343,6 +1461,15 @@ fn main() -> anyhow::Result<()> {
                     }
                 } else {
                     println!("Checkpoint manager is not active.\n");
+                }
+                continue;
+            }
+            if trimmed == "/tree" {
+                if let Some(tree_arc) =
+                    ctx.service::<Arc<std::sync::Mutex<keel_agent::ExplorationTree>>>()
+                {
+                    let tree = tree_arc.lock().unwrap();
+                    print!("{}", tree.render_ascii());
                 }
                 continue;
             }
