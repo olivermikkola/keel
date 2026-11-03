@@ -914,7 +914,11 @@ impl Agent<'_> {
                 }
 
                 // Check predictive pre-warming cache for read_file
-                if call.name == "read_file" {
+                // Skipped in shadow mode: staged edits live only in the VFS overlay, not on disk.
+                let shadow_active = vfs_svc
+                    .as_ref()
+                    .is_some_and(|v| v.mode() == vfs::VfsMode::ShadowMemory);
+                if call.name == "read_file" && !shadow_active {
                     if let Some(prewarm) = self.ctx.service::<Arc<interceptor::PrewarmEngine>>() {
                         if let Some(p) = call.args.get("path").and_then(|val| val.as_str()) {
                             if let Some(content) = prewarm.get_warmed(std::path::Path::new(p)) {
@@ -935,6 +939,9 @@ impl Agent<'_> {
                         "write_file" | "edit_file" | "patch_file"
                     )
                 {
+                    if let Some(prewarm) = self.ctx.service::<Arc<interceptor::PrewarmEngine>>() {
+                        prewarm.invalidate_all();
+                    }
                     if let Some(rel_path) = call.args.get("path").and_then(|v| v.as_str()) {
                         if let Some(ref v) = vfs_svc {
                             let _ = v.sync_post_image(rel_path);
