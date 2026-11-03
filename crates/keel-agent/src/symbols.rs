@@ -263,25 +263,39 @@ fn is_subsequence(sub: &str, target: &str) -> bool {
     true
 }
 
-/// Recursively find supported source code files, skipping `.git` and `target` dirs.
+const MAX_SYMBOL_WALK_DEPTH: usize = 32;
+const MAX_SYMBOL_WALK_VISITED: usize = 200_000;
+const MAX_SYMBOL_WALK_FILES: usize = 10_000;
+
+/// Recursively find supported source code files, skipping hidden, `target` and
+/// `node_modules` dirs. Symlinks are never followed and the walk is bounded.
 fn walkdir_source_files(root: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    let mut visited = 0usize;
 
-    while let Some(dir) = stack.pop() {
+    'walk: while let Some((dir, depth)) = stack.pop() {
         let read = match fs::read_dir(&dir) {
             Ok(r) => r,
             Err(_) => continue,
         };
         for entry in read.flatten() {
-            let p = entry.path();
+            visited += 1;
+            if visited > MAX_SYMBOL_WALK_VISITED || files.len() >= MAX_SYMBOL_WALK_FILES {
+                break 'walk;
+            }
             let name = entry.file_name().to_string_lossy().to_string();
             if name.starts_with('.') || name == "target" || name == "node_modules" {
                 continue;
             }
-            if p.is_dir() {
-                stack.push(p);
-            } else if p.is_file() && is_supported_source_file(&p) {
+            // `DirEntry::file_type` does not follow symlinks.
+            let Ok(ft) = entry.file_type() else { continue };
+            let p = entry.path();
+            if ft.is_dir() {
+                if depth < MAX_SYMBOL_WALK_DEPTH {
+                    stack.push((p, depth + 1));
+                }
+            } else if ft.is_file() && is_supported_source_file(&p) {
                 files.push(p);
             }
         }
