@@ -61,6 +61,9 @@ pub struct LspConfigFile {
     pub servers: HashMap<String, LspServerConfig>,
 }
 
+const MAX_LSP_FRAME_BYTES: usize = 32 * 1024 * 1024;
+const MAX_LSP_HEADER_BYTES: usize = 8192;
+
 /// Write a single LSP JSON-RPC message framed with `Content-Length: <N>\r\n\r\n`.
 pub fn write_lsp_frame<W: Write>(writer: &mut W, payload: &Value) -> Result<()> {
     let body = serde_json::to_vec(payload)?;
@@ -75,9 +78,16 @@ pub fn read_lsp_frame<R: BufRead>(reader: &mut R) -> Result<Option<Value>> {
     let mut content_length: Option<usize> = None;
     loop {
         let mut line = String::new();
-        let n = reader.read_line(&mut line)?;
+        use std::io::Read;
+        let n = reader
+            .by_ref()
+            .take((MAX_LSP_HEADER_BYTES + 1) as u64)
+            .read_line(&mut line)?;
         if n == 0 {
             return Ok(None);
+        }
+        if line.len() > MAX_LSP_HEADER_BYTES {
+            bail!("LSP header line exceeds maximum allowable size (8KB)");
         }
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -93,6 +103,9 @@ pub fn read_lsp_frame<R: BufRead>(reader: &mut R) -> Result<Option<Value>> {
         }
     }
     let len = content_length.context("missing Content-Length header in LSP frame")?;
+    if len > MAX_LSP_FRAME_BYTES {
+        bail!("LSP frame Content-Length ({len} bytes) exceeds maximum limit (32MB)");
+    }
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf)?;
     let val: Value = serde_json::from_slice(&buf).context("decoding LSP JSON-RPC body")?;
@@ -397,6 +410,19 @@ impl LspClient {
             }
         }
         Vec::new()
+    }
+}
+
+impl Drop for LspClient {
+    fn drop(&mut self) {
+        if let Ok(mut child) = self._child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Ok(mut guard) = self.state.0.lock() {
+            guard.closed = true;
+            self.state.1.notify_all();
+        }
     }
 }
 
@@ -1059,5 +1085,18 @@ while True:
         assert_eq!(py_diags[0].source, "py_compile");
 
         let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn read_lsp_frame_enforces_size_limits() {
+        // Enormous Content-Length must be rejected to prevent OOM
+        let bad_header = "Content-Length: 1000000000\r\n\r\n";
+        let mut cursor = std::io::Cursor::new(bad_header.as_bytes());
+        let res = read_lsp_frame(&mut cursor);
+        assert!(res.is_err());
+        assert!(res
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds maximum limit"));
     }
 }
