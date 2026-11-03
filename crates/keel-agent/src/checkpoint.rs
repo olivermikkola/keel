@@ -303,7 +303,18 @@ pub fn is_forbidden_checkpoint_root(root: &Path) -> bool {
     let s = canon.to_string_lossy();
     matches!(
         s.as_ref(),
-        "/" | "/home" | "/root" | "/tmp" | "/var" | "/var/tmp" | "/etc" | "/usr"
+        "/" | "/home"
+            | "/root"
+            | "/tmp"
+            | "/var"
+            | "/var/tmp"
+            | "/etc"
+            | "/usr"
+            | "/opt"
+            | "/srv"
+            | "/mnt"
+            | "/media"
+            | "/boot"
     )
 }
 

@@ -6,6 +6,7 @@ use crate::{Tool, ToolSpec};
 use anyhow::{bail, Context as _, Result};
 use keel_kernel::{Plugin, Scope};
 use serde_json::{json, Value};
+use std::io::{BufRead, BufReader, Read};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -13,6 +14,23 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const MAX_OUT: usize = 32 * 1024;
+const MAX_PIPE_CAPTURE: usize = 1024 * 1024;
+const MAX_GREP_FILE_SIZE: u64 = 10 * 1024 * 1024;
+
+fn read_pipe_capped<R: Read>(mut pipe: R) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let _ = pipe
+        .by_ref()
+        .take(MAX_PIPE_CAPTURE as u64)
+        .read_to_end(&mut buf);
+    let mut discard = [0u8; 8192];
+    while let Ok(n) = pipe.read(&mut discard) {
+        if n == 0 {
+            break;
+        }
+    }
+    buf
+}
 
 /// Resolve `rel` under `root`, rejecting absolute paths, `..` escapes, and symlinks
 /// that resolve outside the canonicalized workspace root.
@@ -100,12 +118,34 @@ impl Tool for ReadFile {
     }
     fn run(&self, a: &Value) -> Result<String> {
         let p = confine(&self.0, arg(a, "path")?)?;
-        if p.is_dir() {
+        let meta = std::fs::symlink_metadata(&p)
+            .with_context(|| format!("checking metadata for {}", p.display()))?;
+        if meta.is_dir() {
             bail!("{} is a directory; use list_dir", p.display());
         }
-        Ok(truncate(
-            std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?,
-        ))
+        if !meta.file_type().is_file() {
+            bail!("{} is not a regular file", p.display());
+        }
+        let mut file =
+            std::fs::File::open(&p).with_context(|| format!("opening {}", p.display()))?;
+        let mut buf = Vec::new();
+        file.by_ref()
+            .take((MAX_OUT * 2) as u64)
+            .read_to_end(&mut buf)
+            .with_context(|| format!("reading {}", p.display()))?;
+        let text = match String::from_utf8(buf) {
+            Ok(s) => s,
+            Err(e) => {
+                let valid = e.into_bytes();
+                let lossy = String::from_utf8_lossy(&valid);
+                format!(
+                    "[binary or non-UTF-8 content; size: {} bytes]\n{}",
+                    meta.len(),
+                    lossy
+                )
+            }
+        };
+        Ok(truncate(text))
     }
 }
 
@@ -271,11 +311,23 @@ fn walk(p: &Path, root: &Path, pat: &str, hits: &mut Vec<String>) {
             }
             walk(&e.path(), root, pat, hits);
         }
-    } else if let Ok(text) = std::fs::read_to_string(p) {
+    } else if let Ok(meta) = p.metadata() {
+        if !meta.file_type().is_file() || meta.len() > MAX_GREP_FILE_SIZE {
+            return;
+        }
+        let Ok(file) = std::fs::File::open(p) else {
+            return;
+        };
+        let reader = BufReader::new(file);
         let rel = p.strip_prefix(root).unwrap_or(p).display().to_string();
-        for (i, line) in text.lines().enumerate() {
-            if line.contains(pat) && hits.len() < MAX_HITS {
-                hits.push(format!("{rel}:{}:{}", i + 1, line.trim()));
+        for (i, line_res) in reader.lines().enumerate() {
+            if hits.len() >= MAX_HITS {
+                break;
+            }
+            if let Ok(line) = line_res {
+                if line.contains(pat) {
+                    hits.push(format!("{rel}:{}:{}", i + 1, line.trim()));
+                }
             }
         }
     }
@@ -389,19 +441,19 @@ impl Tool for Shell {
         let mut stderr_pipe = child.stderr.take();
 
         let stdout_thread = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut pipe) = stdout_pipe.take() {
-                let _ = std::io::Read::read_to_end(&mut pipe, &mut buf);
+            if let Some(pipe) = stdout_pipe.take() {
+                read_pipe_capped(pipe)
+            } else {
+                Vec::new()
             }
-            buf
         });
 
         let stderr_thread = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut pipe) = stderr_pipe.take() {
-                let _ = std::io::Read::read_to_end(&mut pipe, &mut buf);
+            if let Some(pipe) = stderr_pipe.take() {
+                read_pipe_capped(pipe)
+            } else {
+                Vec::new()
             }
-            buf
         });
 
         let start = std::time::Instant::now();
@@ -479,6 +531,30 @@ impl Plugin for BuiltinToolsPlugin {
             sandbox: sandbox_policy,
             timeout: Duration::from_secs(120),
         }));
+        scope.provide(reg);
+    }
+}
+
+/// Mounts only read-only exploration tools (`read_file`, `list_dir`, `grep`).
+/// Mutating tools (`write_file`, `edit_file`, `patch_file`, `shell`) are omitted.
+pub struct ReadOnlyToolsPlugin {
+    pub root: PathBuf,
+}
+
+impl Plugin for ReadOnlyToolsPlugin {
+    fn name(&self) -> &str {
+        "read-only-tools"
+    }
+    fn apply(&self, scope: &mut Scope) {
+        let reg = scope
+            .context()
+            .service::<ToolRegistry>()
+            .map(|r| (*r).clone())
+            .unwrap_or_default();
+        let r = &self.root;
+        reg.register(Arc::new(ReadFile(r.clone())));
+        reg.register(Arc::new(ListDir(r.clone())));
+        reg.register(Arc::new(Grep(r.clone())));
         scope.provide(reg);
     }
 }
@@ -674,6 +750,46 @@ mod tests {
         assert!(err.is_err());
         let msg = format!("{:#}", err.unwrap_err());
         assert!(msg.contains("timed out"));
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn read_file_handles_binary_and_enforces_regular_files() {
+        let ws = std::env::temp_dir().join(format!("keel-readfile-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+
+        // 1. Directory read must fail cleanly
+        let sub = ws.join("subdir");
+        std::fs::create_dir(&sub).unwrap();
+        let rf = ReadFile(ws.clone());
+        let dir_err = rf.run(&json!({"path": "subdir"}));
+        assert!(dir_err.is_err());
+        assert!(dir_err.unwrap_err().to_string().contains("is a directory"));
+
+        // 2. Binary file with invalid UTF-8 bytes must return lossy indicator rather than error
+        let bin_path = ws.join("data.bin");
+        std::fs::write(
+            &bin_path,
+            [0x00, 0x9f, 0xff, 0xfe, b'h', b'e', b'l', b'l', b'o'],
+        )
+        .unwrap();
+        let bin_out = rf.run(&json!({"path": "data.bin"})).unwrap();
+        assert!(bin_out.contains("binary or non-UTF-8 content"));
+        assert!(bin_out.contains("hello"));
+
+        // 3. ReadOnlyToolsPlugin only registers non-mutating tools
+        let ctx = keel_kernel::Context::new();
+        ctx.mount(&ReadOnlyToolsPlugin { root: ws.clone() });
+        let reg = ctx.service::<ToolRegistry>().unwrap();
+        let names = reg.names();
+        assert!(names.contains(&"read_file".to_string()));
+        assert!(names.contains(&"list_dir".to_string()));
+        assert!(names.contains(&"grep".to_string()));
+        assert!(!names.contains(&"write_file".to_string()));
+        assert!(!names.contains(&"edit_file".to_string()));
+        assert!(!names.contains(&"shell".to_string()));
 
         let _ = std::fs::remove_dir_all(&ws);
     }

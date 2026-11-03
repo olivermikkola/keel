@@ -7,7 +7,7 @@
 use crate::repomap::RepoMapPlugin;
 use crate::sandbox::{LandlockPlugin, ToolRegistry};
 use crate::symbols::SymbolPlugin;
-use crate::tools::BuiltinToolsPlugin;
+use crate::tools::ReadOnlyToolsPlugin;
 use crate::{
     Agent, ApproverPlugin, Llm, LlmPlugin, Message, ReadOnly, SessionLog, SessionLogPlugin, Tool,
     ToolSpec,
@@ -95,9 +95,8 @@ pub fn run_subagent(
         enabled: landlock_enabled,
         ..Default::default()
     });
-    let _p_tools = child_ctx.mount(&BuiltinToolsPlugin {
+    let _p_tools = child_ctx.mount(&ReadOnlyToolsPlugin {
         root: root.to_path_buf(),
-        landlock_enabled,
     });
     let _p_symbols = child_ctx.mount(&SymbolPlugin {
         root: root.to_path_buf(),
@@ -142,14 +141,24 @@ pub fn run_subagent(
                 success: true,
             })
         }
-        Err(e) => Ok(SubagentReport {
-            prompt: prompt.to_string(),
-            role,
-            answer: format!("failed: {e:#}"),
-            steps_taken,
-            tools_called,
-            success: false,
-        }),
+        Err(e) => {
+            let partial = child_history.iter().rev().find_map(|m| match m {
+                Message::Assistant { text, .. } if !text.trim().is_empty() => Some(text.clone()),
+                _ => None,
+            });
+            let answer = match partial {
+                Some(p) => format!("{p}\n\n[Note: subagent terminated: {e:#}]"),
+                None => format!("failed: {e:#}"),
+            };
+            Ok(SubagentReport {
+                prompt: prompt.to_string(),
+                role,
+                answer,
+                steps_taken,
+                tools_called,
+                success: false,
+            })
+        }
     }
 }
 
