@@ -66,10 +66,109 @@ pub fn messages_to_wire(messages: &[Message]) -> Vec<Value> {
         .collect()
 }
 
+/// Strips `<think>...</think>` or `<thought>...</thought>` tags and enclosed reasoning from text.
+pub fn strip_think_tags(mut s: &str) -> String {
+    let mut out = String::new();
+    while let Some(start) = s.find("<think>").or_else(|| s.find("<thought>")) {
+        out.push_str(&s[..start]);
+        let tag_len = if s[start..].starts_with("<think>") {
+            "<think>".len()
+        } else {
+            "<thought>".len()
+        };
+        let after_open = &s[start + tag_len..];
+        if let Some(end) = after_open
+            .find("</think>")
+            .or_else(|| after_open.find("</thought>"))
+        {
+            let close_len = if after_open[end..].starts_with("</think>") {
+                "</think>".len()
+            } else {
+                "</thought>".len()
+            };
+            s = &after_open[end + close_len..];
+        } else {
+            // Unclosed think tag: discard trailing reasoning
+            s = "";
+            break;
+        }
+    }
+    out.push_str(s);
+    out.trim().to_string()
+}
+
+fn find_open_think_tag(s: &str) -> Option<(usize, usize)> {
+    let think = s.find("<think>").map(|i| (i, "<think>".len()));
+    let thought = s.find("<thought>").map(|i| (i, "<thought>".len()));
+    match (think, thought) {
+        (Some(a), Some(b)) => {
+            if a.0 <= b.0 {
+                Some(a)
+            } else {
+                Some(b)
+            }
+        }
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+fn find_close_think_tag(s: &str) -> Option<(usize, usize)> {
+    let think = s.find("</think>").map(|i| (i, "</think>".len()));
+    let thought = s.find("</thought>").map(|i| (i, "</thought>".len()));
+    match (think, thought) {
+        (Some(a), Some(b)) => {
+            if a.0 <= b.0 {
+                Some(a)
+            } else {
+                Some(b)
+            }
+        }
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+fn partial_open_think_tag_len(s: &str) -> usize {
+    for prefix in [
+        "<thought", "<though", "<thoug", "<thou", "<tho", "<th", "<t", "<", "<think", "<thin",
+        "<thi",
+    ] {
+        if s.ends_with(prefix) {
+            return prefix.len();
+        }
+    }
+    0
+}
+
+fn partial_close_think_tag_len(s: &str) -> usize {
+    for prefix in [
+        "</thought",
+        "</thoug",
+        "</thou",
+        "</tho",
+        "</th",
+        "</t",
+        "</",
+        "<",
+        "</think",
+        "</thin",
+        "</thi",
+    ] {
+        if s.ends_with(prefix) {
+            return prefix.len();
+        }
+    }
+    0
+}
+
 pub fn parse_reply(body: &Value) -> Result<Message> {
     let msg = &body["choices"][0]["message"];
     anyhow::ensure!(msg.is_object(), "malformed response: {body}");
-    let text = msg["content"].as_str().unwrap_or("").to_string();
+    let raw_text = msg["content"].as_str().unwrap_or("");
+    let text = strip_think_tags(raw_text);
     let mut tool_calls = Vec::new();
     for c in msg["tool_calls"].as_array().into_iter().flatten() {
         let raw = c["function"]["arguments"].as_str().unwrap_or("{}");
@@ -93,6 +192,8 @@ pub struct StreamAcc {
     parsers: Vec<crate::interceptor::IncrementalArgParser>,
     sentinel: Option<std::sync::Arc<crate::interceptor::StreamingSentinel>>,
     prewarm: Option<std::sync::Arc<crate::interceptor::PrewarmEngine>>,
+    in_think: bool,
+    pending_tag: String,
 }
 
 impl StreamAcc {
@@ -116,6 +217,60 @@ impl StreamAcc {
         self
     }
 
+    fn process_content_delta(&mut self, chunk: &str, out: &mut Vec<Chunk>) {
+        let mut text_buf = std::mem::take(&mut self.pending_tag);
+        text_buf.push_str(chunk);
+
+        while !text_buf.is_empty() {
+            if self.in_think {
+                if let Some((idx, len)) = find_close_think_tag(&text_buf) {
+                    let reasoning_piece = &text_buf[..idx];
+                    if !reasoning_piece.is_empty() {
+                        out.push(Chunk::Reasoning(reasoning_piece.into()));
+                    }
+                    self.in_think = false;
+                    text_buf = text_buf[idx + len..].to_string();
+                } else {
+                    let suffix_len = partial_close_think_tag_len(&text_buf);
+                    if suffix_len > 0 {
+                        let safe_len = text_buf.len() - suffix_len;
+                        if safe_len > 0 {
+                            let piece = &text_buf[..safe_len];
+                            out.push(Chunk::Reasoning(piece.into()));
+                        }
+                        self.pending_tag = text_buf[safe_len..].to_string();
+                        break;
+                    } else {
+                        out.push(Chunk::Reasoning(std::mem::take(&mut text_buf)));
+                    }
+                }
+            } else if let Some((idx, len)) = find_open_think_tag(&text_buf) {
+                let content_piece = &text_buf[..idx];
+                if !content_piece.is_empty() {
+                    self.text.push_str(content_piece);
+                    out.push(Chunk::Text(content_piece.into()));
+                }
+                self.in_think = true;
+                text_buf = text_buf[idx + len..].to_string();
+            } else {
+                let suffix_len = partial_open_think_tag_len(&text_buf);
+                if suffix_len > 0 {
+                    let safe_len = text_buf.len() - suffix_len;
+                    if safe_len > 0 {
+                        let piece = &text_buf[..safe_len];
+                        self.text.push_str(piece);
+                        out.push(Chunk::Text(piece.into()));
+                    }
+                    self.pending_tag = text_buf[safe_len..].to_string();
+                    break;
+                } else {
+                    self.text.push_str(&text_buf);
+                    out.push(Chunk::Text(std::mem::take(&mut text_buf)));
+                }
+            }
+        }
+    }
+
     /// Feed one SSE line; returns chunks to show live.
     pub fn feed(&mut self, line: &str) -> Result<Vec<Chunk>> {
         let Some(data) = line.strip_prefix("data:") else {
@@ -134,8 +289,7 @@ impl StreamAcc {
             }
         }
         if let Some(t) = delta["content"].as_str().filter(|t| !t.is_empty()) {
-            self.text.push_str(t);
-            out.push(Chunk::Text(t.into()));
+            self.process_content_delta(t, &mut out);
         }
         for c in delta["tool_calls"].as_array().into_iter().flatten() {
             let i = c["index"].as_u64().unwrap_or(0) as usize;
@@ -196,7 +350,13 @@ impl StreamAcc {
         Ok(out)
     }
 
-    pub fn finish(self) -> Message {
+    pub fn finish(mut self) -> Message {
+        if !self.pending_tag.is_empty() {
+            if !self.in_think {
+                self.text.push_str(&self.pending_tag);
+            }
+            self.pending_tag.clear();
+        }
         let tool_calls = self
             .calls
             .into_iter()
@@ -209,7 +369,7 @@ impl StreamAcc {
             })
             .collect();
         Message::Assistant {
-            text: self.text,
+            text: self.text.trim().to_string(),
             tool_calls,
         }
     }
@@ -269,9 +429,16 @@ impl Llm for OpenAiCompat {
         if let Some(ref p) = self.prewarm {
             acc = acc.with_prewarm(p.clone());
         }
+        let mut early_abort = false;
         for line in BufReader::new(resp.into_reader()).lines() {
             for c in acc.feed(&line?)? {
+                if matches!(&c, Chunk::SentinelVeto { .. }) {
+                    early_abort = true;
+                }
                 sink(c);
+            }
+            if early_abort {
+                break;
             }
         }
         Ok(acc.finish())
@@ -347,5 +514,49 @@ mod tests {
             _ => false,
         });
         assert!(vetoed, "Sentinel must emit early veto during streaming");
+    }
+
+    #[test]
+    fn stream_acc_extracts_inline_think_tags_without_polluting_text() {
+        let lines = [
+            r#"data: {"choices":[{"delta":{"content":"<th"}}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"ink>\nPlanning with Kat-Coder 36B"}}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"\n</think>\n"}}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"I will "}}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"proceed."}}]}"#,
+            "data: [DONE]",
+        ];
+        let mut acc = StreamAcc::default();
+        let mut chunks = vec![];
+        for l in lines {
+            chunks.extend(acc.feed(l).unwrap());
+        }
+
+        // Verify reasoning chunk was emitted
+        assert!(chunks
+            .iter()
+            .any(|c| matches!(c, Chunk::Reasoning(r) if r.contains("Planning with Kat-Coder"))));
+
+        // Verify final text contains only the clean assistant text
+        let Message::Assistant { text, .. } = acc.finish() else {
+            panic!()
+        };
+        assert_eq!(text, "I will proceed.");
+    }
+
+    #[test]
+    fn strip_think_tags_cleans_thought_and_think_blocks() {
+        assert_eq!(
+            strip_think_tags("<think>internal monologue</think>Clean text"),
+            "Clean text"
+        );
+        assert_eq!(
+            strip_think_tags("<thought>pondering step 1\nstep 2</thought>Solution is ready."),
+            "Solution is ready."
+        );
+        assert_eq!(
+            strip_think_tags("No think tags here."),
+            "No think tags here."
+        );
     }
 }
