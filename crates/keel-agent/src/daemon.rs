@@ -58,6 +58,8 @@ pub struct DaemonConfig {
     pub sandbox_allow_read: Vec<PathBuf>,
     pub sandbox_allow_write: Vec<PathBuf>,
     pub discover_toolchains: bool,
+    pub max_context_tokens: Option<usize>,
+    pub keep_recent_turns: Option<usize>,
 }
 
 impl Default for DaemonConfig {
@@ -71,6 +73,8 @@ impl Default for DaemonConfig {
             sandbox_allow_read: Vec::new(),
             sandbox_allow_write: Vec::new(),
             discover_toolchains: true,
+            max_context_tokens: None,
+            keep_recent_turns: None,
         }
     }
 }
@@ -568,6 +572,23 @@ fn create_session(
         ctx.mount(&RepeatToolReminderPlugin::default()),
         ctx.mount(&crate::guard::EnvironmentCircuitBreakerPlugin::default()),
         ctx.mount(&ToolResultPrunerPlugin::default()),
+        ctx.mount(&crate::compaction::AdaptiveCompactorPlugin::new(
+            crate::compaction::AdaptiveCompactor::with_default_summarizer(
+                crate::compaction::ContextBudget {
+                    max_context_tokens: cfg.max_context_tokens.unwrap_or(16_384),
+                    compaction_threshold_tokens: cfg
+                        .max_context_tokens
+                        .map(|m| ((m as f32) * 0.75) as usize)
+                        .unwrap_or(12_288),
+                    target_tokens: cfg
+                        .max_context_tokens
+                        .map(|m| ((m as f32) * 0.50) as usize)
+                        .unwrap_or(8_192),
+                    keep_recent_turns: cfg.keep_recent_turns.unwrap_or(3),
+                    chars_per_token: 3.8,
+                },
+            ),
+        )),
         ctx.mount(&WorkspaceContextPlugin {
             root: cfg.root.clone(),
         }),
@@ -793,6 +814,8 @@ pub fn handle_acp_client<R: BufRead>(
                             "timeTravelReplay": true,
                             "sandboxPolicy": true,
                             "environmentCircuitBreaker": true,
+                            "adaptiveCompaction": true,
+                            "contextBudget": true,
                         }
                     }),
                 );
@@ -2354,6 +2377,92 @@ pub fn handle_acp_client<R: BufRead>(
                     );
                 }
             }
+            "compaction/status" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                let compactor = session
+                    .ctx
+                    .service::<crate::compaction::AdaptiveCompactor>();
+                let history = session.history.lock().unwrap();
+                let (current_tokens, should_compact) = if let Some(ref c) = compactor {
+                    let tok = c.estimate_history_tokens(&history);
+                    let sc = c.should_compact(&history);
+                    (tok, sc)
+                } else {
+                    (0, false)
+                };
+                let budget = compactor
+                    .as_ref()
+                    .map(|c| c.budget.clone())
+                    .unwrap_or_default();
+                rpc_writer.send_response(
+                    id,
+                    json!({
+                        "session_id": sid,
+                        "messagesCount": history.len(),
+                        "currentEstimatedTokens": current_tokens,
+                        "shouldCompact": should_compact,
+                        "budget": {
+                            "maxContextTokens": budget.max_context_tokens,
+                            "compactionThresholdTokens": budget.compaction_threshold_tokens,
+                            "targetTokens": budget.target_tokens,
+                            "keepRecentTurns": budget.keep_recent_turns,
+                            "charsPerToken": budget.chars_per_token,
+                        }
+                    }),
+                );
+            }
+            "compaction/compact" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                if let Some(compactor) = session
+                    .ctx
+                    .service::<crate::compaction::AdaptiveCompactor>()
+                {
+                    let mut history = session.history.lock().unwrap();
+                    let before_tokens = compactor.estimate_history_tokens(&history);
+                    if let Some(report) = compactor.compact_history(&mut history) {
+                        rpc_writer.send_response(
+                            id,
+                            json!({
+                                "session_id": sid,
+                                "compacted": true,
+                                "report": report,
+                            }),
+                        );
+                    } else {
+                        rpc_writer.send_response(
+                            id,
+                            json!({
+                                "session_id": sid,
+                                "compacted": false,
+                                "reason": "history under compaction threshold or no intermediate turns",
+                                "currentEstimatedTokens": before_tokens,
+                            }),
+                        );
+                    }
+                } else {
+                    rpc_writer.send_error(id, -32000, "AdaptiveCompactor not mounted");
+                }
+            }
             "shutdown" | "exit" => {
                 if !id.is_null() {
                     rpc_writer.send_response(id, json!({ "status": "shutting_down" }));
@@ -3399,6 +3508,69 @@ impl WorkerService {
         let allow_res = lines.iter().find(|v| v["id"] == 3).unwrap();
         assert_eq!(allow_res["result"]["status"], "allowed");
         assert_eq!(allow_res["result"]["path"], "/opt/custom_tool");
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn acp_daemon_compaction_status_and_compact() {
+        let tmp =
+            std::env::temp_dir().join(format!("keel-compaction-rpc-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let script = [
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "compaction/status", "params": {}})
+                .to_string(),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "compaction/compact", "params": {}})
+                .to_string(),
+            json!({"jsonrpc": "2.0", "id": 4, "method": "shutdown", "params": {}}).to_string(),
+        ]
+        .join("\n")
+            + "\n";
+
+        let cfg = DaemonConfig {
+            root: tmp.clone(),
+            policy: ApprovalPolicy::Yolo,
+            landlock_enabled: false,
+            vfs_mode: VfsMode::MaterializedCow,
+            verify_command: None,
+            max_context_tokens: Some(8192),
+            keep_recent_turns: Some(2),
+            ..Default::default()
+        };
+
+        let out_buf = Arc::new(Mutex::new(Vec::new()));
+
+        serve_acp(
+            BufReader::new(std::io::Cursor::new(script.into_bytes())),
+            Box::new(SharedVecWriter(out_buf.clone())),
+            cfg,
+            Arc::new(DaemonTestLlm),
+        )
+        .unwrap();
+
+        let raw_output = String::from_utf8(out_buf.lock().unwrap().clone()).unwrap();
+        let lines: Vec<Value> = raw_output
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .collect();
+
+        // 1. Verify capabilities
+        assert!(lines.iter().any(|v| v["id"] == 1
+            && v["result"]["capabilities"]["adaptiveCompaction"] == true
+            && v["result"]["capabilities"]["contextBudget"] == true));
+
+        // 2. Verify compaction/status
+        let status_res = lines.iter().find(|v| v["id"] == 2).unwrap();
+        assert_eq!(status_res["result"]["budget"]["maxContextTokens"], 8192);
+        assert_eq!(status_res["result"]["budget"]["keepRecentTurns"], 2);
+        assert_eq!(status_res["result"]["shouldCompact"], false);
+
+        // 3. Verify compaction/compact on clean short history
+        let compact_res = lines.iter().find(|v| v["id"] == 3).unwrap();
+        assert_eq!(compact_res["result"]["compacted"], false);
 
         let _ = std::fs::remove_dir_all(tmp);
     }

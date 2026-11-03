@@ -7,7 +7,7 @@
 //! and gets scored on verification pass/fail, step count, and wall-clock latency.
 //! The winning candidate's changes can be atomically promoted back to the main workspace.
 
-use crate::compaction::{ToolResultPrunerPlugin, WorkspaceContextPlugin};
+use crate::compaction::{AdaptiveCompactorPlugin, ToolResultPrunerPlugin, WorkspaceContextPlugin};
 use crate::guard::RepeatToolReminderPlugin;
 use crate::lsp::LspPlugin;
 use crate::plan::{PlanPlugin, VerificationGate};
@@ -339,6 +339,7 @@ fn run_single_candidate(
     });
     let _p_guard = ctx.mount(&RepeatToolReminderPlugin::default());
     let _p_pruner = ctx.mount(&ToolResultPrunerPlugin::default());
+    let _p_compactor = ctx.mount(&AdaptiveCompactorPlugin::default());
     let _p_ws = ctx.mount(&WorkspaceContextPlugin {
         root: sb_dir.clone(),
     });

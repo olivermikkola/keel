@@ -74,6 +74,7 @@ impl Tool for SubagentTool {
         });
         let _p_guard = child_ctx.mount(&crate::guard::RepeatToolReminderPlugin::default());
         let _p_pruner = child_ctx.mount(&crate::compaction::ToolResultPrunerPlugin::default());
+        let _p_compactor = child_ctx.mount(&crate::compaction::AdaptiveCompactorPlugin::default());
 
         let mut child_history = vec![Message::System {
             text: format!(

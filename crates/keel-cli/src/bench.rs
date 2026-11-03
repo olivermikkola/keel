@@ -198,6 +198,8 @@ pub fn run(shared_llm: Arc<dyn Llm>, filter: Option<&str>, runs: usize) -> anyho
             });
             let _p_guard = ctx.mount(&RepeatToolReminderPlugin::default());
             let _p_pruner = ctx.mount(&ToolResultPrunerPlugin::default());
+            let _p_compactor =
+                ctx.mount(&keel_agent::compaction::AdaptiveCompactorPlugin::default());
 
             let mut history = vec![Message::System {
                 text: format!(
