@@ -139,7 +139,9 @@ impl TransactionalVfs {
             std::fs::create_dir_all(parent)?;
         }
         let data = serde_json::to_string_pretty(j)?;
-        std::fs::write(p, data)?;
+        let tmp = p.with_extension(format!("tmp.{}", std::process::id()));
+        std::fs::write(&tmp, data)?;
+        std::fs::rename(&tmp, p)?;
         Ok(())
     }
 
@@ -168,6 +170,11 @@ impl TransactionalVfs {
     /// Write a UTF-8 file through the transactional VFS, capturing its pre-image on first touch.
     pub fn write_string(&self, path: &Path, content: &str) -> Result<()> {
         let (full, rel) = self.normalize_rel(path)?;
+        if let Ok(meta) = std::fs::symlink_metadata(&full) {
+            if !meta.file_type().is_file() {
+                anyhow::bail!("{} is not a regular file", full.display());
+            }
+        }
         let mut guard = self
             .journal
             .lock()

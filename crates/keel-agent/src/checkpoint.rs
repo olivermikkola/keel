@@ -32,6 +32,24 @@ pub struct RestoreReport {
     pub removed_files: usize,
 }
 
+/// RAII guard ensuring temporary git index and lock files are strictly cleaned up
+/// on all exit paths (normal return, early error, or panic).
+struct TempIndexGuard {
+    path: PathBuf,
+}
+
+impl TempIndexGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for TempIndexGuard {
+    fn drop(&mut self) {
+        cleanup_temp_index(&self.path);
+    }
+}
+
 pub struct CheckpointManager {
     root: PathBuf,
 }
@@ -89,7 +107,24 @@ impl CheckpointManager {
             self.run_git(&["init"], &[])
                 .context("initializing git repo for checkpoints")?;
         }
+        self.cleanup_stale_temp_indices();
         Ok(())
+    }
+
+    /// Sweep orphaned temporary index files from previous aborted or killed operations.
+    pub fn cleanup_stale_temp_indices(&self) {
+        let dot_git = self.root.join(".git");
+        if let Ok(entries) = std::fs::read_dir(&dot_git) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("keel_idx_")
+                    || name.starts_with("keel_restore_idx_")
+                    || name.starts_with("keel_diff_idx_")
+                {
+                    cleanup_temp_index(&entry.path());
+                }
+            }
+        }
     }
 
     pub fn list(&self) -> Result<Vec<CheckpointInfo>> {
@@ -109,7 +144,11 @@ impl CheckpointManager {
             let _ = std::fs::create_dir_all(parent);
         }
         let json = serde_json::to_string_pretty(list)?;
-        std::fs::write(&p, json).with_context(|| format!("writing {}", p.display()))?;
+        let tmp = p.with_extension(format!("tmp.{}", std::process::id()));
+        std::fs::write(&tmp, json)
+            .with_context(|| format!("writing temp metadata to {}", tmp.display()))?;
+        std::fs::rename(&tmp, &p)
+            .with_context(|| format!("atomically updating {}", p.display()))?;
         Ok(())
     }
 
@@ -126,19 +165,16 @@ impl CheckpointManager {
 
         let dot_git = self.root.join(".git");
         let tmp_idx = dot_git.join(format!("keel_idx_{id}"));
-        let tmp_idx_str = tmp_idx.to_string_lossy();
+        let tmp_guard = TempIndexGuard::new(tmp_idx);
+        let tmp_idx_str = tmp_guard.path.to_string_lossy();
 
         // 1. Stage all working tree files into the temporary index
-        let add_res = self.run_git(&["add", "-A"], &[("GIT_INDEX_FILE", &tmp_idx_str)]);
-        if let Err(e) = add_res {
-            cleanup_temp_index(&tmp_idx);
-            return Err(e);
-        }
+        self.run_git(&["add", "-A"], &[("GIT_INDEX_FILE", &tmp_idx_str)])?;
 
         // 2. Write tree object from temporary index
-        let tree_res = self.run_git(&["write-tree"], &[("GIT_INDEX_FILE", &tmp_idx_str)]);
-        cleanup_temp_index(&tmp_idx);
-        let tree_hash = tree_res?.trim().to_string();
+        let tree_res = self.run_git(&["write-tree"], &[("GIT_INDEX_FILE", &tmp_idx_str)])?;
+        drop(tmp_guard);
+        let tree_hash = tree_res.trim().to_string();
 
         // 3. Commit the tree
         let commit_msg = format!("keel checkpoint: {description}");
@@ -185,27 +221,20 @@ impl CheckpointManager {
 
         let dot_git = self.root.join(".git");
         let tmp_idx = dot_git.join(format!("keel_restore_idx_{}", std::process::id()));
-        let tmp_idx_str = tmp_idx.to_string_lossy();
+        let tmp_guard = TempIndexGuard::new(tmp_idx);
+        let tmp_idx_str = tmp_guard.path.to_string_lossy();
 
         // 1. Read checkpoint tree into temporary index
-        let read_res = self.run_git(
+        self.run_git(
             &["read-tree", &target.tree_hash],
             &[("GIT_INDEX_FILE", &tmp_idx_str)],
-        );
-        if let Err(e) = read_res {
-            cleanup_temp_index(&tmp_idx);
-            return Err(e);
-        }
+        )?;
 
         // 2. Checkout all files from temporary index into working tree
-        let checkout_res = self.run_git(
+        self.run_git(
             &["checkout-index", "-a", "-f"],
             &[("GIT_INDEX_FILE", &tmp_idx_str)],
-        );
-        if let Err(e) = checkout_res {
-            cleanup_temp_index(&tmp_idx);
-            return Err(e);
-        }
+        )?;
 
         // 3. Collect all files that belong to the checkpoint
         let ls_out = self.run_git(&["ls-tree", "-r", "--name-only", &target.tree_hash], &[])?;
@@ -214,12 +243,11 @@ impl CheckpointManager {
         // 4. Remove any non-ignored files in the workspace that were created after the checkpoint.
         // Using `git ls-files --cached --others --exclude-standard` respects `.gitignore` rules so
         // ignored files (e.g., `.env`, `node_modules`, `.venv`, build caches) are never deleted.
-        let candidates_res = self.run_git(
+        let candidates = self.run_git(
             &["ls-files", "--cached", "--others", "--exclude-standard"],
             &[("GIT_INDEX_FILE", &tmp_idx_str)],
-        );
-        cleanup_temp_index(&tmp_idx);
-        let candidates = candidates_res?;
+        )?;
+        drop(tmp_guard);
 
         let mut removed_count = 0;
         for line in candidates.lines() {
@@ -266,16 +294,13 @@ impl CheckpointManager {
 
         let dot_git = self.root.join(".git");
         let tmp_idx = dot_git.join(format!("keel_diff_idx_{}", std::process::id()));
-        let tmp_idx_str = tmp_idx.to_string_lossy();
+        let tmp_guard = TempIndexGuard::new(tmp_idx);
+        let tmp_idx_str = tmp_guard.path.to_string_lossy();
 
-        let add_res = self.run_git(&["add", "-A"], &[("GIT_INDEX_FILE", &tmp_idx_str)]);
-        if let Err(e) = add_res {
-            cleanup_temp_index(&tmp_idx);
-            return Err(e);
-        }
-        let tree_res = self.run_git(&["write-tree"], &[("GIT_INDEX_FILE", &tmp_idx_str)]);
-        cleanup_temp_index(&tmp_idx);
-        let curr_tree = tree_res?.trim().to_string();
+        self.run_git(&["add", "-A"], &[("GIT_INDEX_FILE", &tmp_idx_str)])?;
+        let tree_res = self.run_git(&["write-tree"], &[("GIT_INDEX_FILE", &tmp_idx_str)])?;
+        drop(tmp_guard);
+        let curr_tree = tree_res.trim().to_string();
 
         self.run_git(&["diff", &target.tree_hash, &curr_tree], &[])
     }
@@ -387,6 +412,44 @@ mod tests {
         assert!(
             !tmp.join("file2.txt").exists(),
             "extraneous file was not removed"
+        );
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn temp_index_guard_and_stale_cleanup() {
+        let tmp = std::env::temp_dir().join(format!("keel-ckpt-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let mgr = CheckpointManager::new(tmp.clone());
+        mgr.ensure_git_repo().unwrap();
+
+        // Create artificial stale index and lock files
+        let dot_git = tmp.join(".git");
+        let fake_idx = dot_git.join("keel_idx_fake_123");
+        let fake_lock = dot_git.join("keel_restore_idx_456.lock");
+        std::fs::write(&fake_idx, "stale").unwrap();
+        std::fs::write(&fake_lock, "stale").unwrap();
+        assert!(fake_idx.exists());
+        assert!(fake_lock.exists());
+
+        // Cleanup should remove both
+        mgr.cleanup_stale_temp_indices();
+        assert!(!fake_idx.exists());
+        assert!(!fake_lock.exists());
+
+        // Test TempIndexGuard cleans up on drop
+        let guard_file = dot_git.join("keel_idx_guard_test");
+        {
+            let _g = TempIndexGuard::new(guard_file.clone());
+            std::fs::write(&guard_file, "in use").unwrap();
+            assert!(guard_file.exists());
+        }
+        assert!(
+            !guard_file.exists(),
+            "TempIndexGuard failed to remove file on drop"
         );
 
         let _ = std::fs::remove_dir_all(tmp);

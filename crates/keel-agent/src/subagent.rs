@@ -43,15 +43,15 @@ impl SubagentRole {
     pub fn system_prompt(&self, root: &Path) -> String {
         match self {
             Self::Researcher => format!(
-                "You are an expert research subagent working in {}. Use read-only tools (read_file, grep, list_dir, symbol_search, repomap_get) to investigate and provide a direct, concise, factual answer to the prompt. Do not ask for user input.",
+                "You are an expert research subagent working in {}. Use read-only tools (read_file, grep, list_dir, search_symbols, outline_file, get_symbol, repomap) to investigate and provide a direct, concise, factual answer to the prompt. Once you have gathered sufficient evidence, output your final answer directly and do not invoke additional tools. Do not ask for user input.",
                 root.display()
             ),
             Self::Navigator => format!(
-                "You are an expert codebase navigation subagent working in {}. Use repomap_get and symbol_outline to explore project architecture, references, and symbol definitions, then provide an architectural summary answering the prompt. Do not ask for user input.",
+                "You are an expert codebase navigation subagent working in {}. Use repomap, outline_file, search_symbols, and get_symbol to explore project architecture, references, and symbol definitions, then provide an architectural summary answering the prompt. Once you have gathered sufficient evidence, output your final answer directly and do not invoke additional tools. Do not ask for user input.",
                 root.display()
             ),
             Self::Auditor => format!(
-                "You are a thorough security and reliability code auditor working in {}. Use read-only tools, grep, and symbol searches to identify vulnerabilities, boundary condition oversights, and logic bugs related to the prompt. Report exact file paths and lines.",
+                "You are a thorough security and reliability code auditor working in {}. Use read-only tools (read_file, grep, list_dir, search_symbols, outline_file, get_symbol, repomap) to identify vulnerabilities, boundary condition oversights, and logic bugs related to the prompt. Report exact file paths and lines. Once your findings are compiled, output your final assessment directly and do not invoke additional tools.",
                 root.display()
             ),
         }
@@ -173,7 +173,7 @@ impl Tool for SubagentTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "subagent".into(),
-            description: "Delegate a research, search, or isolated investigation subtask to a subagent with a fresh, clean context window. The subagent runs read-only tools (read_file, grep, list_dir, symbol_search, repomap_get) against the workspace and returns its concise findings back to you.".into(),
+            description: "Delegate a research, search, or isolated investigation subtask to a subagent with a fresh, clean context window. The subagent runs read-only tools (read_file, grep, list_dir, search_symbols, outline_file, get_symbol, repomap) against the workspace and returns its concise findings back to you.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
