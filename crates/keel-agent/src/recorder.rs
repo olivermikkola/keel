@@ -84,6 +84,32 @@ pub enum RecordFrame {
     },
 }
 
+/// Maximum permitted recording file size (64MB) to prevent unbounded memory consumption.
+pub const MAX_RECORDING_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Maximum permitted length of an individual `.keelrec` JSONL line (16MB).
+pub const MAX_RECORDING_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Validate a session identifier to prevent path traversal and unsafe filesystem characters.
+pub fn validate_session_id(id: &str) -> Result<()> {
+    let trimmed = id.trim();
+    if trimmed.is_empty() {
+        bail!("session ID must not be empty");
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains("..") {
+        bail!("session ID contains forbidden path traversal characters: {id}");
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        bail!(
+            "session ID contains invalid characters (must be ASCII alphanumeric, '-', '_', or '.'): {id}"
+        );
+    }
+    Ok(())
+}
+
 /// Append-only flight recorder logging every event to a deterministic `.keelrec` file.
 pub struct FlightRecorder {
     path: PathBuf,
@@ -103,6 +129,7 @@ impl FlightRecorder {
         model: &str,
         system_prompt: Option<&str>,
     ) -> Result<Self> {
+        validate_session_id(session_id)?;
         let dir = recordings_dir.as_ref();
         std::fs::create_dir_all(dir)
             .with_context(|| format!("creating recordings directory: {}", dir.display()))?;
@@ -197,8 +224,20 @@ pub struct RecordedSession {
 impl RecordedSession {
     /// Load a `.keelrec` recording file from disk.
     pub fn load_from_file(path: impl AsRef<Path>) -> Result<Self> {
-        let file = File::open(path.as_ref())
-            .with_context(|| format!("opening recording {}", path.as_ref().display()))?;
+        let p = path.as_ref();
+        let meta = std::fs::symlink_metadata(p)
+            .with_context(|| format!("checking metadata for {}", p.display()))?;
+        if !meta.file_type().is_file() {
+            bail!("recording path is not a regular file: {}", p.display());
+        }
+        if meta.len() > MAX_RECORDING_FILE_BYTES {
+            bail!(
+                "recording file {} exceeds maximum allowed size ({MAX_RECORDING_FILE_BYTES} bytes)",
+                p.display()
+            );
+        }
+
+        let file = File::open(p).with_context(|| format!("opening recording {}", p.display()))?;
         let reader = BufReader::new(file);
 
         let mut frames = Vec::new();
@@ -210,6 +249,12 @@ impl RecordedSession {
 
         for (line_idx, line_res) in reader.lines().enumerate() {
             let line = line_res.with_context(|| format!("reading line {}", line_idx + 1))?;
+            if line.len() > MAX_RECORDING_LINE_BYTES {
+                bail!(
+                    "line {} exceeds maximum allowed length ({MAX_RECORDING_LINE_BYTES} bytes)",
+                    line_idx + 1
+                );
+            }
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
@@ -474,6 +519,7 @@ impl ReplayEngine {
 
     /// Load a specific recorded session by ID.
     pub fn load_session(&self, session_id: &str) -> Result<RecordedSession> {
+        validate_session_id(session_id)?;
         let path = self.recordings_dir.join(format!("{session_id}.keelrec"));
         if !path.exists() {
             bail!(
@@ -564,6 +610,8 @@ impl ReplayEngine {
         new_session_id: &str,
         cp: &CheckpointManager,
     ) -> Result<ForkReport> {
+        validate_session_id(session_id)?;
+        validate_session_id(new_session_id)?;
         let session = self.load_session(session_id)?;
         let step = self.inspect_step(session_id, turn_idx, step_idx)?;
         let Some(checkpoint_id) = step.checkpoint_id else {
@@ -777,6 +825,34 @@ mod tests {
         let step = engine.inspect_step("session-alpha", 0, 0).unwrap();
         assert_eq!(step.tool_calls[0].name, "read_file");
         assert_eq!(step.checkpoint_id, Some("ckpt-alpha-1".into()));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn session_id_validation_and_path_traversal_defense() {
+        assert!(validate_session_id("session-123_abc.def").is_ok());
+        assert!(validate_session_id("").is_err());
+        assert!(validate_session_id("../../etc/passwd").is_err());
+        assert!(validate_session_id("session/child").is_err());
+        assert!(validate_session_id("session\\child").is_err());
+        assert!(validate_session_id("session;rm -rf").is_err());
+
+        let tmp = std::env::temp_dir().join(format!("keel_sec_replay_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let engine = ReplayEngine::new(&tmp);
+        assert!(engine.load_session("../escaped").is_err());
+        assert!(engine
+            .fork_step(
+                "valid-src",
+                0,
+                0,
+                "../evil-fork",
+                &CheckpointManager::new(tmp.clone())
+            )
+            .is_err());
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
