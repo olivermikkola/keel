@@ -295,9 +295,17 @@ impl StreamingSentinel {
             parameter_key: "command".into(),
             patterns: vec![
                 "push --force origin main".into(),
+                "push origin --force main".into(),
+                "push origin main --force".into(),
                 "push -f origin main".into(),
+                "push origin -f main".into(),
+                "push origin main -f".into(),
                 "push --force origin master".into(),
+                "push origin --force master".into(),
+                "push origin master --force".into(),
                 "push -f origin master".into(),
+                "push origin -f master".into(),
+                "push origin master -f".into(),
                 "push origin +main".into(),
                 "push origin +master".into(),
             ],
@@ -400,8 +408,18 @@ impl StreamingSentinel {
             }
 
             if let Some(val) = parsed_fields.get(&rule.parameter_key) {
+                let norm_val = val
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_ascii_lowercase();
                 for pattern in &rule.patterns {
-                    if val.contains(pattern) {
+                    let norm_pat = pattern
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .to_ascii_lowercase();
+                    if val.contains(pattern) || norm_val.contains(&norm_pat) {
                         let event = VetoEvent {
                             id: format!("veto-{}", self.veto_count.fetch_add(1, Ordering::SeqCst) + 1),
                             category: rule.category.clone(),
@@ -453,6 +471,9 @@ impl StreamingSentinel {
     }
 }
 
+const MAX_PREWARM_FILE_SIZE: u64 = 1024 * 1024; // 1 MB cap on prewarmed file content
+const MAX_PREWARM_ENTRIES: usize = 64; // Max entries in LRU prewarm cache
+
 /// Predictive Pre-warming Cache and Engine.
 ///
 /// Pre-loads file contents or initiates background AST symbol outline parsing
@@ -488,20 +509,57 @@ impl PrewarmEngine {
             return false;
         }
 
-        let path = if Path::new(path_str).is_absolute() {
-            PathBuf::from(path_str)
-        } else {
-            self.workspace_root.join(path_str)
+        // Confine target strictly within workspace bounds to prevent out-of-bounds exfiltration
+        let Ok(path) = crate::tools::confine(&self.workspace_root, path_str) else {
+            return false;
         };
 
-        // If file exists and not cached recently, warm it into memory
-        if path.is_file() {
-            self.prewarm_requests.fetch_add(1, Ordering::Relaxed);
-            let mut cache = self.file_cache.write().expect("lock poisoned");
-            if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(path) {
-                if let Ok(content) = std::fs::read_to_string(e.key()) {
-                    e.insert((Instant::now(), content));
-                    return true;
+        let canon_root = self
+            .workspace_root
+            .canonicalize()
+            .unwrap_or_else(|_| self.workspace_root.clone());
+        let Ok(canon_path) = path.canonicalize() else {
+            return false;
+        };
+        if !canon_path.starts_with(&canon_root) {
+            return false;
+        }
+
+        // If file exists, is a regular file, and within size threshold
+        let Ok(meta) = std::fs::symlink_metadata(&canon_path) else {
+            return false;
+        };
+        if !meta.file_type().is_file() || meta.len() > MAX_PREWARM_FILE_SIZE {
+            return false;
+        }
+
+        self.prewarm_requests.fetch_add(1, Ordering::Relaxed);
+        let mut cache = self.file_cache.write().expect("lock poisoned");
+
+        // Evict oldest entry if capacity reached
+        if cache.len() >= MAX_PREWARM_ENTRIES && !cache.contains_key(&canon_path) {
+            if let Some(oldest_key) = cache
+                .iter()
+                .min_by_key(|(_, (instant, _))| *instant)
+                .map(|(k, _)| k.clone())
+            {
+                cache.remove(&oldest_key);
+            }
+        }
+
+        if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(canon_path.clone()) {
+            use std::io::Read;
+            if let Ok(mut f) = std::fs::File::open(&canon_path) {
+                let mut buf = Vec::new();
+                if f.by_ref()
+                    .take(MAX_PREWARM_FILE_SIZE)
+                    .read_to_end(&mut buf)
+                    .is_ok()
+                {
+                    if let Ok(content) = String::from_utf8(buf) {
+                        e.insert((Instant::now(), content));
+                        return true;
+                    }
                 }
             }
         }
@@ -511,14 +569,24 @@ impl PrewarmEngine {
 
     /// Retrieve warmed file contents, recording a cache hit if found.
     pub fn get_warmed(&self, path: &Path) -> Option<String> {
-        let canonical = if path.is_absolute() {
+        let canon_root = self
+            .workspace_root
+            .canonicalize()
+            .unwrap_or_else(|_| self.workspace_root.clone());
+        let full_path = if path.is_absolute() {
             path.to_path_buf()
         } else {
             self.workspace_root.join(path)
         };
+        let Ok(canon_path) = full_path.canonicalize() else {
+            return None;
+        };
+        if !canon_path.starts_with(&canon_root) {
+            return None;
+        }
 
         let cache = self.file_cache.read().expect("lock poisoned");
-        if let Some((_, content)) = cache.get(&canonical) {
+        if let Some((_, content)) = cache.get(&canon_path) {
             self.cache_hits.fetch_add(1, Ordering::Relaxed);
             Some(content.clone())
         } else {
@@ -698,6 +766,59 @@ mod tests {
 
         let metrics = engine.metrics();
         assert_eq!(metrics["cache_hits"], 1);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn sentinel_catches_whitespace_and_case_evasion() {
+        let sentinel = StreamingSentinel::default();
+
+        // 1. Multiple spaces evasion
+        let mut fields1 = HashMap::new();
+        fields1.insert("command".into(), "rm    -rf    /".into());
+        let veto1 = sentinel
+            .inspect("shell", &fields1)
+            .expect("must veto multiple spaces");
+        assert_eq!(veto1.category, VetoCategory::DestructiveCommand);
+
+        // 2. Uppercase evasion
+        let mut fields2 = HashMap::new();
+        fields2.insert("command".into(), "RM -RF /".into());
+        let veto2 = sentinel
+            .inspect("shell", &fields2)
+            .expect("must veto uppercase command");
+        assert_eq!(veto2.category, VetoCategory::DestructiveCommand);
+
+        // 3. Mixed case and spaces on git push force
+        let mut fields3 = HashMap::new();
+        fields3.insert(
+            "command".into(),
+            "GIT   PUSH   ORIGIN   --FORCE   MAIN".into(),
+        );
+        let veto3 = sentinel
+            .inspect("shell", &fields3)
+            .expect("must veto uppercase git force push");
+        assert_eq!(veto3.category, VetoCategory::ForceBranchPush);
+    }
+
+    #[test]
+    fn prewarm_engine_rejects_path_traversal_and_escapes() {
+        let tmp = std::env::temp_dir().join(format!("keel_prewarm_sec_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let engine = PrewarmEngine::new(&tmp);
+
+        // Absolute path outside workspace must not prewarm
+        let mut f1 = HashMap::new();
+        f1.insert("path".into(), "/etc/passwd".into());
+        assert!(!engine.check_and_prewarm("read_file", &f1));
+
+        // Relative path traversal must not prewarm
+        let mut f2 = HashMap::new();
+        f2.insert("path".into(), "../secret.txt".into());
+        assert!(!engine.check_and_prewarm("read_file", &f2));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
