@@ -17,7 +17,22 @@ const MAX_OUT: usize = 32 * 1024;
 const MAX_PIPE_CAPTURE: usize = 1024 * 1024;
 const MAX_GREP_FILE_SIZE: u64 = 10 * 1024 * 1024;
 
-fn read_pipe_capped<R: Read>(mut pipe: R) -> Vec<u8> {
+/// Terminate a child process and its entire process group cleanly.
+pub fn kill_process_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as i32;
+        if pid > 1 {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+pub fn read_pipe_capped<R: Read>(mut pipe: R) -> Vec<u8> {
     let mut buf = Vec::new();
     let _ = pipe
         .by_ref()
@@ -126,6 +141,9 @@ impl Tool for ReadFile {
         if !meta.file_type().is_file() {
             bail!("{} is not a regular file", p.display());
         }
+        if meta.len() > crate::vfs::MAX_VFS_FILE_BYTES {
+            bail!("{} exceeds 64MB limit ({} bytes)", p.display(), meta.len());
+        }
         let mut file =
             std::fs::File::open(&p).with_context(|| format!("opening {}", p.display()))?;
         let mut buf = Vec::new();
@@ -205,6 +223,9 @@ impl Tool for WriteFile {
             }
         }
         let c = arg(a, "content")?;
+        if c.len() as u64 > crate::vfs::MAX_VFS_FILE_BYTES {
+            bail!("content exceeds 64MB limit ({} bytes)", c.len());
+        }
         std::fs::write(&p, c)?;
         Ok(format!("wrote {} bytes to {}", c.len(), p.display()))
     }
@@ -230,6 +251,9 @@ impl Tool for EditFile {
             .with_context(|| format!("checking metadata for {}", p.display()))?;
         if !meta.file_type().is_file() {
             bail!("{} is not a regular file", p.display());
+        }
+        if meta.len() > crate::vfs::MAX_VFS_FILE_BYTES {
+            bail!("{} exceeds 64MB limit ({} bytes)", p.display(), meta.len());
         }
         let (old, new) = (arg(a, "old")?, arg(a, "new")?);
         let text =
@@ -262,6 +286,9 @@ impl Tool for PatchFile {
             .with_context(|| format!("checking metadata for {}", p.display()))?;
         if !meta.file_type().is_file() {
             bail!("{} is not a regular file", p.display());
+        }
+        if meta.len() > crate::vfs::MAX_VFS_FILE_BYTES {
+            bail!("{} exceeds 64MB limit ({} bytes)", p.display(), meta.len());
         }
         let patch_text = arg(a, "patch")?;
         let text =
@@ -437,6 +464,12 @@ impl Tool for Shell {
             }
         }
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+
         unsafe {
             cmd.pre_exec(move || {
                 policy
@@ -473,17 +506,22 @@ impl Tool for Shell {
 
         let start = std::time::Instant::now();
         let status = loop {
-            match child.try_wait()? {
-                Some(st) => break st,
-                None => {
+            match child.try_wait() {
+                Ok(Some(st)) => break st,
+                Ok(None) => {
                     if start.elapsed() > timeout {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        kill_process_group(&mut child);
                         let _ = stdout_thread.join();
                         let _ = stderr_thread.join();
                         bail!("command timed out after {}s", timeout.as_secs());
                     }
                     std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => {
+                    kill_process_group(&mut child);
+                    let _ = stdout_thread.join();
+                    let _ = stderr_thread.join();
+                    return Err(e).context("waiting on child process");
                 }
             }
         };

@@ -129,7 +129,10 @@ impl CheckpointManager {
 
     pub fn list(&self) -> Result<Vec<CheckpointInfo>> {
         let p = self.meta_file();
-        if !p.exists() {
+        let Ok(meta) = std::fs::symlink_metadata(&p) else {
+            return Ok(Vec::new());
+        };
+        if !meta.file_type().is_file() || meta.len() > 16 * 1024 * 1024 {
             return Ok(Vec::new());
         }
         let data =

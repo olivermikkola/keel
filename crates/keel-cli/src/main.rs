@@ -1527,7 +1527,7 @@ fn cli_subagent(
         .unwrap_or(SubagentRole::Researcher);
     let max_steps = steps_opt.unwrap_or(8).clamp(1, 20);
 
-    let report = run_subagent(root, llm, prompt, role, max_steps, landlock_enabled)?;
+    let report = run_subagent(root, llm, prompt, role, max_steps, landlock_enabled, None)?;
 
     if json_mode {
         println!("{}", serde_json::to_string_pretty(&report)?);

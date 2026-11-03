@@ -454,6 +454,8 @@ impl Default for SessionRegistry {
 }
 
 impl SessionRegistry {
+    pub const MAX_SESSIONS: usize = 128;
+
     pub fn new() -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
@@ -474,6 +476,28 @@ impl SessionRegistry {
         let mut g = self.sessions.lock().unwrap();
         if let Some(entry) = g.get(id) {
             return entry.clone();
+        }
+        if g.len() >= Self::MAX_SESSIONS {
+            let mut candidates: Vec<(String, u64)> = g
+                .iter()
+                .filter(|(_, e)| !e.busy.load(Ordering::SeqCst))
+                .map(|(sid, e)| {
+                    let updated = e.updated_at.lock().map(|t| *t).unwrap_or(e.created_at);
+                    (sid.clone(), updated)
+                })
+                .collect();
+            candidates.sort_by_key(|(_, t)| *t);
+            if let Some((oldest_sid, _)) = candidates.first() {
+                if let Some(old_entry) = g.remove(oldest_sid) {
+                    old_entry.cancel_token.cancel();
+                    old_entry.approver.notify_cancelled();
+                    if let Ok(mut m) = old_entry.mounted.lock() {
+                        while let Some(h) = m.pop() {
+                            h.unload();
+                        }
+                    }
+                }
+            }
         }
         let entry = Arc::new(create_session(id.to_string(), cfg, llm, broadcaster));
         g.insert(id.to_string(), entry.clone());
@@ -703,6 +727,20 @@ impl DaemonServer {
             shutdown_signal,
         }
     }
+}
+
+fn resolve_and_validate_session_id(
+    params: &Value,
+    current: &Arc<Mutex<String>>,
+) -> Result<String, String> {
+    let sid = params
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| current.lock().unwrap().clone());
+    crate::recorder::validate_session_id(&sid)
+        .map_err(|e| format!("invalid `session_id`: {e:#}"))?;
+    Ok(sid)
 }
 
 /// Run ACP JSON-RPC client connection loop over `reader` and `writer`.
@@ -939,11 +977,13 @@ pub fn handle_acp_client<R: BufRead>(
                 }
             }
             "session/close" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let closed = server.registry.close(&sid);
                 rpc_writer.send_response(
                     id,
@@ -951,11 +991,13 @@ pub fn handle_acp_client<R: BufRead>(
                 );
             }
             "session/cancel" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 if let Some(session) = server.registry.get(&sid) {
                     session.cancel_token.cancel();
                     session.approver.notify_cancelled();
@@ -1007,6 +1049,17 @@ pub fn handle_acp_client<R: BufRead>(
                 }
             }
             "session/prompt" => {
+                const MAX_CONCURRENT_AGENT_RUNS: usize = 4;
+                active_workers.retain(|h| !h.is_finished());
+                if active_workers.len() >= MAX_CONCURRENT_AGENT_RUNS {
+                    rpc_writer.send_error(
+                        id,
+                        -32003,
+                        &format!("too many concurrent agent runs active in daemon (max {MAX_CONCURRENT_AGENT_RUNS})"),
+                    );
+                    continue;
+                }
+
                 let Some(prompt_text) = params
                     .get("prompt")
                     .or_else(|| params.get("text"))
@@ -1021,11 +1074,13 @@ pub fn handle_acp_client<R: BufRead>(
                     .and_then(|v| v.as_u64())
                     .unwrap_or(40) as usize;
 
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let session = server.registry.get_or_create(
                     &sid,
                     &server.cfg,
@@ -1099,11 +1154,13 @@ pub fn handle_acp_client<R: BufRead>(
                 active_workers.push(handle);
             }
             "vfs/status" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let session = server.registry.get_or_create(
                     &sid,
                     &server.cfg,
@@ -1118,11 +1175,13 @@ pub fn handle_acp_client<R: BufRead>(
                 }
             }
             "vfs/diff" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let session = server.registry.get_or_create(
                     &sid,
                     &server.cfg,
@@ -1136,11 +1195,13 @@ pub fn handle_acp_client<R: BufRead>(
                 }
             }
             "vfs/commit" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let session = server.registry.get_or_create(
                     &sid,
                     &server.cfg,
@@ -1157,11 +1218,13 @@ pub fn handle_acp_client<R: BufRead>(
                 }
             }
             "vfs/rollback" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let session = server.registry.get_or_create(
                     &sid,
                     &server.cfg,
@@ -1178,11 +1241,13 @@ pub fn handle_acp_client<R: BufRead>(
                 }
             }
             "checkpoint/list" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let session = server.registry.get_or_create(
                     &sid,
                     &server.cfg,
@@ -1200,11 +1265,13 @@ pub fn handle_acp_client<R: BufRead>(
                 }
             }
             "checkpoint/save" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let desc = params
                     .get("description")
                     .and_then(|v| v.as_str())
@@ -1225,11 +1292,13 @@ pub fn handle_acp_client<R: BufRead>(
                 }
             }
             "checkpoint/restore" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let target = params
                     .get("id")
                     .and_then(|v| v.as_str())
@@ -1250,11 +1319,13 @@ pub fn handle_acp_client<R: BufRead>(
                 }
             }
             "memory/show" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let session = server.registry.get_or_create(
                     &sid,
                     &server.cfg,
@@ -1277,11 +1348,13 @@ pub fn handle_acp_client<R: BufRead>(
                 }
             }
             "memory/add_fact" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let Some(fact) = params.get("fact").and_then(|v| v.as_str()) else {
                     rpc_writer.send_error(id, -32602, "missing `fact` string parameter");
                     continue;
@@ -1302,11 +1375,13 @@ pub fn handle_acp_client<R: BufRead>(
                 }
             }
             "memory/set_hypothesis" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let hyp = params
                     .get("hypothesis")
                     .and_then(|v| v.as_str())
@@ -1327,11 +1402,13 @@ pub fn handle_acp_client<R: BufRead>(
                 }
             }
             "memory/record_failure" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let Some(approach) = params.get("approach").and_then(|v| v.as_str()) else {
                     rpc_writer.send_error(id, -32602, "missing `approach` parameter");
                     continue;
@@ -1356,11 +1433,13 @@ pub fn handle_acp_client<R: BufRead>(
                 }
             }
             "memory/clear" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let session = server.registry.get_or_create(
                     &sid,
                     &server.cfg,
@@ -1377,11 +1456,13 @@ pub fn handle_acp_client<R: BufRead>(
                 }
             }
             "memory/graph" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let session = server.registry.get_or_create(
                     &sid,
                     &server.cfg,
@@ -1405,11 +1486,13 @@ pub fn handle_acp_client<R: BufRead>(
                 }
             }
             "memory/link" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let from = params.get("from").and_then(|v| v.as_str()).unwrap_or("");
                 let to = params.get("to").and_then(|v| v.as_str()).unwrap_or("");
                 let rel_str = params
@@ -1462,11 +1545,13 @@ pub fn handle_acp_client<R: BufRead>(
                 }
             }
             "memory/contradictions" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let session = server.registry.get_or_create(
                     &sid,
                     &server.cfg,
@@ -1488,11 +1573,13 @@ pub fn handle_acp_client<R: BufRead>(
                 }
             }
             "memory/sync" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let session = server.registry.get_or_create(
                     &sid,
                     &server.cfg,
@@ -1631,11 +1718,13 @@ pub fn handle_acp_client<R: BufRead>(
                 }
             }
             "oracle/run" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let session = server.registry.get_or_create(
                     &sid,
                     &server.cfg,
@@ -1655,11 +1744,13 @@ pub fn handle_acp_client<R: BufRead>(
                 }
             }
             "oracle/baseline" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let action = params
                     .get("action")
                     .and_then(|v| v.as_str())
@@ -1695,11 +1786,13 @@ pub fn handle_acp_client<R: BufRead>(
                 }
             }
             "oracle/diff" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let session = server.registry.get_or_create(
                     &sid,
                     &server.cfg,
@@ -1727,11 +1820,13 @@ pub fn handle_acp_client<R: BufRead>(
                 }
             }
             "symbols/outline" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let rel = params
                     .get("path")
                     .or_else(|| params.get("file"))
@@ -1766,11 +1861,13 @@ pub fn handle_acp_client<R: BufRead>(
                 }
             }
             "symbols/search" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
                 let path_filter = params.get("path").and_then(|v| v.as_str());
                 let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
@@ -1799,11 +1896,13 @@ pub fn handle_acp_client<R: BufRead>(
                 }
             }
             "symbols/get" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let rel = params
                     .get("path")
                     .or_else(|| params.get("file"))
@@ -1845,11 +1944,13 @@ pub fn handle_acp_client<R: BufRead>(
                 }
             }
             "tree/status" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let session = server.registry.get_or_create(
                     &sid,
                     &server.cfg,
@@ -1874,11 +1975,13 @@ pub fn handle_acp_client<R: BufRead>(
                 }
             }
             "tree/fork" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let label = params
                     .get("label")
                     .and_then(|v| v.as_str())
@@ -1912,11 +2015,13 @@ pub fn handle_acp_client<R: BufRead>(
                 }
             }
             "tree/switch" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let node_id = params.get("node_id").and_then(|v| v.as_str()).unwrap_or("");
                 let session = server.registry.get_or_create(
                     &sid,
@@ -1947,11 +2052,13 @@ pub fn handle_acp_client<R: BufRead>(
                 }
             }
             "tree/backtrack" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let session = server.registry.get_or_create(
                     &sid,
                     &server.cfg,
@@ -1981,11 +2088,13 @@ pub fn handle_acp_client<R: BufRead>(
                 }
             }
             "tree/prune" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let node_id = params.get("node_id").and_then(|v| v.as_str()).unwrap_or("");
                 let session = server.registry.get_or_create(
                     &sid,
@@ -2015,11 +2124,13 @@ pub fn handle_acp_client<R: BufRead>(
                 }
             }
             "tree/accept" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let node_id = params.get("node_id").and_then(|v| v.as_str()).unwrap_or("");
                 let session = server.registry.get_or_create(
                     &sid,
@@ -2049,11 +2160,13 @@ pub fn handle_acp_client<R: BufRead>(
                 }
             }
             "sentinel/status" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let session = server.registry.get_or_create(
                     &sid,
                     &server.cfg,
@@ -2076,11 +2189,13 @@ pub fn handle_acp_client<R: BufRead>(
                 }
             }
             "sentinel/mode" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let mode_str = params
                     .get("mode")
                     .and_then(|v| v.as_str())
@@ -2113,11 +2228,13 @@ pub fn handle_acp_client<R: BufRead>(
                 }
             }
             "sentinel/check" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let tool = params
                     .get("tool")
                     .and_then(|v| v.as_str())
@@ -2175,12 +2292,14 @@ pub fn handle_acp_client<R: BufRead>(
                     .unwrap_or(8)
                     .clamp(1, 15) as usize;
 
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
-                let _session = server.registry.get_or_create(
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
+                let session = server.registry.get_or_create(
                     &sid,
                     &server.cfg,
                     server.llm.clone(),
@@ -2194,6 +2313,7 @@ pub fn handle_acp_client<R: BufRead>(
                     role,
                     max_steps,
                     server.cfg.landlock_enabled,
+                    Some(session.cancel_token.clone()),
                 ) {
                     Ok(rep) => {
                         rpc_writer.send_response(
@@ -2214,11 +2334,13 @@ pub fn handle_acp_client<R: BufRead>(
                 }
             }
             "prewarm/status" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let session = server.registry.get_or_create(
                     &sid,
                     &server.cfg,
@@ -2241,11 +2363,13 @@ pub fn handle_acp_client<R: BufRead>(
                 }
             }
             "replay/list" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let session = server.registry.get_or_create(
                     &sid,
                     &server.cfg,
@@ -2271,6 +2395,16 @@ pub fn handle_acp_client<R: BufRead>(
                     .get("target_session_id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
+                if !target_sid.is_empty() {
+                    if let Err(e) = crate::recorder::validate_session_id(target_sid) {
+                        rpc_writer.send_error(
+                            id,
+                            -32602,
+                            &format!("invalid target_session_id: {e:#}"),
+                        );
+                        continue;
+                    }
+                }
                 let session = server.registry.get_or_create(
                     &current_session_id.lock().unwrap(),
                     &server.cfg,
@@ -2304,6 +2438,16 @@ pub fn handle_acp_client<R: BufRead>(
                     .get("target_session_id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
+                if !target_sid.is_empty() {
+                    if let Err(e) = crate::recorder::validate_session_id(target_sid) {
+                        rpc_writer.send_error(
+                            id,
+                            -32602,
+                            &format!("invalid target_session_id: {e:#}"),
+                        );
+                        continue;
+                    }
+                }
                 let turn_idx = params
                     .get("turn_index")
                     .and_then(|v| v.as_u64())
@@ -2334,6 +2478,16 @@ pub fn handle_acp_client<R: BufRead>(
                     .get("target_session_id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
+                if !target_sid.is_empty() {
+                    if let Err(e) = crate::recorder::validate_session_id(target_sid) {
+                        rpc_writer.send_error(
+                            id,
+                            -32602,
+                            &format!("invalid target_session_id: {e:#}"),
+                        );
+                        continue;
+                    }
+                }
                 let turn_idx = params
                     .get("turn_index")
                     .and_then(|v| v.as_u64())
@@ -2368,10 +2522,24 @@ pub fn handle_acp_client<R: BufRead>(
                     .get("target_session_id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
+                if !target_sid.is_empty() {
+                    if let Err(e) = crate::recorder::validate_session_id(target_sid) {
+                        rpc_writer.send_error(
+                            id,
+                            -32602,
+                            &format!("invalid target_session_id: {e:#}"),
+                        );
+                        continue;
+                    }
+                }
                 let new_sid = params
                     .get("new_session_id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("forked-session");
+                if let Err(e) = crate::recorder::validate_session_id(new_sid) {
+                    rpc_writer.send_error(id, -32602, &format!("invalid new_session_id: {e:#}"));
+                    continue;
+                }
                 let turn_idx = params
                     .get("turn_index")
                     .and_then(|v| v.as_u64())
@@ -2478,11 +2646,13 @@ pub fn handle_acp_client<R: BufRead>(
                 }
             }
             "compaction/status" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let session = server.registry.get_or_create(
                     &sid,
                     &server.cfg,
@@ -2522,11 +2692,13 @@ pub fn handle_acp_client<R: BufRead>(
                 );
             }
             "compaction/compact" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let session = server.registry.get_or_create(
                     &sid,
                     &server.cfg,
@@ -2564,11 +2736,13 @@ pub fn handle_acp_client<R: BufRead>(
                 }
             }
             "repomap/get" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let max_tokens = params
                     .get("max_tokens")
                     .and_then(|v| v.as_u64())
@@ -2602,11 +2776,13 @@ pub fn handle_acp_client<R: BufRead>(
                 }
             }
             "repomap/graph" => {
-                let sid = params
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let sid = match resolve_and_validate_session_id(&params, &current_session_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32602, &e);
+                        continue;
+                    }
+                };
                 let session = server.registry.get_or_create(
                     &sid,
                     &server.cfg,
@@ -4035,6 +4211,103 @@ impl WorkerService {
         let subagent_res = lines.iter().find(|v| v["id"] == 2).unwrap();
         assert_eq!(subagent_res["result"]["report"]["role"], "navigator");
         assert_eq!(subagent_res["result"]["report"]["success"], true);
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn acp_daemon_session_validation_across_all_methods() {
+        let tmp = std::env::temp_dir().join(format!("keel-sec-sess-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let out_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let requests = [
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}).to_string(),
+            // 1. session/prompt with path traversal session_id
+            json!({"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {"session_id": "../root", "prompt": "test"}}).to_string(),
+            // 2. session/close with invalid session_id
+            json!({"jsonrpc": "2.0", "id": 3, "method": "session/close", "params": {"session_id": "evil/slash"}}).to_string(),
+            // 3. memory/show with invalid session_id
+            json!({"jsonrpc": "2.0", "id": 4, "method": "memory/show", "params": {"session_id": "evil\0null"}}).to_string(),
+            // 4. replay/info with invalid target_session_id
+            json!({"jsonrpc": "2.0", "id": 5, "method": "replay/info", "params": {"target_session_id": "../../etc"}}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 6, "method": "shutdown", "params": {}}).to_string(),
+        ]
+        .join("\n")
+            + "\n";
+
+        let cfg = DaemonConfig {
+            root: tmp.clone(),
+            policy: ApprovalPolicy::Yolo,
+            landlock_enabled: false,
+            vfs_mode: VfsMode::MaterializedCow,
+            verify_command: None,
+            ..Default::default()
+        };
+
+        serve_acp(
+            BufReader::new(std::io::Cursor::new(requests.into_bytes())),
+            Box::new(SharedVecWriter(out_buf.clone())),
+            cfg,
+            Arc::new(DaemonTestLlm),
+        )
+        .unwrap();
+
+        let raw_output = String::from_utf8(out_buf.lock().unwrap().clone()).unwrap();
+        let lines: Vec<Value> = raw_output
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .collect();
+
+        for id in 2..=5 {
+            let res = lines.iter().find(|v| v["id"] == id).unwrap();
+            assert_eq!(res["error"]["code"], -32602, "expected -32602 for id {id}");
+            assert!(
+                res["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("invalid `session_id`")
+                    || res["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("invalid target_session_id"),
+                "unexpected error message: {:?}",
+                res["error"]["message"]
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn acp_daemon_session_registry_lru_eviction() {
+        let tmp = std::env::temp_dir().join(format!("keel-registry-lru-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let cfg = DaemonConfig {
+            root: tmp.clone(),
+            policy: ApprovalPolicy::Yolo,
+            landlock_enabled: false,
+            vfs_mode: VfsMode::MaterializedCow,
+            verify_command: None,
+            ..Default::default()
+        };
+
+        let registry = SessionRegistry::new();
+        let broadcaster = RpcBroadcaster::new();
+        let llm: Arc<dyn Llm> = Arc::new(DaemonTestLlm);
+
+        // Fill registry up to MAX_SESSIONS + 5
+        for i in 0..(SessionRegistry::MAX_SESSIONS + 5) {
+            let sid = format!("sess-{i}");
+            registry.get_or_create(&sid, &cfg, llm.clone(), broadcaster.clone());
+        }
+
+        let list = registry.list();
+        assert_eq!(list.len(), SessionRegistry::MAX_SESSIONS);
 
         let _ = std::fs::remove_dir_all(tmp);
     }
