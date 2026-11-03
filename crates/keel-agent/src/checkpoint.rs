@@ -11,8 +11,11 @@ use keel_kernel::{Plugin, Scope};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Upper bound for any single git invocation made by the checkpoint engine.
+const GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 static CKPT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -76,9 +79,7 @@ impl CheckpointManager {
         let mut cmd = Command::new("git");
         cmd.args(args)
             .current_dir(&self.root)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_AUTHOR_NAME", "keel")
             .env("GIT_AUTHOR_EMAIL", "keel@local")
             .env("GIT_COMMITTER_NAME", "keel")
@@ -86,8 +87,7 @@ impl CheckpointManager {
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
-        let out = cmd
-            .output()
+        let out = crate::tools::run_command_bounded(cmd, GIT_TIMEOUT)
             .with_context(|| format!("executing git {}", args.join(" ")))?;
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);

@@ -1975,6 +1975,9 @@ fn main() -> anyhow::Result<()> {
     } else {
         ctx.mount(&Printer);
     }
+    let cancel = keel_agent::CancelToken::new();
+    keel_agent::interrupt::install_sigint_cancel(&cancel);
+    let _p_cancel = ctx.mount(&keel_agent::CancelTokenPlugin(cancel.clone()));
     let _p_llm = ctx.mount(&LlmPlugin(llm));
     let _p_approver = ctx.mount(&ApproverPlugin(approver));
     let _p_log = ctx.mount(&SessionLogPlugin(session));
@@ -2270,6 +2273,7 @@ fn main() -> anyhow::Result<()> {
                 println!("Active conversation depth: {} messages.\n", history.len());
                 continue;
             }
+            cancel.reset();
             if let Err(e) = Agent::run_from_context(&ctx, &mut history, trimmed, 40) {
                 eprintln!("\nerror: {e:#}\n");
             } else {

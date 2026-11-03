@@ -18,6 +18,7 @@ pub mod daemon;
 pub mod epistemic;
 pub mod guard;
 pub mod interceptor;
+pub mod interrupt;
 pub mod lsp;
 pub mod mcp;
 pub mod oracle;
