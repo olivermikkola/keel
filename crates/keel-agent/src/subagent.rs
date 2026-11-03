@@ -66,6 +66,7 @@ impl Tool for SubagentTool {
         let _p_landlock = child_ctx.mount(&LandlockPlugin {
             workspace: self.root.clone(),
             enabled: self.landlock_enabled,
+            ..Default::default()
         });
         let _p_tools = child_ctx.mount(&BuiltinToolsPlugin {
             root: self.root.clone(),

@@ -331,9 +331,15 @@ impl Plugin for BuiltinToolsPlugin {
         reg.register(Arc::new(EditFile(r.clone())));
         reg.register(Arc::new(PatchFile(r.clone())));
         reg.register(Arc::new(WriteFile(r.clone())));
+        let sandbox_policy = scope
+            .context()
+            .service::<SandboxPolicy>()
+            .map(|p| (*p).clone())
+            .unwrap_or_else(|| SandboxPolicy::new(r.clone(), self.landlock_enabled));
+
         reg.register(Arc::new(Shell {
             root: r.clone(),
-            sandbox: SandboxPolicy::new(r.clone(), self.landlock_enabled),
+            sandbox: sandbox_policy,
         }));
         scope.provide(reg);
     }

@@ -190,6 +190,7 @@ pub fn run(shared_llm: Arc<dyn Llm>, filter: Option<&str>, runs: usize) -> anyho
             let _p_ll = ctx.mount(&LandlockPlugin {
                 workspace: dir.clone(),
                 enabled: true,
+                ..Default::default()
             });
             let _p_tools = ctx.mount(&BuiltinToolsPlugin {
                 root: dir.clone(),

@@ -331,6 +331,7 @@ fn run_single_candidate(
     let _p_ll = ctx.mount(&LandlockPlugin {
         workspace: sb_dir.clone(),
         enabled: landlock_enabled,
+        ..Default::default()
     });
     let _p_tools = ctx.mount(&BuiltinToolsPlugin {
         root: sb_dir.clone(),
