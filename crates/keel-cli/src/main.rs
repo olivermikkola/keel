@@ -754,15 +754,29 @@ fn cli_handoff(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Resul
             let raw_json = if let Some(path) = file_arg {
                 if path == "-" {
                     let mut s = String::new();
-                    std::io::stdin().read_to_string(&mut s)?;
+                    std::io::stdin()
+                        .take((keel_agent::swarm::MAX_HANDOFF_JSON_BYTES + 1) as u64)
+                        .read_to_string(&mut s)?;
                     s
                 } else {
+                    let p = std::path::Path::new(&path);
+                    if !p.is_file() {
+                        anyhow::bail!(
+                            "handoff file does not exist or is not a regular file: {path}"
+                        );
+                    }
+                    let meta = std::fs::metadata(p)?;
+                    if meta.len() > keel_agent::swarm::MAX_HANDOFF_JSON_BYTES as u64 {
+                        anyhow::bail!("handoff file exceeds 4MB limit: {path}");
+                    }
                     std::fs::read_to_string(&path)
                         .with_context(|| format!("reading handoff file {path}"))?
                 }
             } else {
                 let mut s = String::new();
-                std::io::stdin().read_to_string(&mut s)?;
+                std::io::stdin()
+                    .take((keel_agent::swarm::MAX_HANDOFF_JSON_BYTES + 1) as u64)
+                    .read_to_string(&mut s)?;
                 s
             };
             let envelope = keel_agent::swarm::HandoffEnvelope::from_json_str(&raw_json)?;
@@ -1761,9 +1775,19 @@ fn main() -> anyhow::Result<()> {
         use std::io::Read;
         let raw_json = if path == "-" {
             let mut s = String::new();
-            std::io::stdin().read_to_string(&mut s)?;
+            std::io::stdin()
+                .take((keel_agent::swarm::MAX_HANDOFF_JSON_BYTES + 1) as u64)
+                .read_to_string(&mut s)?;
             s
         } else {
+            let p = std::path::Path::new(&path);
+            if !p.is_file() {
+                anyhow::bail!("handoff file does not exist or is not a regular file: {path}");
+            }
+            let meta = std::fs::metadata(p)?;
+            if meta.len() > keel_agent::swarm::MAX_HANDOFF_JSON_BYTES as u64 {
+                anyhow::bail!("handoff file exceeds 4MB limit: {path}");
+            }
             std::fs::read_to_string(&path)
                 .with_context(|| format!("reading handoff file {path}"))?
         };

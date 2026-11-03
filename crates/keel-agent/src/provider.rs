@@ -437,9 +437,24 @@ impl Llm for OpenAiCompat {
         if let Some(ref p) = self.prewarm {
             acc = acc.with_prewarm(p.clone());
         }
+        const MAX_SSE_LINE_BYTES: usize = 16 * 1024 * 1024; // 16MB maximum SSE line
         let mut early_abort: Option<String> = None;
-        for line in BufReader::new(resp.into_reader()).lines() {
-            for c in acc.feed(&line?)? {
+        let mut reader = BufReader::new(resp.into_reader());
+        loop {
+            let mut line = String::new();
+            use std::io::Read;
+            let n = reader
+                .by_ref()
+                .take((MAX_SSE_LINE_BYTES + 1) as u64)
+                .read_line(&mut line)?;
+            if n == 0 {
+                break;
+            }
+            if line.len() > MAX_SSE_LINE_BYTES {
+                anyhow::bail!("SSE stream line exceeds maximum allowable size (16MB)");
+            }
+            let trimmed = line.trim_end_matches(['\r', '\n']);
+            for c in acc.feed(trimmed)? {
                 if let Chunk::SentinelVeto {
                     ref tool_name,
                     ref reason,

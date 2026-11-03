@@ -25,6 +25,7 @@ use std::time::Instant;
 pub struct IncrementalArgParser {
     raw_buffer: String,
     fields: HashMap<String, String>,
+    pending_key: String,
     current_key: Option<String>,
     in_string: bool,
     escape_next: bool,
@@ -41,19 +42,21 @@ impl IncrementalArgParser {
             self.raw_buffer.push(ch);
 
             if self.escape_next {
-                if let Some(ref key) = self.current_key {
-                    let val = self.fields.entry(key.clone()).or_default();
-                    match ch {
-                        'n' => val.push('\n'),
-                        'r' => val.push('\r'),
-                        't' => val.push('\t'),
-                        '"' => val.push('"'),
-                        '\\' => val.push('\\'),
-                        '/' => val.push('/'),
-                        other => {
-                            val.push('\\');
-                            val.push(other);
-                        }
+                let target = if let Some(ref key) = self.current_key {
+                    self.fields.entry(key.clone()).or_default()
+                } else {
+                    &mut self.pending_key
+                };
+                match ch {
+                    'n' => target.push('\n'),
+                    'r' => target.push('\r'),
+                    't' => target.push('\t'),
+                    '"' => target.push('"'),
+                    '\\' => target.push('\\'),
+                    '/' => target.push('/'),
+                    other => {
+                        target.push('\\');
+                        target.push(other);
                     }
                 }
                 self.escape_next = false;
@@ -70,76 +73,39 @@ impl IncrementalArgParser {
                     // Starting a quoted string. Determine if this string is a key or a value.
                     self.in_string = true;
                     if self.current_key.is_none() {
-                        // We are about to parse a key
+                        self.pending_key.clear();
                     }
                 } else {
                     // Ending a quoted string
                     self.in_string = false;
                     if self.current_key.is_none() {
-                        // We just finished parsing a key name! Extract it from the tail of raw_buffer
-                        if let Some(key) = Self::extract_last_quoted_string(&self.raw_buffer) {
-                            self.current_key = Some(key);
+                        if !self.pending_key.is_empty() {
+                            self.current_key = Some(std::mem::take(&mut self.pending_key));
                         }
                     } else {
-                        // We just finished parsing a string value for `current_key`
+                        // Finished parsing a string value for `current_key`
                         self.current_key = None;
                     }
                 }
                 continue;
             }
 
-            // If we are currently inside a string value for an established key, append the char
+            // If we are currently inside a string value for an established key or a key name, append the char
             if self.in_string {
                 if let Some(ref key) = self.current_key {
                     self.fields.entry(key.clone()).or_default().push(ch);
+                } else {
+                    self.pending_key.push(ch);
                 }
             } else if ch == ':' && self.current_key.is_none() {
-                // Colon reached; if key wasn't captured by quotes, capture preceding token
-                if let Some(key) = Self::extract_last_quoted_string(&self.raw_buffer) {
-                    self.current_key = Some(key);
+                if !self.pending_key.is_empty() {
+                    self.current_key = Some(std::mem::take(&mut self.pending_key));
                 }
             } else if ch == ',' || ch == '}' {
                 // Delimiter between fields
                 self.current_key = None;
+                self.pending_key.clear();
             }
-        }
-    }
-
-    /// Helper to find the most recent complete quoted string in the buffer.
-    fn extract_last_quoted_string(buf: &str) -> Option<String> {
-        let mut in_quote = false;
-        let mut last_str = String::new();
-        let mut current_str = String::new();
-        let mut escape = false;
-
-        for ch in buf.chars() {
-            if escape {
-                current_str.push(ch);
-                escape = false;
-                continue;
-            }
-            if ch == '\\' && in_quote {
-                escape = true;
-                continue;
-            }
-            if ch == '"' {
-                if in_quote {
-                    last_str = current_str.clone();
-                    current_str.clear();
-                    in_quote = false;
-                } else {
-                    in_quote = true;
-                    current_str.clear();
-                }
-            } else if in_quote {
-                current_str.push(ch);
-            }
-        }
-
-        if !last_str.is_empty() {
-            Some(last_str)
-        } else {
-            None
         }
     }
 
@@ -821,5 +787,19 @@ mod tests {
         assert!(!engine.check_and_prewarm("read_file", &f2));
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn incremental_parser_handles_large_stream_efficiently() {
+        let mut parser = IncrementalArgParser::new();
+        parser.feed("{\"content\": \"");
+        // Stream a large body of text
+        let chunk = "a".repeat(10_000);
+        parser.feed(&chunk);
+        assert_eq!(parser.fields().get("content").unwrap().len(), 10_000);
+
+        // Next field key extraction works cleanly even after large buffer
+        parser.feed("\", \"path\": \"foo.rs\"}");
+        assert_eq!(parser.fields().get("path").unwrap(), "foo.rs");
     }
 }
