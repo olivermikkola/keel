@@ -17,6 +17,7 @@ pub mod compaction;
 pub mod daemon;
 pub mod epistemic;
 pub mod guard;
+pub mod interceptor;
 pub mod lsp;
 pub mod mcp;
 pub mod oracle;
@@ -35,6 +36,10 @@ pub mod vfs;
 pub use epistemic::{
     ContradictionAlert, EpistemicGraphLinkTool, EpistemicMemoryPlugin, EpistemicState,
     EpistemicStore, FactCategory, FactNode, GraphEdge, RelationType,
+};
+pub use interceptor::{
+    IncrementalArgParser, PrewarmEngine, PrewarmPlugin, SentinelMode as StreamingSentinelMode,
+    SentinelPlugin, SentinelRule, StreamingSentinel, VetoCategory, VetoEvent,
 };
 pub use oracle::{
     parse_test_output, DiagnosticOracle, OraclePlugin, RegressionDelta, SentinelMode, TestFailure,
@@ -95,6 +100,18 @@ pub enum Chunk {
     Text(String),
     /// Reasoning/thinking tokens. Shown to the user, never fed back into history.
     Reasoning(String),
+    /// Incremental tool call argument delta while generating.
+    ToolCallDelta {
+        index: usize,
+        id: Option<String>,
+        name: Option<String>,
+        args_delta: String,
+    },
+    /// Early security sentinel notification emitted during streaming.
+    SentinelVeto {
+        tool_name: String,
+        reason: String,
+    },
 }
 
 /// Model provider. Implementations are plugins (OpenAI-compatible, Anthropic, ...).
@@ -692,6 +709,23 @@ impl Agent<'_> {
         let Some(tool) = self.tools.iter().find(|t| t.spec().name == call.name) else {
             return format!("error: unknown tool `{}`", call.name);
         };
+        // Early security sentinel check
+        if let Some(sentinel) = self.ctx.service::<Arc<interceptor::StreamingSentinel>>() {
+            let mut fields = std::collections::HashMap::new();
+            if let Some(obj) = call.args.as_object() {
+                for (k, v) in obj {
+                    if let Some(s) = v.as_str() {
+                        fields.insert(k.clone(), s.to_string());
+                    }
+                }
+            }
+            if let Some(veto) = sentinel.inspect(&call.name, &fields) {
+                if sentinel.mode() == interceptor::SentinelMode::Strict {
+                    self.ctx.emit(&ToolDenied(call.clone()));
+                    return format!("denied by streaming security sentinel: {}", veto.reason);
+                }
+            }
+        }
         match self.approver.decide(call, tool.mutating()) {
             Decision::Deny(why) => {
                 self.ctx.emit(&ToolDenied(call.clone()));
@@ -711,6 +745,18 @@ impl Agent<'_> {
                     ) {
                         if let Some(rel_path) = call.args.get("path").and_then(|val| val.as_str()) {
                             let _ = v.capture_pre_image(rel_path);
+                        }
+                    }
+                }
+
+                // Check predictive pre-warming cache for read_file
+                if call.name == "read_file" {
+                    if let Some(prewarm) = self.ctx.service::<Arc<interceptor::PrewarmEngine>>() {
+                        if let Some(p) = call.args.get("path").and_then(|val| val.as_str()) {
+                            if let Some(content) = prewarm.get_warmed(std::path::Path::new(p)) {
+                                self.ctx.emit(&ToolResult(call.id.clone(), content.clone()));
+                                return content;
+                            }
                         }
                     }
                 }
