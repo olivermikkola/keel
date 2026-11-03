@@ -1838,6 +1838,24 @@ fn main() -> anyhow::Result<()> {
         None => std::env::current_dir()?,
     };
 
+    // Validate before mounting plugins, creating logs, or making model calls.
+    // Explicit resume must never silently turn into a fresh conversation.
+    let resumed_history = if !any_mode && !dump_config {
+        resume_opt.as_ref().map(|path| {
+            let result = SessionLog::read_history(path).and_then(|messages| {
+                anyhow::ensure!(!messages.is_empty(), "session contains no conversation messages");
+                Ok(messages)
+            });
+            result.map_err(|error| {
+                let message = format!("Cannot resume session from {path}: {error:#}. The original log was not modified. Choose a valid session or omit --resume to start fresh.");
+                if json_mode { println!("{}", json!({"type":"done","status":"error","error":message})); }
+                anyhow::anyhow!(message)
+            })
+        }).transpose()?
+    } else {
+        None
+    };
+
     if log_opt.is_none() {
         if let Some(r) = &resume_opt {
             log_opt = Some(r.clone());
@@ -2197,16 +2215,15 @@ fn main() -> anyhow::Result<()> {
     }
     let mut history = vec![Message::System { text: sys_text }];
 
-    if let Some(res_path) = &resume_opt {
-        match SessionLog::read_history(res_path) {
-            Ok(prev) => {
-                if !json_mode {
-                    println!("Loaded {} previous messages from {}", prev.len(), res_path);
-                }
-                history.extend(prev);
-            }
-            Err(e) => eprintln!("warning: failed to resume from {res_path}: {e:#}"),
+    if let Some(previous) = resumed_history {
+        if !json_mode {
+            println!(
+                "Loaded {} previous messages from {}",
+                previous.len(),
+                resume_opt.as_deref().unwrap_or_default()
+            );
         }
+        history.extend(previous);
     }
 
     if prompt.is_empty() || interactive {

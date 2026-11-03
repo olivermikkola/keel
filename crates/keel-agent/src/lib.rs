@@ -394,6 +394,8 @@ impl SessionLog {
         let file = std::fs::File::open(p)?;
         let mut reader = std::io::BufReader::new(file);
         let mut messages = Vec::new();
+        let mut line_number = 0usize;
+        let mut total_bytes = 0u64;
         loop {
             let mut line = String::new();
             use std::io::Read;
@@ -404,6 +406,11 @@ impl SessionLog {
             if n == 0 {
                 break;
             }
+            line_number += 1;
+            total_bytes += n as u64;
+            if total_bytes > MAX_LOG_FILE_BYTES {
+                anyhow::bail!("session log grew beyond the 64MB limit while reading");
+            }
             if line.len() > MAX_LOG_LINE_BYTES {
                 anyhow::bail!("session log line exceeds maximum allowable size (16MB)");
             }
@@ -411,30 +418,41 @@ impl SessionLog {
             if trimmed.is_empty() {
                 continue;
             }
-            if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
-                let kind = val["kind"].as_str().unwrap_or("");
-                let data = &val["data"];
-                match kind {
-                    "user" => {
-                        if let Some(t) = data["text"].as_str() {
-                            messages.push(Message::User { text: t.into() });
-                        }
+            let val: Value = serde_json::from_str(trimmed).map_err(|_| {
+                anyhow::anyhow!(
+                    "invalid session JSON at line {line_number}; history was not loaded"
+                )
+            })?;
+            let kind = val["kind"].as_str().ok_or_else(|| {
+                anyhow::anyhow!("missing session record kind at line {line_number}")
+            })?;
+            let data = &val["data"];
+            let invalid = || {
+                anyhow::anyhow!(
+                    "invalid {kind} session record at line {line_number}; history was not loaded"
+                )
+            };
+            match kind {
+                "user" => messages.push(Message::User {
+                    text: data["text"].as_str().ok_or_else(invalid)?.into(),
+                }),
+                "assistant" => {
+                    let message =
+                        serde_json::from_value::<Message>(data.clone()).map_err(|_| invalid())?;
+                    if !matches!(message, Message::Assistant { .. }) {
+                        return Err(invalid());
                     }
-                    "assistant" => {
-                        if let Ok(msg) = serde_json::from_value::<Message>(data.clone()) {
-                            messages.push(msg);
-                        }
-                    }
-                    "tool" => {
-                        let id = data["id"].as_str().unwrap_or_default().to_string();
-                        let content = data["content"].as_str().unwrap_or_default().to_string();
-                        messages.push(Message::Tool { id, content });
-                    }
-                    _ => {}
+                    messages.push(message);
                 }
-                if messages.len() >= MAX_LOG_MESSAGES {
-                    break;
-                }
+                "tool" => messages.push(Message::Tool {
+                    id: data["id"].as_str().ok_or_else(invalid)?.into(),
+                    content: data["content"].as_str().ok_or_else(invalid)?.into(),
+                }),
+                // Telemetry and future non-conversation records do not alter history.
+                _ => {}
+            }
+            if messages.len() > MAX_LOG_MESSAGES {
+                anyhow::bail!("session log exceeds {MAX_LOG_MESSAGES} conversation messages; history was not loaded");
             }
         }
         Ok(messages)
@@ -1678,6 +1696,40 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn session_log_rejects_corruption_instead_of_returning_partial_history() {
+        let path =
+            std::env::temp_dir().join(format!("keel-corrupt-log-{}.jsonl", std::process::id()));
+        for bad_record in [
+            "not-json",
+            r#"{"kind":"user","data":{}}"#,
+            r#"{"kind":"assistant","data":{"role":"user","text":"wrong role"}}"#,
+            r#"{"kind":"tool","data":{"content":"missing id"}}"#,
+        ] {
+            let content = format!(
+                "{{\"kind\":\"user\",\"data\":{{\"text\":\"first turn\"}}}}\n{bad_record}\n"
+            );
+            std::fs::write(&path, &content).unwrap();
+            let error = SessionLog::read_history(&path).unwrap_err().to_string();
+            assert!(error.contains("line 2"), "{error}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn session_log_does_not_silently_truncate_at_message_limit() {
+        let path =
+            std::env::temp_dir().join(format!("keel-limit-log-{}.jsonl", std::process::id()));
+        let record = "{\"kind\":\"user\",\"data\":{\"text\":\"turn\"}}\n";
+        std::fs::write(&path, record.repeat(MAX_LOG_MESSAGES + 1)).unwrap();
+        assert!(SessionLog::read_history(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("conversation messages"));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
