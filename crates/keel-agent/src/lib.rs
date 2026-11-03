@@ -72,6 +72,7 @@ pub use symbols::{
     parse_structural_outline, render_outline_markdown, FileOutline, Symbol, SymbolIndex,
     SymbolKind, SymbolPlugin, SymbolSearchResult,
 };
+pub use tools::{BuiltinToolsPlugin, ReadOnlyToolsPlugin};
 pub use tree::{ExplorationTree, NodeStatus, TreeNode, TreePlugin};
 
 use anyhow::Result;

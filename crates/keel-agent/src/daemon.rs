@@ -42,7 +42,7 @@ use anyhow::{Context as _, Result};
 use keel_kernel::{Context, Plugin, Scope};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -718,17 +718,30 @@ pub fn handle_acp_client<R: BufRead>(
     let current_session_id = Arc::new(Mutex::new(default_session_id));
     let mut authenticated = server.auth_token.is_none();
     let mut active_workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
+    const MAX_RPC_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
     loop {
         if server.shutdown_signal.load(Ordering::Relaxed) {
             break;
         }
         let mut line = String::new();
-        let n = match reader.read_line(&mut line) {
+        let n = match reader
+            .by_ref()
+            .take((MAX_RPC_FRAME_BYTES + 1) as u64)
+            .read_line(&mut line)
+        {
             Ok(n) => n,
             Err(_) => break,
         };
         if n == 0 {
+            break;
+        }
+        if line.len() > MAX_RPC_FRAME_BYTES {
+            rpc_writer.send_error(
+                Value::Null,
+                -32000,
+                "JSON-RPC message exceeds maximum allowable frame size (16MB)",
+            );
             break;
         }
         let trimmed = line.trim();

@@ -173,6 +173,12 @@ impl SandboxPolicy {
         let mut paths = Vec::new();
         paths.push(self.workspace.clone());
         paths.push(PathBuf::from("/tmp"));
+        if let Ok(tmpdir) = env::var("TMPDIR") {
+            let p = PathBuf::from(tmpdir);
+            if p.exists() {
+                paths.push(p);
+            }
+        }
         paths.extend(self.extra_write_paths.clone());
 
         // Deduplicate
@@ -304,6 +310,15 @@ impl ToolRegistry {
 
     pub fn list(&self) -> Vec<std::sync::Arc<dyn Tool>> {
         self.tools.lock().unwrap().clone()
+    }
+
+    pub fn names(&self) -> Vec<String> {
+        self.tools
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|t| t.spec().name)
+            .collect()
     }
 }
 
