@@ -29,7 +29,8 @@ use keel_agent::{
     tools::BuiltinToolsPlugin,
     vfs::{TransactionalVfs, VfsMode, VfsPlugin},
     Agent, AllowAll, ApprovalPolicy, Approver, ApproverPlugin, InteractiveApprover, Llm, LlmPlugin,
-    Message, ReadOnly, SessionLog, SessionLogPlugin, ToolResult, ToolStart,
+    Message, PrewarmEngine, PrewarmPlugin, ReadOnly, SentinelPlugin, SessionLog, SessionLogPlugin,
+    StreamingSentinel, StreamingSentinelMode, ToolResult, ToolStart,
 };
 use keel_kernel::{Context, Plugin, Scope};
 use std::io::Write;
@@ -53,6 +54,22 @@ impl Plugin for Printer {
                 eprint!("\x1b[2m{t}\x1b[0m");
                 let _ = std::io::stderr().flush();
             }
+            Chunk::ToolCallDelta {
+                name, args_delta, ..
+            } => {
+                if let Some(n) = name {
+                    if !args_delta.is_empty() {
+                        eprint!("\x1b[36m[{n} typing...]\x1b[0m ");
+                        let _ = std::io::stderr().flush();
+                    }
+                }
+            }
+            Chunk::SentinelVeto { tool_name, reason } => {
+                eprintln!(
+                    "\n\x1b[1;31m[EARLY SECURITY SENTINEL VETO] `{tool_name}`: {reason}\x1b[0m"
+                );
+                let _ = std::io::stderr().flush();
+            }
         });
     }
 }
@@ -73,6 +90,35 @@ impl Plugin for JsonPrinter {
                 println!(
                     "{}",
                     serde_json::json!({ "type": "reasoning", "content": t })
+                );
+                let _ = std::io::stdout().flush();
+            }
+            Chunk::ToolCallDelta {
+                index,
+                id,
+                name,
+                args_delta,
+            } => {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "type": "tool_call_delta",
+                        "index": index,
+                        "id": id,
+                        "name": name,
+                        "args_delta": args_delta,
+                    })
+                );
+                let _ = std::io::stdout().flush();
+            }
+            Chunk::SentinelVeto { tool_name, reason } => {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "type": "sentinel_veto",
+                        "tool_name": tool_name,
+                        "reason": reason,
+                    })
                 );
                 let _ = std::io::stdout().flush();
             }
@@ -120,6 +166,9 @@ fn print_usage() {
   keel memory <cmd>                epistemic belief state (show, add-fact, set-hypothesis, clear)
   keel handoff <cmd>               sovereign cross-harness context distillation (Helm swarm)
   keel oracle <cmd>                test diagnostic oracle & regression sentinel (test, baseline, diff)
+  keel symbols <cmd>               structural symbol index & outline navigator (outline, search, get)
+  keel tree <cmd>                  branching exploration tree DAG (status, fork, switch, backtrack)
+  keel sentinel <cmd>              streaming tool-call interception & early veto sentinel (status, check, rules)
   keel bench [filter] [--runs N]   run benchmark suite
 
 options:
@@ -1114,6 +1163,102 @@ fn cli_vfs(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result<()
     Ok(())
 }
 
+fn cli_sentinel(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result<()> {
+    let json_mode = take_flag(&mut args, "--json");
+    let mode_opt = take_opt(&mut args, "--mode");
+    let tool_opt = take_opt(&mut args, "--tool");
+    let root = match root_opt {
+        Some(r) => std::fs::canonicalize(r)?,
+        None => std::env::current_dir()?,
+    };
+
+    let sentinel_mode = match mode_opt.as_deref() {
+        Some("warn") => StreamingSentinelMode::Warn,
+        Some("disabled") => StreamingSentinelMode::Disabled,
+        _ => StreamingSentinelMode::Strict,
+    };
+    let sentinel = StreamingSentinel::new(sentinel_mode);
+    let prewarm = PrewarmEngine::new(root);
+
+    let subcmd = args.first().map(String::as_str).unwrap_or("status");
+    match subcmd {
+        "status" => {
+            let metrics = serde_json::json!({
+                "sentinel": sentinel.metrics(),
+                "prewarm": prewarm.metrics(),
+            });
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&metrics)?);
+            } else {
+                println!("=== Keel Streaming Sentinel ===");
+                println!("Mode: {:?}", sentinel.mode());
+                println!("Rules active: {}", sentinel.metrics()["rule_count"]);
+                println!("Vetoes recorded: {}", sentinel.metrics()["veto_count"]);
+                println!(
+                    "Prewarm requests: {}",
+                    prewarm.metrics()["prewarm_requests"]
+                );
+                println!("Prewarm cache hits: {}", prewarm.metrics()["cache_hits"]);
+            }
+            Ok(())
+        }
+        "check" => {
+            let cmd = if args.len() > 1 {
+                args[1..].join(" ")
+            } else {
+                eprintln!("Usage: keel sentinel check <command> [--tool <tool>] [--json]");
+                std::process::exit(2);
+            };
+            let tool = tool_opt.as_deref().unwrap_or("bash");
+            let mut fields = std::collections::HashMap::new();
+            if tool == "bash" {
+                fields.insert("command".into(), cmd.clone());
+            } else {
+                fields.insert("path".into(), cmd.clone());
+            }
+            let veto = sentinel.inspect(tool, &fields);
+            if json_mode {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "tool": tool,
+                        "target": cmd,
+                        "vetoed": veto.is_some(),
+                        "veto": veto,
+                    })
+                );
+            } else if let Some(v) = veto {
+                println!("\x1b[1;31m[VETO TRIGGERED]\x1b[0m");
+                println!("  Category: {:?}", v.category);
+                println!("  Pattern: {}", v.matched_pattern);
+                println!("  Reason: {}", v.reason);
+            } else {
+                println!("\x1b[1;32m[ALLOWED]\x1b[0m No sentinel veto triggered for `{cmd}`.");
+            }
+            Ok(())
+        }
+        "rules" => {
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&sentinel.metrics())?);
+            } else {
+                println!("Built-in Sentinel Rules:");
+                println!("  1. Destructive Shell Removal (rm -rf /, mkfs, dd if=/dev, forkbomb)");
+                println!("  2. Force Branch Push (git push --force origin main/master)");
+                println!("  3. Credential Scraping (cat ~/.ssh, /etc/shadow, ~/.aws)");
+                println!("  4. Path Traversal Escapes (../../.., /etc/passwd)");
+                println!("  5. Protected Repository Structures (.git/objects, refs, HEAD)");
+            }
+            Ok(())
+        }
+        other => {
+            eprintln!(
+                "unknown sentinel subcommand `{other}`. Usage: keel sentinel <status|check|rules> ..."
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -1171,6 +1316,10 @@ fn main() -> anyhow::Result<()> {
     if args.first().map(String::as_str) == Some("tree") {
         args.remove(0);
         return cli_tree(args, root_opt);
+    }
+    if args.first().map(String::as_str) == Some("sentinel") {
+        args.remove(0);
+        return cli_sentinel(args, root_opt);
     }
 
     let mut interactive = take_flag(&mut args, "-i") || take_flag(&mut args, "--interactive");
@@ -1243,6 +1392,8 @@ fn main() -> anyhow::Result<()> {
             .ok(),
         model: std::env::var("KEEL_MODEL").unwrap_or_else(|_| "deepseek-chat".into()),
         enable_thinking: std::env::var("KEEL_THINKING").ok().map(|v| v != "0"),
+        sentinel: None,
+        prewarm: None,
     });
     let llm: Arc<dyn Llm> = if let Some(frontier_model) = cascade_model_opt {
         let frontier: Arc<dyn Llm> = Arc::new(OpenAiCompat {
@@ -1253,6 +1404,8 @@ fn main() -> anyhow::Result<()> {
                 .ok(),
             model: frontier_model,
             enable_thinking: Some(true),
+            sentinel: None,
+            prewarm: None,
         });
         Arc::new(CascadeProvider::new(primary_llm, frontier, 2))
     } else {
@@ -1449,6 +1602,8 @@ fn main() -> anyhow::Result<()> {
     });
     let _p_symbols = ctx.mount(&keel_agent::SymbolPlugin { root: root.clone() });
     let _p_tree = ctx.mount(&keel_agent::TreePlugin { root: root.clone() });
+    let _p_sentinel = ctx.mount(&SentinelPlugin(Arc::new(StreamingSentinel::default())));
+    let _p_prewarm = ctx.mount(&PrewarmPlugin(Arc::new(PrewarmEngine::new(root.clone()))));
 
     let mut extra_servers = std::collections::HashMap::new();
     for spec in mcp_server_opts {
@@ -1544,6 +1699,20 @@ fn main() -> anyhow::Result<()> {
                 {
                     let tree = tree_arc.lock().unwrap();
                     print!("{}", tree.render_ascii());
+                }
+                continue;
+            }
+            if trimmed == "/sentinel" {
+                if let Some(sentinel) = ctx.service::<Arc<StreamingSentinel>>() {
+                    let m = sentinel.metrics();
+                    println!(
+                        "Streaming Sentinel: Mode={:?}, Rules={}, Vetoes={}\n",
+                        sentinel.mode(),
+                        m["rule_count"],
+                        m["veto_count"]
+                    );
+                } else {
+                    println!("Streaming Sentinel is not mounted.\n");
                 }
                 continue;
             }

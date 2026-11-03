@@ -331,6 +331,35 @@ impl Plugin for AcpEventStreamer {
                     }),
                 );
             }
+            Chunk::ToolCallDelta {
+                index,
+                id,
+                name,
+                args_delta,
+            } => {
+                b1.send_notification(
+                    "session/update",
+                    json!({
+                        "session_id": sid1,
+                        "type": "tool_call_delta",
+                        "index": index,
+                        "id": id,
+                        "name": name,
+                        "args_delta": args_delta,
+                    }),
+                );
+            }
+            Chunk::SentinelVeto { tool_name, reason } => {
+                b1.send_notification(
+                    "session/update",
+                    json!({
+                        "session_id": sid1,
+                        "type": "sentinel_veto",
+                        "tool_name": tool_name,
+                        "reason": reason,
+                    }),
+                );
+            }
         });
 
         let b2 = self.broadcaster.clone();
@@ -562,6 +591,12 @@ fn create_session(
         ctx.mount(&TreePlugin {
             root: cfg.root.clone(),
         }),
+        ctx.mount(&crate::interceptor::SentinelPlugin(Arc::new(
+            crate::interceptor::StreamingSentinel::default(),
+        ))),
+        ctx.mount(&crate::interceptor::PrewarmPlugin(Arc::new(
+            crate::interceptor::PrewarmEngine::new(cfg.root.clone()),
+        ))),
     ];
 
     let mut sys_text = format!(
@@ -727,6 +762,8 @@ pub fn handle_acp_client<R: BufRead>(
                             "symbolOutline": true,
                             "explorationTree": true,
                             "multiStepBacktracking": true,
+                            "streamingSentinel": true,
+                            "predictivePrewarm": true,
                         }
                     }),
                 );
@@ -1918,6 +1955,139 @@ pub fn handle_acp_client<R: BufRead>(
                     rpc_writer.send_error(id, -32000, "ExplorationTree not mounted");
                 }
             }
+            "sentinel/status" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                if let Some(sentinel) = session
+                    .ctx
+                    .service::<Arc<crate::interceptor::StreamingSentinel>>()
+                {
+                    rpc_writer.send_response(
+                        id,
+                        json!({
+                            "session_id": sid,
+                            "sentinel": sentinel.metrics(),
+                        }),
+                    );
+                } else {
+                    rpc_writer.send_error(id, -32000, "StreamingSentinel not mounted");
+                }
+            }
+            "sentinel/mode" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let mode_str = params
+                    .get("mode")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("strict");
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                if let Some(sentinel) = session
+                    .ctx
+                    .service::<Arc<crate::interceptor::StreamingSentinel>>()
+                {
+                    let mode = match mode_str {
+                        "warn" => crate::interceptor::SentinelMode::Warn,
+                        "disabled" => crate::interceptor::SentinelMode::Disabled,
+                        _ => crate::interceptor::SentinelMode::Strict,
+                    };
+                    sentinel.set_mode(mode);
+                    rpc_writer.send_response(
+                        id,
+                        json!({
+                            "session_id": sid,
+                            "mode": mode,
+                        }),
+                    );
+                } else {
+                    rpc_writer.send_error(id, -32000, "StreamingSentinel not mounted");
+                }
+            }
+            "sentinel/check" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let tool = params
+                    .get("tool")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("bash");
+                let args_val = params.get("args").cloned().unwrap_or_else(|| json!({}));
+                let mut fields = HashMap::new();
+                if let Some(obj) = args_val.as_object() {
+                    for (k, v) in obj {
+                        if let Some(s) = v.as_str() {
+                            fields.insert(k.clone(), s.to_string());
+                        }
+                    }
+                }
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                if let Some(sentinel) = session
+                    .ctx
+                    .service::<Arc<crate::interceptor::StreamingSentinel>>()
+                {
+                    let veto = sentinel.inspect(tool, &fields);
+                    rpc_writer.send_response(
+                        id,
+                        json!({
+                            "session_id": sid,
+                            "vetoed": veto.is_some(),
+                            "veto": veto,
+                        }),
+                    );
+                } else {
+                    rpc_writer.send_error(id, -32000, "StreamingSentinel not mounted");
+                }
+            }
+            "prewarm/status" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                if let Some(prewarm) = session
+                    .ctx
+                    .service::<Arc<crate::interceptor::PrewarmEngine>>()
+                {
+                    rpc_writer.send_response(
+                        id,
+                        json!({
+                            "session_id": sid,
+                            "prewarm": prewarm.metrics(),
+                        }),
+                    );
+                } else {
+                    rpc_writer.send_error(id, -32000, "PrewarmEngine not mounted");
+                }
+            }
             "shutdown" | "exit" => {
                 if !id.is_null() {
                     rpc_writer.send_response(id, json!({ "status": "shutting_down" }));
@@ -2713,6 +2883,76 @@ impl WorkerService {
         let mermaid = graph_res["result"]["mermaid"].as_str().unwrap();
         assert!(mermaid.contains("Port 8000"));
         assert!(mermaid.contains("contradicts"));
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn acp_daemon_streaming_sentinel_and_prewarm_rpc() {
+        let tmp =
+            std::env::temp_dir().join(format!("keel-sentinel-rpc-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let out_buf = Arc::new(Mutex::new(Vec::new()));
+
+        let requests = [
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "sentinel/status", "params": {}}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "sentinel/check", "params": {
+                "tool": "bash",
+                "args": { "command": "rm -rf / --no-preserve-root" }
+            }}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 4, "method": "sentinel/mode", "params": { "mode": "warn" }}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 5, "method": "prewarm/status", "params": {}}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 6, "method": "shutdown", "params": {}}).to_string(),
+        ]
+        .join("\n")
+            + "\n";
+
+        let cfg = DaemonConfig {
+            root: tmp.clone(),
+            policy: ApprovalPolicy::Yolo,
+            landlock_enabled: false,
+            vfs_mode: VfsMode::MaterializedCow,
+            verify_command: None,
+        };
+
+        serve_acp(
+            BufReader::new(std::io::Cursor::new(requests.into_bytes())),
+            Box::new(SharedVecWriter(out_buf.clone())),
+            cfg,
+            Arc::new(DaemonTestLlm),
+        )
+        .unwrap();
+
+        let raw_output = String::from_utf8(out_buf.lock().unwrap().clone()).unwrap();
+        let lines: Vec<Value> = raw_output
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .collect();
+
+        // 1. Verify capability
+        assert!(lines.iter().any(|v| v["id"] == 1
+            && v["result"]["capabilities"]["streamingSentinel"] == true
+            && v["result"]["capabilities"]["predictivePrewarm"] == true));
+
+        // 2. Verify sentinel status
+        let status_res = lines.iter().find(|v| v["id"] == 2).unwrap();
+        assert_eq!(status_res["result"]["sentinel"]["mode"], "strict");
+
+        // 3. Verify check detects destructive veto
+        let check_res = lines.iter().find(|v| v["id"] == 3).unwrap();
+        assert_eq!(check_res["result"]["vetoed"], true);
+        assert_eq!(check_res["result"]["veto"]["matched_pattern"], "rm -rf /");
+
+        // 4. Verify mode change to warn
+        let mode_res = lines.iter().find(|v| v["id"] == 4).unwrap();
+        assert_eq!(mode_res["result"]["mode"], "warn");
+
+        // 5. Verify prewarm metrics
+        let prewarm_res = lines.iter().find(|v| v["id"] == 5).unwrap();
+        assert!(prewarm_res["result"]["prewarm"]["prewarm_requests"].is_number());
 
         let _ = std::fs::remove_dir_all(tmp);
     }

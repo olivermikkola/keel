@@ -12,6 +12,8 @@ pub struct OpenAiCompat {
     pub model: String,
     /// Qwen-style chat-template switch (`enable_thinking`). None = server default.
     pub enable_thinking: Option<bool>,
+    pub sentinel: Option<std::sync::Arc<crate::interceptor::StreamingSentinel>>,
+    pub prewarm: Option<std::sync::Arc<crate::interceptor::PrewarmEngine>>,
 }
 
 impl OpenAiCompat {
@@ -21,7 +23,25 @@ impl OpenAiCompat {
             api_key: Some(api_key),
             model: "deepseek-chat".into(),
             enable_thinking: None,
+            sentinel: None,
+            prewarm: None,
         }
+    }
+
+    pub fn with_sentinel(
+        mut self,
+        sentinel: std::sync::Arc<crate::interceptor::StreamingSentinel>,
+    ) -> Self {
+        self.sentinel = Some(sentinel);
+        self
+    }
+
+    pub fn with_prewarm(
+        mut self,
+        prewarm: std::sync::Arc<crate::interceptor::PrewarmEngine>,
+    ) -> Self {
+        self.prewarm = Some(prewarm);
+        self
     }
 }
 
@@ -70,9 +90,32 @@ pub fn parse_reply(body: &Value) -> Result<Message> {
 pub struct StreamAcc {
     text: String,
     calls: Vec<(String, String, String)>, // (id, name, arguments-json-so-far)
+    parsers: Vec<crate::interceptor::IncrementalArgParser>,
+    sentinel: Option<std::sync::Arc<crate::interceptor::StreamingSentinel>>,
+    prewarm: Option<std::sync::Arc<crate::interceptor::PrewarmEngine>>,
 }
 
 impl StreamAcc {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_sentinel(
+        mut self,
+        sentinel: std::sync::Arc<crate::interceptor::StreamingSentinel>,
+    ) -> Self {
+        self.sentinel = Some(sentinel);
+        self
+    }
+
+    pub fn with_prewarm(
+        mut self,
+        prewarm: std::sync::Arc<crate::interceptor::PrewarmEngine>,
+    ) -> Self {
+        self.prewarm = Some(prewarm);
+        self
+    }
+
     /// Feed one SSE line; returns chunks to show live.
     pub fn feed(&mut self, line: &str) -> Result<Vec<Chunk>> {
         let Some(data) = line.strip_prefix("data:") else {
@@ -98,16 +141,56 @@ impl StreamAcc {
             let i = c["index"].as_u64().unwrap_or(0) as usize;
             while self.calls.len() <= i {
                 self.calls.push(Default::default());
+                self.parsers
+                    .push(crate::interceptor::IncrementalArgParser::new());
             }
             let slot = &mut self.calls[i];
+            let parser = &mut self.parsers[i];
+            let mut id_val = None;
+            let mut name_val = None;
             if let Some(id) = c["id"].as_str() {
                 slot.0 = id.into();
+                id_val = Some(id.to_string());
             }
             if let Some(n) = c["function"]["name"].as_str() {
                 slot.1.push_str(n);
+                name_val = Some(n.to_string());
             }
+            let mut arg_piece = String::new();
             if let Some(a) = c["function"]["arguments"].as_str() {
                 slot.2.push_str(a);
+                arg_piece = a.to_string();
+                parser.feed(a);
+            }
+
+            if id_val.is_some() || name_val.is_some() || !arg_piece.is_empty() {
+                out.push(Chunk::ToolCallDelta {
+                    index: i,
+                    id: id_val,
+                    name: if !slot.1.is_empty() {
+                        Some(slot.1.clone())
+                    } else {
+                        None
+                    },
+                    args_delta: arg_piece,
+                });
+            }
+
+            if let Some(ref sentinel) = self.sentinel {
+                if !slot.1.is_empty() {
+                    if let Some(veto) = sentinel.inspect(&slot.1, parser.fields()) {
+                        out.push(Chunk::SentinelVeto {
+                            tool_name: slot.1.clone(),
+                            reason: veto.reason,
+                        });
+                    }
+                }
+            }
+
+            if let Some(ref prewarm) = self.prewarm {
+                if !slot.1.is_empty() {
+                    prewarm.check_and_prewarm(&slot.1, parser.fields());
+                }
             }
         }
         Ok(out)
@@ -180,6 +263,12 @@ impl Llm for OpenAiCompat {
     ) -> Result<Message> {
         let resp = self.request(messages, tools, true)?;
         let mut acc = StreamAcc::default();
+        if let Some(ref s) = self.sentinel {
+            acc = acc.with_sentinel(s.clone());
+        }
+        if let Some(ref p) = self.prewarm {
+            acc = acc.with_prewarm(p.clone());
+        }
         for line in BufReader::new(resp.into_reader()).lines() {
             for c in acc.feed(&line?)? {
                 sink(c);
@@ -234,5 +323,29 @@ mod tests {
             content: "x".into(),
         }]);
         assert_eq!(w[0]["tool_call_id"], "c1");
+    }
+
+    #[test]
+    fn stream_acc_triggers_streaming_sentinel_veto() {
+        use crate::interceptor::StreamingSentinel;
+        use std::sync::Arc;
+
+        let sentinel = Arc::new(StreamingSentinel::default());
+        let mut acc = StreamAcc::new().with_sentinel(sentinel);
+        let lines = [
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"bash","arguments":"{\"command\":\"echo safe && "}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"rm -rf / --no-preserve-root\"}"}}]}}]}"#,
+            "data: [DONE]",
+        ];
+        let mut chunks = vec![];
+        for l in lines {
+            chunks.extend(acc.feed(l).unwrap());
+        }
+
+        let vetoed = chunks.iter().any(|c| match c {
+            Chunk::SentinelVeto { tool_name, .. } => tool_name == "bash",
+            _ => false,
+        });
+        assert!(vetoed, "Sentinel must emit early veto during streaming");
     }
 }
