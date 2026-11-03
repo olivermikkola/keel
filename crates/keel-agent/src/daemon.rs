@@ -822,6 +822,7 @@ pub fn handle_acp_client<R: BufRead>(
                             "contextBudget": true,
                             "repoMap": true,
                             "pagerankCentrality": true,
+                            "subagentDelegation": true,
                         }
                     }),
                 );
@@ -2117,6 +2118,65 @@ pub fn handle_acp_client<R: BufRead>(
                     );
                 } else {
                     rpc_writer.send_error(id, -32000, "StreamingSentinel not mounted");
+                }
+            }
+            "subagent/run" | "subagent/delegate" => {
+                let prompt = params
+                    .get("prompt")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if prompt.trim().is_empty() {
+                    rpc_writer.send_error(id, -32602, "missing required parameter 'prompt'");
+                    continue;
+                }
+                let role = params
+                    .get("role")
+                    .and_then(|v| v.as_str())
+                    .map(crate::subagent::SubagentRole::from_str_lossy)
+                    .unwrap_or(crate::subagent::SubagentRole::Researcher);
+                let max_steps = params
+                    .get("max_steps")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(8)
+                    .clamp(1, 15) as usize;
+
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let _session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+
+                match crate::subagent::run_subagent(
+                    &server.cfg.root,
+                    server.llm.clone(),
+                    &prompt,
+                    role,
+                    max_steps,
+                    server.cfg.landlock_enabled,
+                ) {
+                    Ok(rep) => {
+                        rpc_writer.send_response(
+                            id,
+                            json!({
+                                "session_id": sid,
+                                "report": rep,
+                            }),
+                        );
+                    }
+                    Err(e) => {
+                        rpc_writer.send_error(
+                            id,
+                            -32000,
+                            &format!("subagent execution failed: {e:#}"),
+                        );
+                    }
                 }
             }
             "prewarm/status" => {
@@ -3801,6 +3861,64 @@ impl WorkerService {
         // Check 4: Ping succeeds once authenticated
         let ok4 = lines.iter().find(|v| v["id"] == 4).unwrap();
         assert_eq!(ok4["result"]["status"], "pong");
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn acp_daemon_subagent_rpc() {
+        let tmp =
+            std::env::temp_dir().join(format!("keel-subagent-rpc-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let script = [
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "subagent/run", "params": {
+                "prompt": "Investigate workspace structure",
+                "role": "navigator",
+                "max_steps": 3
+            }})
+            .to_string(),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": {}}).to_string(),
+        ]
+        .join("\n")
+            + "\n";
+
+        let cfg = DaemonConfig {
+            root: tmp.clone(),
+            policy: ApprovalPolicy::Yolo,
+            landlock_enabled: false,
+            vfs_mode: VfsMode::MaterializedCow,
+            verify_command: None,
+            ..Default::default()
+        };
+
+        let out_buf = Arc::new(Mutex::new(Vec::new()));
+
+        serve_acp(
+            BufReader::new(std::io::Cursor::new(script.into_bytes())),
+            Box::new(SharedVecWriter(out_buf.clone())),
+            cfg,
+            Arc::new(DaemonTestLlm),
+        )
+        .unwrap();
+
+        let raw_output = String::from_utf8(out_buf.lock().unwrap().clone()).unwrap();
+        let lines: Vec<Value> = raw_output
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .collect();
+
+        // 1. Verify capabilities
+        assert!(lines
+            .iter()
+            .any(|v| v["id"] == 1 && v["result"]["capabilities"]["subagentDelegation"] == true));
+
+        // 2. Verify subagent/run
+        let subagent_res = lines.iter().find(|v| v["id"] == 2).unwrap();
+        assert_eq!(subagent_res["result"]["report"]["role"], "navigator");
+        assert_eq!(subagent_res["result"]["report"]["success"], true);
 
         let _ = std::fs::remove_dir_all(tmp);
     }
