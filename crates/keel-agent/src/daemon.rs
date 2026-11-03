@@ -24,6 +24,7 @@ use crate::compaction::{ToolResultPrunerPlugin, WorkspaceContextPlugin, Workspac
 use crate::epistemic::{EpistemicMemoryPlugin, EpistemicStore};
 use crate::guard::RepeatToolReminderPlugin;
 use crate::lsp::LspPlugin;
+use crate::oracle::{DiagnosticOracle, OraclePlugin, SentinelMode};
 use crate::plan::PlanPlugin;
 use crate::sandbox::LandlockPlugin;
 use crate::speculate::SpeculatePlugin;
@@ -547,6 +548,12 @@ fn create_session(
             mode: cfg.vfs_mode,
             persist: cfg.vfs_mode == VfsMode::MaterializedCow,
         }),
+        ctx.mount(&OraclePlugin {
+            root: cfg.root.clone(),
+            test_command: cfg.verify_command.clone(),
+            mode: SentinelMode::Warn,
+            auto_baseline: false,
+        }),
     ];
 
     let mut sys_text = format!(
@@ -705,6 +712,8 @@ pub fn handle_acp_client<R: BufRead>(
                             "persistentDaemon": true,
                             "sessionMultiplexing": true,
                             "swarmHandoff": true,
+                            "diagnosticOracle": true,
+                            "regressionSentinel": true,
                         }
                     }),
                 );
@@ -1324,6 +1333,102 @@ pub fn handle_acp_client<R: BufRead>(
                     Err(e) => {
                         rpc_writer.send_error(id, -32000, &format!("{e:#}"));
                     }
+                }
+            }
+            "oracle/run" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                if let Some(oracle) = session.ctx.service::<Arc<DiagnosticOracle>>() {
+                    match oracle.run_tests() {
+                        Ok(snap) => {
+                            rpc_writer
+                                .send_response(id, json!({ "session_id": sid, "snapshot": snap }));
+                        }
+                        Err(e) => rpc_writer.send_error(id, -32000, &format!("{e:#}")),
+                    }
+                } else {
+                    rpc_writer.send_error(id, -32000, "DiagnosticOracle not mounted");
+                }
+            }
+            "oracle/baseline" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let action = params
+                    .get("action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("capture");
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                if let Some(oracle) = session.ctx.service::<Arc<DiagnosticOracle>>() {
+                    if action == "clear" {
+                        oracle.clear_baseline();
+                        rpc_writer
+                            .send_response(id, json!({ "session_id": sid, "status": "cleared" }));
+                    } else {
+                        match oracle.capture_baseline() {
+                            Ok(snap) => {
+                                rpc_writer.send_response(
+                                    id,
+                                    json!({
+                                        "session_id": sid,
+                                        "status": "captured",
+                                        "baseline": snap
+                                    }),
+                                );
+                            }
+                            Err(e) => rpc_writer.send_error(id, -32000, &format!("{e:#}")),
+                        }
+                    }
+                } else {
+                    rpc_writer.send_error(id, -32000, "DiagnosticOracle not mounted");
+                }
+            }
+            "oracle/diff" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                if let Some(oracle) = session.ctx.service::<Arc<DiagnosticOracle>>() {
+                    match oracle.check_delta() {
+                        Ok(delta) => {
+                            let remediation = delta.render_remediation();
+                            rpc_writer.send_response(
+                                id,
+                                json!({
+                                    "session_id": sid,
+                                    "delta": delta,
+                                    "remediation": remediation,
+                                    "is_clean": delta.is_clean,
+                                }),
+                            );
+                        }
+                        Err(e) => rpc_writer.send_error(id, -32000, &format!("{e:#}")),
+                    }
+                } else {
+                    rpc_writer.send_error(id, -32000, "DiagnosticOracle not mounted");
                 }
             }
             "shutdown" | "exit" => {

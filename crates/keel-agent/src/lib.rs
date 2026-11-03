@@ -19,6 +19,7 @@ pub mod epistemic;
 pub mod guard;
 pub mod lsp;
 pub mod mcp;
+pub mod oracle;
 pub mod patch;
 pub mod plan;
 pub mod provider;
@@ -29,6 +30,10 @@ pub mod swarm;
 pub mod tools;
 pub mod vfs;
 
+pub use oracle::{
+    parse_test_output, DiagnosticOracle, OraclePlugin, RegressionDelta, SentinelMode, TestFailure,
+    TestSnapshot,
+};
 pub use swarm::{export_handoff, ingest_handoff, HandoffEnvelope, HandoffIngestReport};
 
 use anyhow::Result;
