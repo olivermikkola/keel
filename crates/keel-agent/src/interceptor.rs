@@ -222,6 +222,24 @@ impl Default for StreamingSentinel {
     }
 }
 
+/// Helper to match tool names, treating aliases like "bash" and "shell" interchangeably,
+/// and supporting comma-separated lists in rule configurations (e.g. "shell,bash").
+pub fn matches_tool_name(rule_tool: &str, candidate_tool: &str) -> bool {
+    let candidate = candidate_tool.trim().to_lowercase();
+    rule_tool.split(',').any(|t| {
+        let pat = t.trim().to_lowercase();
+        if pat == candidate {
+            return true;
+        }
+        if (pat == "bash" || pat == "shell" || pat == "sh")
+            && (candidate == "bash" || candidate == "shell" || candidate == "sh")
+        {
+            return true;
+        }
+        false
+    })
+}
+
 impl StreamingSentinel {
     /// Create a new Streaming Sentinel with standard defense-in-depth rules.
     pub fn new(mode: SentinelMode) -> Self {
@@ -245,7 +263,7 @@ impl StreamingSentinel {
             id: "destructive-shell-wipe".into(),
             category: VetoCategory::DestructiveCommand,
             description: "Detects destructive recursive root removals and disk writes".into(),
-            tool_match: Some("bash".into()),
+            tool_match: Some("shell,bash".into()),
             parameter_key: "command".into(),
             patterns: vec![
                 "rm -rf /".into(),
@@ -253,6 +271,10 @@ impl StreamingSentinel {
                 "rm -fr /".into(),
                 "rm -rf ~".into(),
                 "rm -rf $HOME".into(),
+                "rm -rf /etc".into(),
+                "rm -rf /usr".into(),
+                "rm -rf /var".into(),
+                "rm -rf /boot".into(),
                 "mkfs".into(),
                 "dd if=/dev/zero".into(),
                 "dd if=/dev/urandom".into(),
@@ -269,7 +291,7 @@ impl StreamingSentinel {
             id: "git-force-push-main".into(),
             category: VetoCategory::ForceBranchPush,
             description: "Detects force push targeting main or master branches".into(),
-            tool_match: Some("bash".into()),
+            tool_match: Some("shell,bash".into()),
             parameter_key: "command".into(),
             patterns: vec![
                 "push --force origin main".into(),
@@ -287,13 +309,16 @@ impl StreamingSentinel {
             category: VetoCategory::CredentialScraping,
             description: "Detects attempts to read SSH keys, system shadow, or cloud credentials"
                 .into(),
-            tool_match: Some("bash".into()),
+            tool_match: Some("shell,bash".into()),
             parameter_key: "command".into(),
             patterns: vec![
                 "cat ~/.ssh/".into(),
                 "cat /etc/shadow".into(),
+                "cat ~/.aws/".into(),
                 "cat ~/.aws/credentials".into(),
                 "cat ~/.config/gh/hosts.yml".into(),
+                ".ssh/id_rsa".into(),
+                ".ssh/id_ed25519".into(),
             ],
         });
 
@@ -306,8 +331,14 @@ impl StreamingSentinel {
             parameter_key: "path".into(),
             patterns: vec![
                 "../../..".into(),
+                "../..".into(),
+                "../".into(),
+                "..\\".into(),
                 "/etc/passwd".into(),
                 "/etc/shadow".into(),
+                "/etc/".into(),
+                "/root/".into(),
+                "~/.ssh".into(),
                 "/proc/".into(),
                 "/sys/".into(),
                 "/dev/".into(),
@@ -363,7 +394,7 @@ impl StreamingSentinel {
 
         for rule in rules.iter() {
             if let Some(ref target_tool) = rule.tool_match {
-                if target_tool != tool_name {
+                if !matches_tool_name(target_tool, tool_name) {
                     continue;
                 }
             }
@@ -585,6 +616,43 @@ mod tests {
             .inspect("bash", parser.fields())
             .expect("must veto");
         assert_eq!(veto.category, VetoCategory::ForceBranchPush);
+    }
+
+    #[test]
+    fn sentinel_intercepts_shell_alias_and_credential_scraping() {
+        let sentinel = StreamingSentinel::default();
+
+        // 1. Verify "shell" tool triggers destructive wipe rule
+        let mut fields = HashMap::new();
+        fields.insert("command".into(), "rm -rf / --no-preserve-root".into());
+        let veto = sentinel
+            .inspect("shell", &fields)
+            .expect("sentinel must match 'shell' tool for bash rules");
+        assert_eq!(veto.category, VetoCategory::DestructiveCommand);
+
+        // 2. Verify "shell" tool triggers git force push rule
+        let mut fields2 = HashMap::new();
+        fields2.insert("command".into(), "git push --force origin main".into());
+        let veto2 = sentinel
+            .inspect("shell", &fields2)
+            .expect("sentinel must catch git force push via 'shell'");
+        assert_eq!(veto2.category, VetoCategory::ForceBranchPush);
+
+        // 3. Verify credential scraping rule on "shell"
+        let mut fields3 = HashMap::new();
+        fields3.insert("command".into(), "cat ~/.ssh/id_rsa".into());
+        let veto3 = sentinel
+            .inspect("shell", &fields3)
+            .expect("sentinel must catch credential scraping via 'shell'");
+        assert_eq!(veto3.category, VetoCategory::CredentialScraping);
+
+        // 4. Verify path traversal escape with "../"
+        let mut fields4 = HashMap::new();
+        fields4.insert("path".into(), "../secret.txt".into());
+        let veto4 = sentinel
+            .inspect("read_file", &fields4)
+            .expect("sentinel must catch relative directory traversal");
+        assert_eq!(veto4.category, VetoCategory::PathTraversal);
     }
 
     #[test]

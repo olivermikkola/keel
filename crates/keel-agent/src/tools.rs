@@ -10,6 +10,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::time::Duration;
 
 const MAX_OUT: usize = 32 * 1024;
 
@@ -25,12 +26,46 @@ pub fn confine(root: &Path, rel: &str) -> Result<PathBuf> {
     {
         bail!("path escapes workspace: {rel}");
     }
+    let canon_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let joined = root.join(p);
-    if let (Ok(canon_root), Ok(canon_target)) = (root.canonicalize(), joined.canonicalize()) {
+
+    // If the path already exists, canonicalize directly and verify prefix.
+    if let Ok(canon_target) = joined.canonicalize() {
         if !canon_target.starts_with(&canon_root) {
             bail!("symlink escapes workspace: {rel}");
         }
+        return Ok(joined);
     }
+
+    // If joined does not exist (e.g. creating a new file before write_file),
+    // traverse component by component to ensure no ancestor directory resolves
+    // through a symlink pointing outside the workspace.
+    let mut current = canon_root.clone();
+    for comp in p.components() {
+        match comp {
+            Component::Normal(c) => {
+                current = current.join(c);
+                if let Ok(meta) = current.symlink_metadata() {
+                    if meta.file_type().is_symlink() {
+                        match current.canonicalize() {
+                            Ok(resolved) => {
+                                if !resolved.starts_with(&canon_root) {
+                                    bail!("symlink escapes workspace: {rel}");
+                                }
+                                current = resolved;
+                            }
+                            Err(_) => {
+                                bail!("broken symlink in path: {rel}");
+                            }
+                        }
+                    }
+                }
+            }
+            Component::CurDir => {}
+            _ => bail!("invalid path component: {rel}"),
+        }
+    }
+
     Ok(joined)
 }
 
@@ -246,9 +281,42 @@ fn walk(p: &Path, root: &Path, pat: &str, hits: &mut Vec<String>) {
     }
 }
 
+/// Returns true if an environment variable name is likely to contain sensitive credentials,
+/// tokens, or secret keys that should not be passed to untrusted child processes.
+pub fn is_sensitive_env_var(k: &str) -> bool {
+    let u = k.to_uppercase();
+    // Allow non-sensitive CI and build metadata
+    if u == "GITHUB_ACTIONS"
+        || u == "GITHUB_REPOSITORY"
+        || u == "GITHUB_REF"
+        || u == "GITHUB_SHA"
+        || u == "GITHUB_RUN_ID"
+        || u == "GITHUB_WORKFLOW"
+        || u == "GITHUB_JOB"
+    {
+        return false;
+    }
+    u.ends_with("_API_KEY")
+        || u.ends_with("_TOKEN")
+        || u.ends_with("_SECRET")
+        || u.contains("API_KEY")
+        || u.contains("SECRET_ACCESS_KEY")
+        || u.contains("ACCESS_TOKEN")
+        || u.contains("PRIVATE_KEY")
+        || u.contains("AUTH_TOKEN")
+        || u == "GITHUB_TOKEN"
+        || u == "GH_TOKEN"
+        || u.starts_with("AWS_SECRET")
+        || u.starts_with("AWS_SESSION")
+        || u.starts_with("AWS_SECURITY")
+        || u.starts_with("SSH_AUTH")
+        || u == "DATABASE_URL"
+}
+
 pub struct Shell {
     pub root: PathBuf,
     pub sandbox: SandboxPolicy,
+    pub timeout: Duration,
 }
 
 impl Shell {
@@ -256,7 +324,13 @@ impl Shell {
         Self {
             sandbox: SandboxPolicy::new(root.clone(), true),
             root,
+            timeout: Duration::from_secs(120),
         }
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 }
 
@@ -266,7 +340,14 @@ impl Tool for Shell {
             name: "shell".into(),
             description: "Run a shell command in the workspace; returns exit code, stdout, stderr."
                 .into(),
-            parameters: json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" },
+                    "timeout_secs": { "type": "integer", "description": "Optional timeout in seconds (default: 120)" }
+                },
+                "required": ["command"]
+            }),
         }
     }
     fn mutating(&self) -> bool {
@@ -278,7 +359,17 @@ impl Tool for Shell {
         cmd.arg("-c")
             .arg(arg(a, "command")?)
             .current_dir(&self.root)
-            .stdin(Stdio::null());
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        // Scrub sensitive environment variables to prevent credential exfiltration
+        for (k, _) in std::env::vars() {
+            if is_sensitive_env_var(&k) {
+                cmd.env_remove(&k);
+            }
+        }
+
         unsafe {
             cmd.pre_exec(move || {
                 policy
@@ -286,12 +377,58 @@ impl Tool for Shell {
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))
             });
         }
-        let out = cmd.output()?;
+
+        let timeout = a
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .map(Duration::from_secs)
+            .unwrap_or(self.timeout);
+
+        let mut child = cmd.spawn()?;
+        let mut stdout_pipe = child.stdout.take();
+        let mut stderr_pipe = child.stderr.take();
+
+        let stdout_thread = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = stdout_pipe.take() {
+                let _ = std::io::Read::read_to_end(&mut pipe, &mut buf);
+            }
+            buf
+        });
+
+        let stderr_thread = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = stderr_pipe.take() {
+                let _ = std::io::Read::read_to_end(&mut pipe, &mut buf);
+            }
+            buf
+        });
+
+        let start = std::time::Instant::now();
+        let status = loop {
+            match child.try_wait()? {
+                Some(st) => break st,
+                None => {
+                    if start.elapsed() > timeout {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let _ = stdout_thread.join();
+                        let _ = stderr_thread.join();
+                        bail!("command timed out after {}s", timeout.as_secs());
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        };
+
+        let stdout_bytes = stdout_thread.join().unwrap_or_default();
+        let stderr_bytes = stderr_thread.join().unwrap_or_default();
+
         Ok(truncate(format!(
             "exit: {}\nstdout:\n{}\nstderr:\n{}",
-            out.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
+            status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&stdout_bytes),
+            String::from_utf8_lossy(&stderr_bytes)
         )))
     }
 }
@@ -340,6 +477,7 @@ impl Plugin for BuiltinToolsPlugin {
         reg.register(Arc::new(Shell {
             root: r.clone(),
             sandbox: sandbox_policy,
+            timeout: Duration::from_secs(120),
         }));
         scope.provide(reg);
     }
@@ -453,5 +591,90 @@ mod tests {
             .contains("count + 1"));
 
         let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn confine_detects_symlink_traversal_on_nonexistent_target() {
+        let tmp = std::env::temp_dir().join(format!("keel-sym-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let ws = tmp.join("ws");
+        let outside = tmp.join("outside");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        // Create a symlink ws/sym_outside -> outside
+        std::os::unix::fs::symlink(&outside, ws.join("sym_outside")).unwrap();
+
+        // Target ws/sym_outside/new_file.txt does NOT exist yet.
+        // Old buggy confine would pass because joined.canonicalize() returned Err(NotFound).
+        // Hardened confine must detect that sym_outside points outside workspace!
+        let err = confine(&ws, "sym_outside/new_file.txt");
+        assert!(
+            err.is_err(),
+            "should reject symlink directory traversal to outside workspace"
+        );
+        let msg = format!("{:#}", err.unwrap_err());
+        assert!(msg.contains("escapes workspace") || msg.contains("symlink"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn confine_rejects_broken_symlinks() {
+        let tmp = std::env::temp_dir().join(format!("keel-broken-sym-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Create a broken symlink pointing to a non-existent path
+        std::os::unix::fs::symlink(tmp.join("does_not_exist"), tmp.join("broken")).unwrap();
+
+        let err = confine(&tmp, "broken");
+        assert!(err.is_err(), "broken symlinks must be rejected");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn shell_scrubs_sensitive_environment_variables() {
+        let ws = std::env::temp_dir().join(format!("keel-env-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+
+        std::env::set_var("TEST_SECRET_API_KEY", "super_secret_token_123");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "super_secret_aws_456");
+
+        let sh = Shell::new(ws.clone());
+        let out = sh
+            .run(&json!({
+                "command": "echo key=$TEST_SECRET_API_KEY aws=$AWS_SECRET_ACCESS_KEY"
+            }))
+            .unwrap();
+
+        assert!(!out.contains("super_secret_token_123"));
+        assert!(!out.contains("super_secret_aws_456"));
+        assert!(out.contains("key= aws="));
+
+        std::env::remove_var("TEST_SECRET_API_KEY");
+        std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn shell_enforces_execution_timeout() {
+        let ws = std::env::temp_dir().join(format!("keel-timeout-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+
+        let sh = Shell::new(ws.clone()).with_timeout(Duration::from_millis(500));
+        let err = sh.run(&json!({
+            "command": "sleep 10",
+            "timeout_secs": 1
+        }));
+
+        assert!(err.is_err());
+        let msg = format!("{:#}", err.unwrap_err());
+        assert!(msg.contains("timed out"));
+
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

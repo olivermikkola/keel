@@ -759,7 +759,10 @@ pub fn handle_acp_client<R: BufRead>(
                         .and_then(|v| v.as_str())
                 });
             if let Some(expected) = &server.auth_token {
-                if provided_token == Some(expected.as_str()) {
+                if provided_token
+                    .map(|p| constant_time_eq(p, expected))
+                    .unwrap_or(false)
+                {
                     authenticated = true;
                 } else if method == "initialize" || method == "auth" || method == "authenticate" {
                     rpc_writer.send_error(
@@ -2567,6 +2570,20 @@ pub fn handle_acp_client<R: BufRead>(
     Ok(())
 }
 
+/// Constant-time string equality check to mitigate timing side-channel attacks on bearer tokens.
+pub fn constant_time_eq(a: &str, b: &str) -> bool {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    if a_bytes.len() != b_bytes.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a_bytes.iter().zip(b_bytes.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// Run bidirectional ACP JSON-RPC 2.0 daemon over `reader` and `writer` (stdio mode).
 pub fn serve_acp<R: BufRead>(
     reader: R,
@@ -3720,6 +3737,70 @@ impl WorkerService {
         // 3. Verify repomap/graph
         let graph_res = lines.iter().find(|v| v["id"] == 3).unwrap();
         assert!(graph_res["result"]["nodeCount"].as_u64().unwrap() >= 2);
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn acp_daemon_bearer_auth_enforcement() {
+        let tmp = std::env::temp_dir().join(format!("keel-auth-rpc-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // 1. Unauthenticated request without token should fail
+        // 2. Request with invalid token should fail
+        // 3. Request with valid token should succeed
+        let script = [
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": {"token": "wrong_token"}}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "initialize", "params": {"token": "secret_pass_123"}}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 4, "method": "ping", "params": {}}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 5, "method": "shutdown", "params": {}}).to_string(),
+        ]
+        .join("\n")
+            + "\n";
+
+        let cfg = DaemonConfig {
+            root: tmp.clone(),
+            policy: ApprovalPolicy::Yolo,
+            landlock_enabled: false,
+            vfs_mode: VfsMode::MaterializedCow,
+            verify_command: None,
+            ..Default::default()
+        };
+
+        let out_buf = Arc::new(Mutex::new(Vec::new()));
+
+        serve_acp_with_auth(
+            BufReader::new(std::io::Cursor::new(script.into_bytes())),
+            Box::new(SharedVecWriter(out_buf.clone())),
+            cfg,
+            Arc::new(DaemonTestLlm),
+            Some("secret_pass_123".into()),
+        )
+        .unwrap();
+
+        let raw_output = String::from_utf8(out_buf.lock().unwrap().clone()).unwrap();
+        let lines: Vec<Value> = raw_output
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .collect();
+
+        // Check 1: Missing token gets -32001 error
+        let err1 = lines.iter().find(|v| v["id"] == 1).unwrap();
+        assert_eq!(err1["error"]["code"], -32001);
+
+        // Check 2: Invalid token gets -32001 error
+        let err2 = lines.iter().find(|v| v["id"] == 2).unwrap();
+        assert_eq!(err2["error"]["code"], -32001);
+
+        // Check 3: Valid token succeeds
+        let ok3 = lines.iter().find(|v| v["id"] == 3).unwrap();
+        assert_eq!(ok3["result"]["serverInfo"]["name"], "keel-acp-daemon");
+
+        // Check 4: Ping succeeds once authenticated
+        let ok4 = lines.iter().find(|v| v["id"] == 4).unwrap();
+        assert_eq!(ok4["result"]["status"], "pong");
 
         let _ = std::fs::remove_dir_all(tmp);
     }
