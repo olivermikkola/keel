@@ -552,7 +552,7 @@ impl AdaptiveCompactor {
             head_end = 1;
         }
 
-        // 2. Identify Tail boundary (last `keep_recent_turns` user interaction turns)
+        // 2. Identify Tail boundary (last `keep_recent_turns` interaction turns)
         let mut tail_start = history.len();
         let mut user_turns_seen = 0;
         for i in (head_end..history.len()).rev() {
@@ -565,10 +565,30 @@ impl AdaptiveCompactor {
             }
         }
 
-        // Fallback: if not enough User messages, keep last (keep_recent_turns * 3) messages
+        // Fallback: if not enough User messages (e.g. autonomous agent running multi-step loops),
+        // keep the most recent `keep_recent_turns` Assistant steps.
         if user_turns_seen < self.budget.keep_recent_turns {
-            let keep_msg_count = self.budget.keep_recent_turns.saturating_mul(3);
-            tail_start = history.len().saturating_sub(keep_msg_count).max(head_end);
+            let mut assistant_steps_seen = 0;
+            for i in (head_end..history.len()).rev() {
+                if matches!(history[i], Message::Assistant { .. }) {
+                    assistant_steps_seen += 1;
+                    if assistant_steps_seen >= self.budget.keep_recent_turns {
+                        tail_start = i;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Critical safety invariant: Snap tail_start so we NEVER split an Assistant from its Tool responses!
+        // If tail_start points to a Message::Tool, walk backwards to the Message::Assistant that invoked it.
+        while tail_start > head_end && matches!(history[tail_start], Message::Tool { .. }) {
+            tail_start -= 1;
+        }
+
+        // Ensure head_end does not cut across tool results
+        while head_end < history.len() && matches!(history[head_end], Message::Tool { .. }) {
+            head_end += 1;
         }
 
         // If there are no intermediate messages to compact, return None
@@ -869,5 +889,64 @@ mod tests {
         assert!(est >= 11);
 
         let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn middle_out_compaction_autonomous_loop_never_slices_tool_results() {
+        let budget = ContextBudget {
+            max_context_tokens: 1000,
+            compaction_threshold_tokens: 100,
+            target_tokens: 50,
+            keep_recent_turns: 3,
+            chars_per_token: 4.0,
+        };
+
+        let compactor = AdaptiveCompactor::with_default_summarizer(budget);
+
+        let mut history = vec![
+            Message::System { text: "sys".into() },
+            Message::User {
+                text: "autonomous goal with no further user turns".into(),
+            },
+        ];
+        for i in 1..=8 {
+            history.push(Message::Assistant {
+                text: format!("step {i}"),
+                tool_calls: vec![ToolCall {
+                    id: format!("call_{i}"),
+                    name: "tool".into(),
+                    args: serde_json::json!({ "i": i }),
+                }],
+            });
+            history.push(Message::Tool {
+                id: format!("call_{i}"),
+                content: format!("result {i}").repeat(20),
+            });
+        }
+
+        assert!(compactor.should_compact(&history));
+        let rep = compactor.compact_history(&mut history).expect("compacts");
+        assert!(rep.compacted_messages_count > 0);
+
+        // Invariant: No Message::Tool is ever orphaned or immediately preceded by Message::User
+        for (idx, msg) in history.iter().enumerate() {
+            if let Message::Tool { id, .. } = msg {
+                assert!(idx > 0, "Tool message at index 0");
+                match &history[idx - 1] {
+                    Message::Assistant { tool_calls, .. } => {
+                        assert!(
+                            tool_calls.iter().any(|tc| tc.id == *id),
+                            "Tool message {id} at index {idx} does not match preceding Assistant"
+                        );
+                    }
+                    Message::Tool { .. } => {}
+                    other => {
+                        panic!(
+                            "Tool message {id} at index {idx} immediately preceded by non-assistant: {other:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

@@ -46,24 +46,98 @@ impl OpenAiCompat {
 }
 
 pub fn messages_to_wire(messages: &[Message]) -> Vec<Value> {
-    messages
-        .iter()
-        .map(|m| match m {
-            Message::System { text } => json!({"role":"system","content":text}),
-            Message::User { text } => json!({"role":"user","content":text}),
+    let mut out: Vec<Value> = Vec::with_capacity(messages.len());
+    let mut pending_tool_calls: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+
+    for m in messages {
+        match m {
+            Message::System { text } => {
+                for tid in std::mem::take(&mut pending_tool_calls) {
+                    out.push(
+                        json!({"role": "tool", "tool_call_id": tid, "content": "[interrupted or omitted]"}),
+                    );
+                }
+                out.push(json!({"role":"system","content":text}));
+            }
+            Message::User { text } => {
+                for tid in std::mem::take(&mut pending_tool_calls) {
+                    out.push(
+                        json!({"role": "tool", "tool_call_id": tid, "content": "[interrupted or omitted]"}),
+                    );
+                }
+                // Merge consecutive User messages into a single message for strict providers (Anthropic Claude, etc.)
+                if let Some(last) = out.last_mut() {
+                    if last["role"] == "user" {
+                        if let Some(prev) = last["content"].as_str() {
+                            let merged = format!("{prev}\n\n{text}");
+                            last["content"] = Value::String(merged);
+                            continue;
+                        }
+                    }
+                }
+                out.push(json!({"role":"user","content":text}));
+            }
             Message::Assistant { text, tool_calls } => {
-                let mut v = json!({"role":"assistant","content":text});
+                for tid in std::mem::take(&mut pending_tool_calls) {
+                    out.push(
+                        json!({"role": "tool", "tool_call_id": tid, "content": "[interrupted or omitted]"}),
+                    );
+                }
+                let mut v = json!({
+                    "role": "assistant",
+                    "content": if text.is_empty() && tool_calls.is_empty() {
+                        Value::String("...".into())
+                    } else {
+                        Value::String(text.clone())
+                    }
+                });
                 if !tool_calls.is_empty() {
+                    for tc in tool_calls {
+                        pending_tool_calls.insert(tc.id.clone());
+                    }
                     v["tool_calls"] = tool_calls
                         .iter()
-                        .map(|c| json!({"id":c.id,"type":"function","function":{"name":c.name,"arguments":c.args.to_string()}}))
+                        .map(|c| {
+                            json!({"id":c.id,"type":"function","function":{"name":c.name,"arguments":c.args.to_string()}})
+                        })
                         .collect();
                 }
-                v
+                out.push(v);
             }
-            Message::Tool { id, content } => json!({"role":"tool","tool_call_id":id,"content":content}),
-        })
-        .collect()
+            Message::Tool { id, content } => {
+                pending_tool_calls.remove(id);
+                // In chat APIs, `tool` role can only immediately follow an assistant message with tool_calls.
+                // If it directly follows a user or system message, convert to safe user context to avoid 400.
+                let preceding_role = out.last().and_then(|v| v["role"].as_str());
+                if matches!(preceding_role, Some("user") | Some("system")) {
+                    if let Some(last) = out.last_mut() {
+                        if last["role"] == "user" {
+                            if let Some(prev) = last["content"].as_str() {
+                                let note = format!("{prev}\n\n[Tool result for {id}]: {content}");
+                                last["content"] = Value::String(note);
+                                continue;
+                            }
+                        }
+                    }
+                    out.push(
+                        json!({"role": "user", "content": format!("[Tool result for {id}]: {content}")}),
+                    );
+                } else {
+                    out.push(json!({"role":"tool","tool_call_id":id,"content":content}));
+                }
+            }
+        }
+    }
+
+    // Close any trailing unanswered tool calls so the provider schema is satisfied
+    for tid in pending_tool_calls {
+        out.push(
+            json!({"role": "tool", "tool_call_id": tid, "content": "[interrupted or omitted]"}),
+        );
+    }
+
+    out
 }
 
 /// Strips `<think>...</think>` or `<thought>...</thought>` tags and enclosed reasoning from text.
@@ -599,5 +673,72 @@ mod tests {
             strip_think_tags("No think tags here."),
             "No think tags here."
         );
+    }
+
+    #[test]
+    fn messages_to_wire_sanitizes_consecutive_user_and_interrupted_tools() {
+        let msgs = vec![
+            Message::User {
+                text: "first prompt".into(),
+            },
+            Message::User {
+                text: "second prompt".into(),
+            },
+            Message::Assistant {
+                text: "calling tools".into(),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "call_a".into(),
+                        name: "tool_a".into(),
+                        args: json!({}),
+                    },
+                    ToolCall {
+                        id: "call_b".into(),
+                        name: "tool_b".into(),
+                        args: json!({}),
+                    },
+                ],
+            },
+            Message::Tool {
+                id: "call_a".into(),
+                content: "res_a".into(),
+            },
+            // call_b was not answered before the next User message!
+            Message::User {
+                text: "interruption".into(),
+            },
+            // Orphaned tool after user
+            Message::Tool {
+                id: "orphan".into(),
+                content: "orphan_res".into(),
+            },
+        ];
+
+        let wire = messages_to_wire(&msgs);
+
+        // 1. First two user messages merged
+        assert_eq!(wire[0]["role"], "user");
+        assert_eq!(wire[0]["content"], "first prompt\n\nsecond prompt");
+
+        // 2. Assistant message
+        assert_eq!(wire[1]["role"], "assistant");
+
+        // 3. Tool response for call_a
+        assert_eq!(wire[2]["role"], "tool");
+        assert_eq!(wire[2]["tool_call_id"], "call_a");
+
+        // 4. Synthesized tool response for call_b before user
+        assert_eq!(wire[3]["role"], "tool");
+        assert_eq!(wire[3]["tool_call_id"], "call_b");
+        assert!(wire[3]["content"].as_str().unwrap().contains("interrupted"));
+
+        // 5. User message with folded orphan tool output
+        assert_eq!(wire[4]["role"], "user");
+        let user_content = wire[4]["content"].as_str().unwrap();
+        assert!(user_content.contains("interruption"));
+        assert!(user_content.contains("[Tool result for orphan]: orphan_res"));
+
+        // No illegal tool role following user or orphan remaining
+        assert_eq!(wire.len(), 5);
     }
 }
