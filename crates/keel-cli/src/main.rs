@@ -18,7 +18,7 @@ use keel_agent::{
     compaction::{ToolResultPrunerPlugin, WorkspaceContextPlugin, WorkspaceInstructions},
     daemon::DaemonConfig,
     epistemic::{EpistemicMemoryPlugin, EpistemicStore},
-    guard::RepeatToolReminderPlugin,
+    guard::{EnvironmentCircuitBreakerPlugin, RepeatToolReminderPlugin},
     lsp::{LspPlugin, LspService},
     mcp::{McpClient, McpPlugin, McpServerConfig},
     plan::PlanPlugin,
@@ -46,12 +46,24 @@ impl Plugin for Printer {
         "printer"
     }
     fn apply(&self, s: &mut Scope) {
-        s.on::<Chunk, _>(|c| match c {
+        let last_tool = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let lt = last_tool.clone();
+        s.on::<Chunk, _>(move |c| match c {
             Chunk::Text(t) => {
+                let mut guard = lt.lock().unwrap();
+                if guard.is_some() {
+                    eprintln!();
+                    *guard = None;
+                }
                 print!("{t}");
                 let _ = std::io::stdout().flush();
             }
             Chunk::Reasoning(t) => {
+                let mut guard = lt.lock().unwrap();
+                if guard.is_some() {
+                    eprintln!();
+                    *guard = None;
+                }
                 eprint!("\x1b[2m{t}\x1b[0m");
                 let _ = std::io::stderr().flush();
             }
@@ -59,13 +71,19 @@ impl Plugin for Printer {
                 name, args_delta, ..
             } => {
                 if let Some(n) = name {
-                    if !args_delta.is_empty() {
-                        eprint!("\x1b[36m[{n} typing...]\x1b[0m ");
+                    let mut guard = lt.lock().unwrap();
+                    if guard.as_deref() != Some(n) {
+                        eprint!("\x1b[36m[{n}]\x1b[0m ");
                         let _ = std::io::stderr().flush();
+                        *guard = Some(n.to_string());
                     }
+                } else if !args_delta.is_empty() {
+                    // Argument tokens streaming for active tool call
                 }
             }
             Chunk::SentinelVeto { tool_name, reason } => {
+                let mut guard = lt.lock().unwrap();
+                *guard = None;
                 eprintln!(
                     "\n\x1b[1;31m[EARLY SECURITY SENTINEL VETO] `{tool_name}`: {reason}\x1b[0m"
                 );
@@ -1499,6 +1517,17 @@ fn main() -> anyhow::Result<()> {
     let shadow_vfs = take_flag(&mut args, "--shadow");
     let safety_mode_opt = take_opt(&mut args, "--safety-mode");
     let no_sandbox = take_flag(&mut args, "--no-sandbox");
+    let sandbox_allow_read: Vec<std::path::PathBuf> =
+        take_all_opts(&mut args, "--sandbox-allow-read")
+            .into_iter()
+            .map(std::path::PathBuf::from)
+            .collect();
+    let sandbox_allow_write: Vec<std::path::PathBuf> =
+        take_all_opts(&mut args, "--sandbox-allow-write")
+            .into_iter()
+            .map(std::path::PathBuf::from)
+            .collect();
+    let no_toolchains = take_flag(&mut args, "--no-toolchains");
     let dump_config = take_flag(&mut args, "--dump-config");
     let json_mode = take_flag(&mut args, "--json");
     let auto_rollback = take_flag(&mut args, "--auto-rollback");
@@ -1629,6 +1658,9 @@ fn main() -> anyhow::Result<()> {
                 VfsMode::MaterializedCow
             },
             verify_command: verify_cmd,
+            sandbox_allow_read,
+            sandbox_allow_write,
+            discover_toolchains: !no_toolchains,
         };
         if let Some(addr) = listen_opt {
             return keel_agent::daemon::serve_acp_tcp(&addr, cfg, llm, auth_token_opt);
@@ -1714,12 +1746,16 @@ fn main() -> anyhow::Result<()> {
     let _p_landlock = ctx.mount(&LandlockPlugin {
         workspace: root.clone(),
         enabled: !no_sandbox,
+        extra_read_paths: sandbox_allow_read,
+        extra_write_paths: sandbox_allow_write,
+        discover_toolchains: !no_toolchains,
     });
     let _p_tools = ctx.mount(&BuiltinToolsPlugin {
         root: root.clone(),
         landlock_enabled: !no_sandbox,
     });
     let _p_guard = ctx.mount(&RepeatToolReminderPlugin::default());
+    let _p_breaker = ctx.mount(&EnvironmentCircuitBreakerPlugin::default());
     let _p_pruner = ctx.mount(&ToolResultPrunerPlugin::default());
     let _p_ws = ctx.mount(&WorkspaceContextPlugin { root: root.clone() });
     let _p_plan = ctx.mount(&PlanPlugin {

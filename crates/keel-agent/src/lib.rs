@@ -38,6 +38,10 @@ pub use epistemic::{
     ContradictionAlert, EpistemicGraphLinkTool, EpistemicMemoryPlugin, EpistemicState,
     EpistemicStore, FactCategory, FactNode, GraphEdge, RelationType,
 };
+pub use guard::{
+    CircuitBreakerTrip, EnvironmentCircuitBreaker, EnvironmentCircuitBreakerPlugin,
+    EnvironmentErrorType, RepeatToolGuard, RepeatToolReminderPlugin,
+};
 pub use interceptor::{
     IncrementalArgParser, PrewarmEngine, PrewarmPlugin, SentinelMode as StreamingSentinelMode,
     SentinelPlugin, SentinelRule, StreamingSentinel, VetoCategory, VetoEvent,
@@ -49,6 +53,9 @@ pub use oracle::{
 pub use recorder::{
     FlightRecorder, FlightRecorderPlugin, ForkReport, RecordFrame, RecordedSession,
     RecordingSummary, ReplayEngine, ReplayEnginePlugin, RestoreReport, StepInspection,
+};
+pub use sandbox::{
+    LandlockPlugin, SandboxPolicy, COMMON_TOOLCHAIN_ROOTS, DEFAULT_DEVICE_NODES, TOOLCHAIN_ENV_VARS,
 };
 pub use swarm::{export_handoff, ingest_handoff, HandoffEnvelope, HandoffIngestReport};
 pub use symbols::{
@@ -715,6 +722,11 @@ impl Agent<'_> {
                 if let Some(guard) = self.ctx.service::<guard::RepeatToolGuard>() {
                     if let Some(reminder) = guard.observe(call) {
                         out.push_str(&reminder);
+                    }
+                }
+                if let Some(breaker) = self.ctx.service::<guard::EnvironmentCircuitBreaker>() {
+                    if let Some(trip) = breaker.observe(&call.name, &out) {
+                        out.push_str(&breaker.format_advisory(&trip));
                     }
                 }
                 self.log

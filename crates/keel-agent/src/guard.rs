@@ -3,11 +3,16 @@
 //! Detects when an agent repeats the exact same tool call with identical canonical JSON arguments
 //! across consecutive invocations (at configurable thresholds, default `[2, 4, 7]`) and appends
 //! an escalating advisory reminder to the tool output so smaller models break out of stuck loops.
+//!
+//! Also provides [`EnvironmentCircuitBreaker`], which detects consecutive environment-level
+//! execution failures (Permission Denied, Command Not Found, Landlock confinement) and injects
+//! high-priority advisories before models burn their turn budgets.
 
 use crate::ToolCall;
 use keel_kernel::{Plugin, Scope};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::{Arc, Mutex};
 
 const GENTLE_REMINDER: &str = "\n\n[repeat-tool-reminder] You are repeating the exact same tool call with identical arguments. Carefully analyze the previous result before calling again: if the task is not complete, try a different approach or different arguments instead of repeating the call.";
@@ -128,6 +133,226 @@ impl Plugin for RepeatToolReminderPlugin {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Environment Circuit Breaker
+// ---------------------------------------------------------------------------
+
+/// Categorization of environment-level execution failures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvironmentErrorType {
+    /// Exit code 126 or output indicates a permission issue.
+    PermissionDenied,
+    /// Exit code 127 or output indicates a missing command/file.
+    CommandNotFound,
+    /// Output references sandboxing mechanisms (Landlock, seccomp, etc.).
+    SandboxConfinement,
+    /// Unclassified error with captured detail.
+    Other(String),
+}
+
+impl fmt::Display for EnvironmentErrorType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PermissionDenied => write!(f, "Permission denied"),
+            Self::CommandNotFound => write!(f, "Command not found"),
+            Self::SandboxConfinement => write!(f, "Sandbox confinement"),
+            Self::Other(s) => write!(f, "{s}"),
+        }
+    }
+}
+
+/// Fired when the circuit breaker trips after repeated environmental failures.
+#[derive(Debug, Clone)]
+pub struct CircuitBreakerTrip {
+    pub consecutive_failures: usize,
+    pub error_type: EnvironmentErrorType,
+    pub diagnostic_message: String,
+    pub remedy_suggestion: String,
+}
+
+#[derive(Default)]
+struct BreakerState {
+    consecutive_failures: usize,
+    last_error_type: Option<EnvironmentErrorType>,
+}
+
+/// Tracks consecutive environment-level shell command failures and trips
+/// when a configurable threshold is reached.
+///
+/// Resets the counter on any successful (exit code 0) command execution.
+#[derive(Clone)]
+pub struct EnvironmentCircuitBreaker {
+    trip_threshold: usize,
+    state: Arc<Mutex<BreakerState>>,
+}
+
+impl Default for EnvironmentCircuitBreaker {
+    fn default() -> Self {
+        Self::new(3)
+    }
+}
+
+impl EnvironmentCircuitBreaker {
+    /// Creates a new circuit breaker that trips after `trip_threshold` consecutive environmental failures.
+    pub fn new(trip_threshold: usize) -> Self {
+        assert!(trip_threshold > 0, "trip_threshold must be at least 1");
+        Self {
+            trip_threshold,
+            state: Arc::new(Mutex::new(BreakerState::default())),
+        }
+    }
+
+    pub fn reset(&self) {
+        let mut s = self.state.lock().unwrap();
+        s.consecutive_failures = 0;
+        s.last_error_type = None;
+    }
+
+    /// Extract exit code from tool output if present (e.g. "exit: 0" or "exit: 126").
+    pub fn parse_exit_code(output: &str) -> Option<i32> {
+        for line in output.lines() {
+            if let Some(rest) = line.strip_prefix("exit:") {
+                if let Ok(code) = rest.trim().parse::<i32>() {
+                    return Some(code);
+                }
+            }
+        }
+        None
+    }
+
+    /// Classifies an error from a tool execution into an [`EnvironmentErrorType`].
+    pub fn classify_error(output: &str, exit_code: Option<i32>) -> Option<EnvironmentErrorType> {
+        let lower = output.to_lowercase();
+        // Sandbox confinement is checked first — most specific to Keel
+        if lower.contains("landlock") || lower.contains("sandbox") || lower.contains("seccomp") {
+            return Some(EnvironmentErrorType::SandboxConfinement);
+        }
+
+        // Permission denied: exit code 126 or matching output strings
+        if exit_code == Some(126)
+            || output.contains("Permission denied")
+            || output.contains("Operation not permitted")
+            || output.contains("Read-only file system")
+        {
+            return Some(EnvironmentErrorType::PermissionDenied);
+        }
+
+        // Command not found: exit code 127 or matching output strings
+        if exit_code == Some(127)
+            || lower.contains("command not found")
+            || output.contains("No such file or directory")
+        {
+            return Some(EnvironmentErrorType::CommandNotFound);
+        }
+
+        if let Some(code) = exit_code {
+            if code != 0 {
+                return Some(EnvironmentErrorType::Other(format!("exit code {code}")));
+            }
+        }
+
+        None
+    }
+
+    /// Observes the result of a tool execution and returns a [`CircuitBreakerTrip`] if tripped.
+    pub fn observe(&self, tool_name: &str, output: &str) -> Option<CircuitBreakerTrip> {
+        let exit_code = Self::parse_exit_code(output);
+        if exit_code == Some(0) {
+            self.reset();
+            return None;
+        }
+
+        let error_type = Self::classify_error(output, exit_code)?;
+
+        let mut s = self.state.lock().unwrap();
+        s.consecutive_failures += 1;
+        s.last_error_type = Some(error_type.clone());
+        let count = s.consecutive_failures;
+
+        if count < self.trip_threshold {
+            return None;
+        }
+
+        let first_line = output
+            .lines()
+            .find(|l| !l.starts_with("exit:"))
+            .unwrap_or(output);
+        let diagnostic_message = format!(
+            "Tool '{tool_name}' failed {count} time(s) consecutively with {error_type}: {first_line}"
+        );
+
+        let remedy_suggestion = match &error_type {
+            EnvironmentErrorType::PermissionDenied => {
+                "Check file and directory permissions. Ensure developer toolchains are accessible. If Landlock sandbox is enabled, consider passing `--sandbox-allow-read <PATH>` or `--no-sandbox`."
+                    .to_string()
+            }
+            EnvironmentErrorType::CommandNotFound => {
+                "The command or executable is not installed or not in PATH. Check PATH or install the missing toolchain."
+                    .to_string()
+            }
+            EnvironmentErrorType::SandboxConfinement => {
+                "Linux Landlock filesystem confinement is blocking access. Configure `--sandbox-allow-read <PATH>` or test with `--no-sandbox`."
+                    .to_string()
+            }
+            EnvironmentErrorType::Other(msg) => {
+                format!("Environmental failure ({msg}). Verify prerequisites or workspace configuration.")
+            }
+        };
+
+        Some(CircuitBreakerTrip {
+            consecutive_failures: count,
+            error_type,
+            diagnostic_message,
+            remedy_suggestion,
+        })
+    }
+
+    /// Formats an advisory warning for injection into the tool output.
+    pub fn format_advisory(&self, trip: &CircuitBreakerTrip) -> String {
+        format!(
+            "\n\n[environment-circuit-breaker] CRITICAL: Environment failure detected {} time(s) in a row.\n- Error type: {}\n- Diagnostic: {}\n- Remedy: {}\nDo not loop on identical commands. Adjust the command or notify the user if external setup is required.",
+            trip.consecutive_failures,
+            trip.error_type,
+            trip.diagnostic_message,
+            trip.remedy_suggestion,
+        )
+    }
+
+    pub fn consecutive_failures(&self) -> usize {
+        self.state.lock().unwrap().consecutive_failures
+    }
+
+    pub fn is_tripped(&self) -> bool {
+        self.state.lock().unwrap().consecutive_failures >= self.trip_threshold
+    }
+}
+
+/// Plugin that mounts [`EnvironmentCircuitBreaker`] into the kernel context.
+pub struct EnvironmentCircuitBreakerPlugin {
+    pub trip_threshold: usize,
+}
+
+impl Default for EnvironmentCircuitBreakerPlugin {
+    fn default() -> Self {
+        Self { trip_threshold: 3 }
+    }
+}
+
+impl Plugin for EnvironmentCircuitBreakerPlugin {
+    fn name(&self) -> &str {
+        "environment-circuit-breaker"
+    }
+
+    fn apply(&self, scope: &mut Scope) {
+        let breaker = EnvironmentCircuitBreaker::new(self.trip_threshold);
+        let b_reset = breaker.clone();
+        scope.on::<crate::TurnStart, _>(move |_| {
+            b_reset.reset();
+        });
+        scope.provide(breaker);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,5 +381,85 @@ mod tests {
         assert!(r4.contains("consecutive_calls: 4"));
         g.reset();
         assert!(g.observe(&c).is_none()); // reset back to 1
+    }
+
+    #[test]
+    fn permission_denied_detection() {
+        let breaker = EnvironmentCircuitBreaker::new(1);
+        let trip = breaker
+            .observe("shell", "exit: 126\nstderr:\nPermission denied")
+            .unwrap();
+        assert_eq!(trip.error_type, EnvironmentErrorType::PermissionDenied);
+
+        let trip2 = breaker
+            .observe("shell", "exit: 1\nstderr:\nOperation not permitted")
+            .unwrap();
+        assert_eq!(trip2.error_type, EnvironmentErrorType::PermissionDenied);
+    }
+
+    #[test]
+    fn command_not_found_detection() {
+        let breaker = EnvironmentCircuitBreaker::new(1);
+        let trip = breaker
+            .observe("shell", "exit: 127\nstderr:\nsh: cargo: command not found")
+            .unwrap();
+        assert_eq!(trip.error_type, EnvironmentErrorType::CommandNotFound);
+    }
+
+    #[test]
+    fn sandbox_confinement_priority() {
+        let breaker = EnvironmentCircuitBreaker::new(1);
+        let trip = breaker
+            .observe(
+                "shell",
+                "exit: 1\nstderr:\nlandlock: Permission denied by kernel sandbox",
+            )
+            .unwrap();
+        assert_eq!(trip.error_type, EnvironmentErrorType::SandboxConfinement);
+    }
+
+    #[test]
+    fn success_resets_counter() {
+        let breaker = EnvironmentCircuitBreaker::new(3);
+        breaker.observe("shell", "exit: 127\nstderr:\ncommand not found");
+        breaker.observe("shell", "exit: 127\nstderr:\ncommand not found");
+        assert_eq!(breaker.consecutive_failures(), 2);
+        assert!(!breaker.is_tripped());
+
+        // Success resets
+        breaker.observe("shell", "exit: 0\nstdout:\nall tests passed");
+        assert_eq!(breaker.consecutive_failures(), 0);
+        assert!(!breaker.is_tripped());
+    }
+
+    #[test]
+    fn trip_threshold_is_respected() {
+        let breaker = EnvironmentCircuitBreaker::new(3);
+        assert!(breaker
+            .observe("shell", "exit: 126\nstderr:\nPermission denied")
+            .is_none());
+        assert!(breaker
+            .observe("shell", "exit: 126\nstderr:\nPermission denied")
+            .is_none());
+        assert_eq!(breaker.consecutive_failures(), 2);
+        assert!(!breaker.is_tripped());
+
+        let trip = breaker
+            .observe("shell", "exit: 126\nstderr:\nPermission denied")
+            .expect("should trip at 3");
+        assert_eq!(trip.consecutive_failures, 3);
+        assert!(breaker.is_tripped());
+    }
+
+    #[test]
+    fn format_advisory_contains_diagnostic_and_remedy() {
+        let breaker = EnvironmentCircuitBreaker::new(1);
+        let trip = breaker
+            .observe("shell", "exit: 126\nstderr:\nPermission denied")
+            .unwrap();
+        let adv = breaker.format_advisory(&trip);
+        assert!(adv.contains("[environment-circuit-breaker] CRITICAL"));
+        assert!(adv.contains("Permission denied"));
+        assert!(adv.contains("Remedy:"));
     }
 }

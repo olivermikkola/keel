@@ -5,9 +5,10 @@ set -euo pipefail
 
 MODEL_PATH="${MODEL_PATH:-/home/olivermikkola/Models/Kwaipilot_KAT-Coder-V2.5-Dev-Q4_K_M.gguf}"
 LLAMA_BUILD="${LLAMA_BUILD:-/home/olivermikkola/Projects/llama.cpp/build/bin}"
-PORT="${PORT:-8080}"
+PORT="${PORT:-8085}"
 CTX="${CTX:-16384}"
 NGL="${NGL:-99}"
+THREADS="${THREADS:-2}"
 
 if [[ ! -f "$MODEL_PATH" ]]; then
     echo "Error: model file not found at $MODEL_PATH" >&2
@@ -43,5 +44,6 @@ exec "$LLAMA_BUILD/llama-server" \
     --port "$PORT" \
     -c "$CTX" \
     -ngl "$NGL" \
+    -t "$THREADS" \
     --alias "kat-coder" \
     --parallel 1

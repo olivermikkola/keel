@@ -55,6 +55,24 @@ pub struct DaemonConfig {
     pub landlock_enabled: bool,
     pub vfs_mode: VfsMode,
     pub verify_command: Option<String>,
+    pub sandbox_allow_read: Vec<PathBuf>,
+    pub sandbox_allow_write: Vec<PathBuf>,
+    pub discover_toolchains: bool,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            root: PathBuf::from("."),
+            policy: ApprovalPolicy::Standard,
+            landlock_enabled: true,
+            vfs_mode: VfsMode::MaterializedCow,
+            verify_command: None,
+            sandbox_allow_read: Vec::new(),
+            sandbox_allow_write: Vec::new(),
+            discover_toolchains: true,
+        }
+    }
 }
 
 /// Thread-safe JSON-RPC 2.0 writer that emits newline-delimited JSON messages.
@@ -539,12 +557,16 @@ fn create_session(
         ctx.mount(&LandlockPlugin {
             workspace: cfg.root.clone(),
             enabled: cfg.landlock_enabled,
+            extra_read_paths: cfg.sandbox_allow_read.clone(),
+            extra_write_paths: cfg.sandbox_allow_write.clone(),
+            discover_toolchains: cfg.discover_toolchains,
         }),
         ctx.mount(&BuiltinToolsPlugin {
             root: cfg.root.clone(),
             landlock_enabled: cfg.landlock_enabled,
         }),
         ctx.mount(&RepeatToolReminderPlugin::default()),
+        ctx.mount(&crate::guard::EnvironmentCircuitBreakerPlugin::default()),
         ctx.mount(&ToolResultPrunerPlugin::default()),
         ctx.mount(&WorkspaceContextPlugin {
             root: cfg.root.clone(),
@@ -665,7 +687,7 @@ impl DaemonServer {
 pub fn handle_acp_client<R: BufRead>(
     mut reader: R,
     writer: Box<dyn Write + Send>,
-    server: DaemonServer,
+    mut server: DaemonServer,
     default_session_id: String,
 ) -> Result<()> {
     let rpc_writer = RpcWriter::new(writer);
@@ -769,6 +791,8 @@ pub fn handle_acp_client<R: BufRead>(
                             "predictivePrewarm": true,
                             "flightRecorder": true,
                             "timeTravelReplay": true,
+                            "sandboxPolicy": true,
+                            "environmentCircuitBreaker": true,
                         }
                     }),
                 );
@@ -2252,6 +2276,84 @@ pub fn handle_acp_client<R: BufRead>(
                     rpc_writer.send_error(id, -32000, "ReplayEngine not mounted");
                 }
             }
+            "sandbox/status" => {
+                let session = server.registry.get_or_create(
+                    &current_session_id.lock().unwrap(),
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                let policy = session.ctx.service::<crate::sandbox::SandboxPolicy>();
+                let breaker = session
+                    .ctx
+                    .service::<crate::guard::EnvironmentCircuitBreaker>();
+
+                let enabled = policy.as_ref().map(|p| p.enabled).unwrap_or(false);
+                let discover_toolchains = policy
+                    .as_ref()
+                    .map(|p| p.discover_toolchains)
+                    .unwrap_or(false);
+                let ro_paths: Vec<String> = policy
+                    .as_ref()
+                    .map(|p| {
+                        p.read_only_paths()
+                            .iter()
+                            .map(|x| x.display().to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let rw_paths: Vec<String> = policy
+                    .as_ref()
+                    .map(|p| {
+                        p.write_paths()
+                            .iter()
+                            .map(|x| x.display().to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let tripped = breaker.as_ref().map(|b| b.is_tripped()).unwrap_or(false);
+                let consecutive_failures = breaker
+                    .as_ref()
+                    .map(|b| b.consecutive_failures())
+                    .unwrap_or(0);
+
+                rpc_writer.send_response(
+                    id,
+                    json!({
+                        "enabled": enabled,
+                        "discoverToolchains": discover_toolchains,
+                        "readOnlyPathsCount": ro_paths.len(),
+                        "readOnlyPaths": ro_paths,
+                        "writePathsCount": rw_paths.len(),
+                        "writePaths": rw_paths,
+                        "circuitBreaker": {
+                            "tripped": tripped,
+                            "consecutiveFailures": consecutive_failures
+                        }
+                    }),
+                );
+            }
+            "sandbox/allow" => {
+                let path_str = params.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                let mode = params
+                    .get("mode")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("read");
+                if path_str.is_empty() {
+                    rpc_writer.send_error(id, -32602, "missing required parameter: path");
+                } else {
+                    let p = PathBuf::from(path_str);
+                    if mode == "write" {
+                        server.cfg.sandbox_allow_write.push(p);
+                    } else {
+                        server.cfg.sandbox_allow_read.push(p);
+                    }
+                    rpc_writer.send_response(
+                        id,
+                        json!({ "status": "allowed", "path": path_str, "mode": mode }),
+                    );
+                }
+            }
             "shutdown" | "exit" => {
                 if !id.is_null() {
                     rpc_writer.send_response(id, json!({ "status": "shutting_down" }));
@@ -2495,6 +2597,7 @@ mod tests {
             landlock_enabled: false,
             vfs_mode: VfsMode::MaterializedCow,
             verify_command: None,
+            ..Default::default()
         };
 
         serve_acp(
@@ -2552,6 +2655,7 @@ mod tests {
             landlock_enabled: false,
             vfs_mode: VfsMode::MaterializedCow,
             verify_command: None,
+            ..Default::default()
         };
 
         let token = "secret-token-12345".to_string();
@@ -2682,6 +2786,7 @@ mod tests {
             landlock_enabled: false,
             vfs_mode: VfsMode::MaterializedCow,
             verify_command: None,
+            ..Default::default()
         };
 
         let srv_handle = std::thread::spawn(move || {
@@ -2764,6 +2869,7 @@ mod tests {
             landlock_enabled: false,
             vfs_mode: VfsMode::MaterializedCow,
             verify_command: None,
+            ..Default::default()
         };
 
         serve_acp(
@@ -2843,6 +2949,7 @@ impl WorkerService {
             landlock_enabled: false,
             vfs_mode: VfsMode::MaterializedCow,
             verify_command: None,
+            ..Default::default()
         };
 
         serve_acp(
@@ -2942,6 +3049,7 @@ impl WorkerService {
             landlock_enabled: false,
             vfs_mode: VfsMode::MaterializedCow,
             verify_command: None,
+            ..Default::default()
         };
 
         serve_acp(
@@ -3010,6 +3118,7 @@ impl WorkerService {
             landlock_enabled: false,
             vfs_mode: VfsMode::MaterializedCow,
             verify_command: None,
+            ..Default::default()
         };
 
         serve_acp(
@@ -3080,6 +3189,7 @@ impl WorkerService {
             landlock_enabled: false,
             vfs_mode: VfsMode::MaterializedCow,
             verify_command: None,
+            ..Default::default()
         };
 
         serve_acp(
@@ -3188,6 +3298,7 @@ impl WorkerService {
             landlock_enabled: false,
             vfs_mode: VfsMode::MaterializedCow,
             verify_command: None,
+            ..Default::default()
         };
 
         serve_acp(
@@ -3229,6 +3340,65 @@ impl WorkerService {
             step_res["result"]["step"]["tool_calls"][0]["name"],
             "write_file"
         );
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn acp_daemon_sandbox_status_and_allow() {
+        let tmp =
+            std::env::temp_dir().join(format!("keel-sandbox-rpc-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let script = [
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "sandbox/status", "params": {}})
+                .to_string(),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "sandbox/allow", "params": {"path": "/opt/custom_tool", "mode": "read"}}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 4, "method": "shutdown", "params": {}}).to_string(),
+        ]
+        .join("\n")
+            + "\n";
+
+        let cfg = DaemonConfig {
+            root: tmp.clone(),
+            policy: ApprovalPolicy::Yolo,
+            landlock_enabled: false,
+            vfs_mode: VfsMode::MaterializedCow,
+            verify_command: None,
+            ..Default::default()
+        };
+
+        let out_buf = Arc::new(Mutex::new(Vec::new()));
+
+        serve_acp(
+            BufReader::new(std::io::Cursor::new(script.into_bytes())),
+            Box::new(SharedVecWriter(out_buf.clone())),
+            cfg,
+            Arc::new(DaemonTestLlm),
+        )
+        .unwrap();
+
+        let raw_output = String::from_utf8(out_buf.lock().unwrap().clone()).unwrap();
+        let lines: Vec<Value> = raw_output
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .collect();
+
+        // 1. Verify capabilities
+        assert!(lines.iter().any(|v| v["id"] == 1
+            && v["result"]["capabilities"]["sandboxPolicy"] == true
+            && v["result"]["capabilities"]["environmentCircuitBreaker"] == true));
+
+        // 2. Verify sandbox/status
+        let status_res = lines.iter().find(|v| v["id"] == 2).unwrap();
+        assert_eq!(status_res["result"]["circuitBreaker"]["tripped"], false);
+
+        // 3. Verify sandbox/allow
+        let allow_res = lines.iter().find(|v| v["id"] == 3).unwrap();
+        assert_eq!(allow_res["result"]["status"], "allowed");
+        assert_eq!(allow_res["result"]["path"], "/opt/custom_tool");
 
         let _ = std::fs::remove_dir_all(tmp);
     }
