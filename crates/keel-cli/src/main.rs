@@ -119,9 +119,11 @@ fn print_usage() {
   keel daemon [options]            ACP bidirectional JSON-RPC 2.0 daemon (stdio, socket, tcp)
   keel memory <cmd>                epistemic belief state (show, add-fact, set-hypothesis, clear)
   keel handoff <cmd>               sovereign cross-harness context distillation (Helm swarm)
+  keel oracle <cmd>                test diagnostic oracle & regression sentinel (test, baseline, diff)
   keel bench [filter] [--runs N]   run benchmark suite
 
 options:
+  --sentinel <mode>                regression sentinel mode (warn, rollback, strict)
   --handoff <file>                 bootstrap session directly from handoff envelope
   --listen <addr>                  listen on TCP address (e.g. 127.0.0.1:4040)
   --socket <path>                  listen on Unix domain socket (e.g. ~/.keel/daemon.sock)
@@ -678,6 +680,87 @@ fn cli_handoff(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Resul
     }
 }
 
+fn cli_oracle(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result<()> {
+    let sub = if !args.is_empty() {
+        args.remove(0)
+    } else {
+        "test".to_string()
+    };
+    let json_mode = take_flag(&mut args, "--json");
+    let cmd_opt = take_opt(&mut args, "--cmd");
+    let root = match root_opt {
+        Some(r) => std::fs::canonicalize(r)?,
+        None => std::env::current_dir()?,
+    };
+    let oracle = keel_agent::oracle::DiagnosticOracle::new(
+        root,
+        cmd_opt,
+        keel_agent::oracle::SentinelMode::Warn,
+    );
+    match sub.as_str() {
+        "test" | "run" => {
+            let snap = oracle.run_tests()?;
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&snap)?);
+            } else {
+                println!(
+                    "Oracle test run completed in {}ms: {} total, {} passed, {} failed, {} ignored.",
+                    snap.elapsed_ms, snap.total, snap.passed, snap.failed, snap.ignored
+                );
+                for f in &snap.failures {
+                    println!("  ❌ {}", f.name);
+                    if let Some(loc) = &f.location {
+                        println!("     Location: {loc}");
+                    }
+                    if let Some(ass) = &f.assertion {
+                        println!("     Assertion: {ass}");
+                    }
+                }
+            }
+            if snap.failed > 0 {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        "baseline" => {
+            let snap = oracle.capture_baseline()?;
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&snap)?);
+            } else {
+                println!(
+                    "Captured test baseline: {} passed, {} failed across {} tests.",
+                    snap.passed, snap.failed, snap.total
+                );
+            }
+            Ok(())
+        }
+        "diff" => {
+            let delta = oracle.check_delta()?;
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&delta)?);
+            } else if delta.is_clean {
+                println!("✅ Zero test regressions detected.");
+                if !delta.pre_existing_failures.is_empty() {
+                    println!(
+                        "   (quarantined {} pre-existing failures)",
+                        delta.pre_existing_failures.len()
+                    );
+                }
+            } else if let Some(rem) = delta.render_remediation() {
+                println!("{rem}");
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        other => {
+            eprintln!(
+                "unknown oracle subcommand `{other}`. Usage: keel oracle <test|baseline|diff> [--cmd \"...\"] [--json]"
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
 fn cli_vfs(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result<()> {
     let json_mode = take_flag(&mut args, "--json");
     let root = match root_opt {
@@ -791,6 +874,10 @@ fn main() -> anyhow::Result<()> {
         args.remove(0);
         return cli_handoff(args, root_opt);
     }
+    if args.first().map(String::as_str) == Some("oracle") {
+        args.remove(0);
+        return cli_oracle(args, root_opt);
+    }
 
     let mut interactive = take_flag(&mut args, "-i") || take_flag(&mut args, "--interactive");
     if args.first().map(String::as_str) == Some("repl") {
@@ -823,6 +910,7 @@ fn main() -> anyhow::Result<()> {
         take_opt(&mut args, "--cascade").or_else(|| std::env::var("KEEL_CASCADE_MODEL").ok());
     let apply_winner = take_flag(&mut args, "--apply");
     let handoff_opt = take_opt(&mut args, "--handoff");
+    let sentinel_opt = take_opt(&mut args, "--sentinel");
     let listen_opt = take_opt(&mut args, "--listen");
     let socket_opt = take_opt(&mut args, "--socket");
     let auth_token_opt =
@@ -1026,7 +1114,7 @@ fn main() -> anyhow::Result<()> {
     let _p_ws = ctx.mount(&WorkspaceContextPlugin { root: root.clone() });
     let _p_plan = ctx.mount(&PlanPlugin {
         root: root.clone(),
-        verify_command: verify_cmd,
+        verify_command: verify_cmd.clone(),
     });
     let _p_subagent = ctx.mount(&SubagentPlugin {
         root: root.clone(),
@@ -1055,6 +1143,15 @@ fn main() -> anyhow::Result<()> {
             VfsMode::MaterializedCow
         },
         persist: !shadow_vfs,
+    });
+    let _p_oracle = ctx.mount(&keel_agent::OraclePlugin {
+        root: root.clone(),
+        test_command: verify_cmd.clone(),
+        mode: sentinel_opt
+            .as_deref()
+            .map(keel_agent::SentinelMode::from_str_lossy)
+            .unwrap_or(keel_agent::SentinelMode::Warn),
+        auto_baseline: sentinel_opt.is_some(),
     });
 
     let mut extra_servers = std::collections::HashMap::new();
