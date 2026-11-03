@@ -291,6 +291,7 @@ impl StreamAcc {
         if let Some(t) = delta["content"].as_str().filter(|t| !t.is_empty()) {
             self.process_content_delta(t, &mut out);
         }
+        let mut vetoed = false;
         for c in delta["tool_calls"].as_array().into_iter().flatten() {
             let i = c["index"].as_u64().unwrap_or(0) as usize;
             while self.calls.len() <= i {
@@ -337,15 +338,22 @@ impl StreamAcc {
                             tool_name: slot.1.clone(),
                             reason: veto.reason,
                         });
+                        vetoed = true;
                     }
                 }
             }
 
-            if let Some(ref prewarm) = self.prewarm {
-                if !slot.1.is_empty() {
-                    prewarm.check_and_prewarm(&slot.1, parser.fields());
+            if !vetoed {
+                if let Some(ref prewarm) = self.prewarm {
+                    if !slot.1.is_empty() {
+                        prewarm.check_and_prewarm(&slot.1, parser.fields());
+                    }
                 }
             }
+        }
+        if vetoed {
+            self.calls.clear();
+            self.parsers.clear();
         }
         Ok(out)
     }
@@ -429,17 +437,26 @@ impl Llm for OpenAiCompat {
         if let Some(ref p) = self.prewarm {
             acc = acc.with_prewarm(p.clone());
         }
-        let mut early_abort = false;
+        let mut early_abort: Option<String> = None;
         for line in BufReader::new(resp.into_reader()).lines() {
             for c in acc.feed(&line?)? {
-                if matches!(&c, Chunk::SentinelVeto { .. }) {
-                    early_abort = true;
+                if let Chunk::SentinelVeto {
+                    ref tool_name,
+                    ref reason,
+                } = c
+                {
+                    early_abort = Some(format!(
+                        "Streaming security sentinel vetoed `{tool_name}`: {reason}"
+                    ));
                 }
                 sink(c);
             }
-            if early_abort {
+            if early_abort.is_some() {
                 break;
             }
+        }
+        if let Some(reason) = early_abort {
+            anyhow::bail!("{reason}");
         }
         Ok(acc.finish())
     }
@@ -514,6 +531,15 @@ mod tests {
             _ => false,
         });
         assert!(vetoed, "Sentinel must emit early veto during streaming");
+
+        let msg = acc.finish();
+        let Message::Assistant { tool_calls, .. } = msg else {
+            panic!("expected assistant message");
+        };
+        assert!(
+            tool_calls.is_empty(),
+            "Vetoed tool calls must be purged from finished assistant message"
+        );
     }
 
     #[test]
