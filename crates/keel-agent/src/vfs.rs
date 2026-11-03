@@ -21,6 +21,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+pub const MAX_VFS_FILE_BYTES: u64 = 64 * 1024 * 1024; // 64MB max file tracked in VFS
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VfsMode {
@@ -164,6 +166,12 @@ impl TransactionalVfs {
         if !meta.file_type().is_file() {
             anyhow::bail!("{} is not a regular file", full.display());
         }
+        if meta.len() > MAX_VFS_FILE_BYTES {
+            anyhow::bail!(
+                "file `{}` exceeds maximum allowable VFS read size (64MB)",
+                full.display()
+            );
+        }
         std::fs::read_to_string(&full).with_context(|| format!("reading {}", full.display()))
     }
 
@@ -174,6 +182,12 @@ impl TransactionalVfs {
             if !meta.file_type().is_file() {
                 anyhow::bail!("{} is not a regular file", full.display());
             }
+            if meta.len() > MAX_VFS_FILE_BYTES {
+                anyhow::bail!(
+                    "target file `{}` exceeds maximum allowable VFS file size (64MB)",
+                    full.display()
+                );
+            }
         }
         let mut guard = self
             .journal
@@ -181,8 +195,12 @@ impl TransactionalVfs {
             .map_err(|_| anyhow::anyhow!("VFS journal mutex poisoned"))?;
 
         if !guard.entries.contains_key(&rel) {
-            let original = if full.is_file() {
-                std::fs::read_to_string(&full).ok()
+            let original = if let Ok(meta) = std::fs::symlink_metadata(&full) {
+                if meta.file_type().is_file() && meta.len() <= MAX_VFS_FILE_BYTES {
+                    std::fs::read_to_string(&full).ok()
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -218,8 +236,12 @@ impl TransactionalVfs {
             .lock()
             .map_err(|_| anyhow::anyhow!("VFS journal mutex poisoned"))?;
         if !guard.entries.contains_key(&rel) {
-            let original = if full.is_file() {
-                std::fs::read_to_string(&full).ok()
+            let original = if let Ok(meta) = std::fs::symlink_metadata(&full) {
+                if meta.file_type().is_file() && meta.len() <= MAX_VFS_FILE_BYTES {
+                    std::fs::read_to_string(&full).ok()
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -244,8 +266,12 @@ impl TransactionalVfs {
             .lock()
             .map_err(|_| anyhow::anyhow!("VFS journal mutex poisoned"))?;
         if let Some(entry) = guard.entries.get_mut(&rel) {
-            entry.staged_content = if full.is_file() {
-                std::fs::read_to_string(&full).ok()
+            entry.staged_content = if let Ok(meta) = std::fs::symlink_metadata(&full) {
+                if meta.file_type().is_file() && meta.len() <= MAX_VFS_FILE_BYTES {
+                    std::fs::read_to_string(&full).ok()
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -737,6 +763,23 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("escapes workspace"));
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn vfs_rejects_special_files_and_preserves_bounds() {
+        let tmp = std::env::temp_dir().join(format!("keel-vfs-bounds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let vfs = TransactionalVfs::new(tmp.clone(), VfsMode::MaterializedCow, false);
+
+        // Directory cannot be read as a file
+        let sub = tmp.join("subdir");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert!(vfs.read_to_string(Path::new("subdir")).is_err());
+        assert!(vfs.write_string(Path::new("subdir"), "bad").is_err());
 
         let _ = std::fs::remove_dir_all(tmp);
     }

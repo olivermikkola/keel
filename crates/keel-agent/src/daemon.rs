@@ -1534,6 +1534,10 @@ pub fn handle_acp_client<R: BufRead>(
                     .and_then(|v| v.as_str())
                     .map(String::from)
                     .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                if let Err(e) = crate::recorder::validate_session_id(&sid) {
+                    rpc_writer.send_error(id, -32602, &format!("invalid `session_id`: {e:#}"));
+                    continue;
+                }
                 let Some(env_val) = params.get("envelope") else {
                     rpc_writer.send_error(id, -32602, "missing `envelope` object parameter");
                     continue;
@@ -1550,6 +1554,10 @@ pub fn handle_acp_client<R: BufRead>(
                             continue;
                         }
                     };
+                if let Err(e) = envelope.validate() {
+                    rpc_writer.send_error(id, -32602, &format!("invalid HandoffEnvelope: {e:#}"));
+                    continue;
+                }
                 let session = server.registry.get_or_create(
                     &sid,
                     &server.cfg,
@@ -1585,6 +1593,10 @@ pub fn handle_acp_client<R: BufRead>(
                     .and_then(|v| v.as_str())
                     .map(String::from)
                     .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                if let Err(e) = crate::recorder::validate_session_id(&sid) {
+                    rpc_writer.send_error(id, -32602, &format!("invalid `session_id`: {e:#}"));
+                    continue;
+                }
                 let target_harness = params
                     .get("target_harness")
                     .and_then(|v| v.as_str())
@@ -3193,6 +3205,88 @@ mod tests {
         );
         assert_eq!(export_msg["result"]["envelope"]["source_harness"], "keel");
         assert_eq!(export_msg["result"]["envelope"]["target_harness"], "claude");
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn acp_daemon_handoff_validation_and_session_traversal_rejection() {
+        let tmp = std::env::temp_dir().join(format!("keel-handoff-sec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let out_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let invalid_envelope = json!({
+            "source_conversation_id": "helm-session",
+            "source_harness": "helm",
+            "target_harness": "keel",
+            "goal": "Test null byte rejection",
+            "relevant_files": ["secret\0file.rs"],
+            "open_tasks": [],
+            "completed_tasks": [],
+            "context_summary": ""
+        });
+
+        let requests = [
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}).to_string(),
+            // 1. Ingest with invalid envelope (null byte in file path)
+            json!({"jsonrpc": "2.0", "id": 2, "method": "handoff/ingest", "params": {"envelope": invalid_envelope}}).to_string(),
+            // 2. Ingest with path traversal session_id
+            json!({"jsonrpc": "2.0", "id": 3, "method": "handoff/ingest", "params": {"session_id": "../evil", "envelope": {"source_conversation_id": "s1", "source_harness": "h", "target_harness": "k", "goal": "g", "relevant_files": [], "open_tasks": [], "completed_tasks": [], "context_summary": ""}}}).to_string(),
+            // 3. Export with path traversal session_id
+            json!({"jsonrpc": "2.0", "id": 4, "method": "handoff/export", "params": {"session_id": "../../etc"}}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 5, "method": "shutdown", "params": {}}).to_string(),
+        ]
+        .join("\n")
+            + "\n";
+
+        let cfg = DaemonConfig {
+            root: tmp.clone(),
+            policy: ApprovalPolicy::Yolo,
+            landlock_enabled: false,
+            vfs_mode: VfsMode::MaterializedCow,
+            verify_command: None,
+            ..Default::default()
+        };
+
+        serve_acp(
+            BufReader::new(std::io::Cursor::new(requests.into_bytes())),
+            Box::new(SharedVecWriter(out_buf.clone())),
+            cfg,
+            Arc::new(DaemonTestLlm),
+        )
+        .unwrap();
+
+        let raw_output = String::from_utf8(out_buf.lock().unwrap().clone()).unwrap();
+        let lines: Vec<Value> = raw_output
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .collect();
+
+        // 1. Null byte rejected with error code -32602
+        let res2 = lines.iter().find(|v| v["id"] == 2).unwrap();
+        assert_eq!(res2["error"]["code"], -32602);
+        assert!(res2["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("null byte"));
+
+        // 2. Traversal session_id on ingest rejected with -32602
+        let res3 = lines.iter().find(|v| v["id"] == 3).unwrap();
+        assert_eq!(res3["error"]["code"], -32602);
+        assert!(res3["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid `session_id`"));
+
+        // 3. Traversal session_id on export rejected with -32602
+        let res4 = lines.iter().find(|v| v["id"] == 4).unwrap();
+        assert_eq!(res4["error"]["code"], -32602);
+        assert!(res4["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid `session_id`"));
 
         let _ = std::fs::remove_dir_all(tmp);
     }
