@@ -631,6 +631,7 @@ fn create_session(
         ctx.mount(&SymbolPlugin {
             root: cfg.root.clone(),
         }),
+        ctx.mount(&crate::repomap::RepoMapPlugin::new(cfg.root.clone())),
         ctx.mount(&TreePlugin {
             root: cfg.root.clone(),
         }),
@@ -816,6 +817,8 @@ pub fn handle_acp_client<R: BufRead>(
                             "environmentCircuitBreaker": true,
                             "adaptiveCompaction": true,
                             "contextBudget": true,
+                            "repoMap": true,
+                            "pagerankCentrality": true,
                         }
                     }),
                 );
@@ -2463,6 +2466,82 @@ pub fn handle_acp_client<R: BufRead>(
                     rpc_writer.send_error(id, -32000, "AdaptiveCompactor not mounted");
                 }
             }
+            "repomap/get" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let max_tokens = params
+                    .get("max_tokens")
+                    .and_then(|v| v.as_u64())
+                    .map(|u| u as usize)
+                    .unwrap_or(1024);
+                let focus: Option<Vec<String>> = params.get("focus").and_then(|v| {
+                    v.as_array().map(|arr| {
+                        arr.iter()
+                            .filter_map(|val| val.as_str().map(String::from))
+                            .collect()
+                    })
+                });
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                if let Some(map) = session.ctx.service::<Arc<crate::repomap::RepoMap>>() {
+                    let markdown = map.render(max_tokens, focus.as_deref());
+                    rpc_writer.send_response(
+                        id,
+                        json!({
+                            "session_id": sid,
+                            "max_tokens": max_tokens,
+                            "markdown": markdown,
+                        }),
+                    );
+                } else {
+                    rpc_writer.send_error(id, -32000, "RepoMap not mounted");
+                }
+            }
+            "repomap/graph" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                if let Some(map) = session.ctx.service::<Arc<crate::repomap::RepoMap>>() {
+                    let mut top_files: Vec<_> = map
+                        .ranks
+                        .iter()
+                        .map(|(path, &rank)| json!({ "path": path, "rank": rank }))
+                        .collect();
+                    top_files.sort_by(|a, b| {
+                        b["rank"]
+                            .as_f64()
+                            .unwrap_or(0.0)
+                            .partial_cmp(&a["rank"].as_f64().unwrap_or(0.0))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    rpc_writer.send_response(
+                        id,
+                        json!({
+                            "session_id": sid,
+                            "nodeCount": map.graph.node_count(),
+                            "nodes": map.graph.nodes(),
+                            "topCentralFiles": top_files,
+                        }),
+                    );
+                } else {
+                    rpc_writer.send_error(id, -32000, "RepoMap not mounted");
+                }
+            }
             "shutdown" | "exit" => {
                 if !id.is_null() {
                     rpc_writer.send_response(id, json!({ "status": "shutting_down" }));
@@ -3571,6 +3650,76 @@ impl WorkerService {
         // 3. Verify compaction/compact on clean short history
         let compact_res = lines.iter().find(|v| v["id"] == 3).unwrap();
         assert_eq!(compact_res["result"]["compacted"], false);
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn acp_daemon_repomap_rpc() {
+        let tmp =
+            std::env::temp_dir().join(format!("keel-repomap-rpc-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("src")).unwrap();
+
+        std::fs::write(
+            tmp.join("src/models.rs"),
+            "pub struct User { pub id: u64 }\npub trait Store { fn save(&self); }",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join("src/main.rs"),
+            "use models::User;\nfn main() { let _u = User { id: 1 }; }",
+        )
+        .unwrap();
+
+        let script = [
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "repomap/get", "params": {"max_tokens": 512}}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "repomap/graph", "params": {}}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 4, "method": "shutdown", "params": {}}).to_string(),
+        ]
+        .join("\n")
+            + "\n";
+
+        let cfg = DaemonConfig {
+            root: tmp.clone(),
+            policy: ApprovalPolicy::Yolo,
+            landlock_enabled: false,
+            vfs_mode: VfsMode::MaterializedCow,
+            verify_command: None,
+            ..Default::default()
+        };
+
+        let out_buf = Arc::new(Mutex::new(Vec::new()));
+
+        serve_acp(
+            BufReader::new(std::io::Cursor::new(script.into_bytes())),
+            Box::new(SharedVecWriter(out_buf.clone())),
+            cfg,
+            Arc::new(DaemonTestLlm),
+        )
+        .unwrap();
+
+        let raw_output = String::from_utf8(out_buf.lock().unwrap().clone()).unwrap();
+        let lines: Vec<Value> = raw_output
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .collect();
+
+        // 1. Verify capabilities
+        assert!(lines.iter().any(|v| v["id"] == 1
+            && v["result"]["capabilities"]["repoMap"] == true
+            && v["result"]["capabilities"]["pagerankCentrality"] == true));
+
+        // 2. Verify repomap/get
+        let get_res = lines.iter().find(|v| v["id"] == 2).unwrap();
+        let md = get_res["result"]["markdown"].as_str().unwrap();
+        assert!(md.contains("Repository Architecture Map"));
+        assert!(md.contains("src/models.rs"));
+
+        // 3. Verify repomap/graph
+        let graph_res = lines.iter().find(|v| v["id"] == 3).unwrap();
+        assert!(graph_res["result"]["nodeCount"].as_u64().unwrap() >= 2);
 
         let _ = std::fs::remove_dir_all(tmp);
     }
