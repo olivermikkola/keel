@@ -27,6 +27,7 @@ pub mod sandbox;
 pub mod speculate;
 pub mod subagent;
 pub mod swarm;
+pub mod symbols;
 pub mod tools;
 pub mod vfs;
 
@@ -35,6 +36,10 @@ pub use oracle::{
     TestSnapshot,
 };
 pub use swarm::{export_handoff, ingest_handoff, HandoffEnvelope, HandoffIngestReport};
+pub use symbols::{
+    parse_structural_outline, render_outline_markdown, FileOutline, Symbol, SymbolIndex,
+    SymbolKind, SymbolPlugin, SymbolSearchResult,
+};
 
 use anyhow::Result;
 use keel_kernel::{Context, Plugin, Scope};
