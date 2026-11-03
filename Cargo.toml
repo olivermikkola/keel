@@ -6,3 +6,9 @@ members = ["crates/keel-kernel", "crates/keel-agent", "crates/keel-cli"]
 version = "0.0.1"
 edition = "2021"
 license = "MIT"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
