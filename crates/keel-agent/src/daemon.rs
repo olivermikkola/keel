@@ -29,6 +29,7 @@ use crate::plan::PlanPlugin;
 use crate::sandbox::LandlockPlugin;
 use crate::speculate::SpeculatePlugin;
 use crate::subagent::SubagentPlugin;
+use crate::symbols::{SymbolIndex, SymbolPlugin};
 use crate::tools::BuiltinToolsPlugin;
 use crate::vfs::{TransactionalVfs, VfsMode, VfsPlugin};
 use crate::{
@@ -554,6 +555,9 @@ fn create_session(
             mode: SentinelMode::Warn,
             auto_baseline: false,
         }),
+        ctx.mount(&SymbolPlugin {
+            root: cfg.root.clone(),
+        }),
     ];
 
     let mut sys_text = format!(
@@ -714,6 +718,8 @@ pub fn handle_acp_client<R: BufRead>(
                             "swarmHandoff": true,
                             "diagnosticOracle": true,
                             "regressionSentinel": true,
+                            "structuralSymbols": true,
+                            "symbolOutline": true,
                         }
                     }),
                 );
@@ -1431,6 +1437,124 @@ pub fn handle_acp_client<R: BufRead>(
                     rpc_writer.send_error(id, -32000, "DiagnosticOracle not mounted");
                 }
             }
+            "symbols/outline" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let rel = params
+                    .get("path")
+                    .or_else(|| params.get("file"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                if let Some(index) = session.ctx.service::<Arc<SymbolIndex>>() {
+                    match crate::tools::confine(&server.cfg.root, rel) {
+                        Ok(abs) => match index.outline_file(&abs, rel) {
+                            Ok(outline) => {
+                                let md = crate::symbols::render_outline_markdown(&outline);
+                                rpc_writer.send_response(
+                                    id,
+                                    json!({
+                                        "session_id": sid,
+                                        "outline": outline,
+                                        "markdown": md,
+                                    }),
+                                );
+                            }
+                            Err(e) => rpc_writer.send_error(id, -32000, &format!("{e:#}")),
+                        },
+                        Err(e) => rpc_writer.send_error(id, -32000, &format!("{e:#}")),
+                    }
+                } else {
+                    rpc_writer.send_error(id, -32000, "SymbolIndex not mounted");
+                }
+            }
+            "symbols/search" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                let path_filter = params.get("path").and_then(|v| v.as_str());
+                let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                if let Some(index) = session.ctx.service::<Arc<SymbolIndex>>() {
+                    match index.search_symbols(&server.cfg.root, query, path_filter, limit) {
+                        Ok(matches) => {
+                            rpc_writer.send_response(
+                                id,
+                                json!({
+                                    "session_id": sid,
+                                    "query": query,
+                                    "matches": matches,
+                                }),
+                            );
+                        }
+                        Err(e) => rpc_writer.send_error(id, -32000, &format!("{e:#}")),
+                    }
+                } else {
+                    rpc_writer.send_error(id, -32000, "SymbolIndex not mounted");
+                }
+            }
+            "symbols/get" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let rel = params
+                    .get("path")
+                    .or_else(|| params.get("file"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                if let Some(index) = session.ctx.service::<Arc<SymbolIndex>>() {
+                    match crate::tools::confine(&server.cfg.root, rel) {
+                        Ok(abs) => match index.get_symbol_source(&abs, rel, name) {
+                            Ok(Some((symbol, source))) => {
+                                rpc_writer.send_response(
+                                    id,
+                                    json!({
+                                        "session_id": sid,
+                                        "symbol": symbol,
+                                        "source": source,
+                                    }),
+                                );
+                            }
+                            Ok(None) => {
+                                rpc_writer.send_error(
+                                    id,
+                                    -32004,
+                                    &format!("Symbol `{name}` not found in `{rel}`"),
+                                );
+                            }
+                            Err(e) => rpc_writer.send_error(id, -32000, &format!("{e:#}")),
+                        },
+                        Err(e) => rpc_writer.send_error(id, -32000, &format!("{e:#}")),
+                    }
+                } else {
+                    rpc_writer.send_error(id, -32000, "SymbolIndex not mounted");
+                }
+            }
             "shutdown" | "exit" => {
                 if !id.is_null() {
                     rpc_writer.send_response(id, json!({ "status": "shutting_down" }));
@@ -1640,6 +1764,17 @@ mod tests {
         }
     }
 
+    struct SharedVecWriter(Arc<Mutex<Vec<u8>>>);
+    impl Write for SharedVecWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn acp_daemon_initialize_prompt_vfs_and_rollback_roundtrip() {
         let tmp = std::env::temp_dir().join(format!("keel-acp-test-{}", std::process::id()));
@@ -1647,17 +1782,6 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
 
         let out_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-
-        struct SharedVecWriter(Arc<Mutex<Vec<u8>>>);
-        impl Write for SharedVecWriter {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
 
         let requests = [
             json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}).to_string(),
@@ -1917,17 +2041,6 @@ mod tests {
 
         let out_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
 
-        struct SharedVecWriter(Arc<Mutex<Vec<u8>>>);
-        impl Write for SharedVecWriter {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
         let handoff_payload = json!({
             "source_conversation_id": "helm-session-888",
             "source_harness": "helm",
@@ -1990,6 +2103,93 @@ mod tests {
         );
         assert_eq!(export_msg["result"]["envelope"]["source_harness"], "keel");
         assert_eq!(export_msg["result"]["envelope"]["target_harness"], "claude");
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn acp_daemon_symbols_outline_and_search_rpc() {
+        let tmp = std::env::temp_dir().join(format!("keel-symbols-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("src")).unwrap();
+
+        std::fs::write(
+            tmp.join("src/service.rs"),
+            r#"
+/// Worker service for async jobs.
+pub struct WorkerService {
+    pub id: u32,
+}
+
+impl WorkerService {
+    pub fn start(&self) {}
+}
+"#,
+        )
+        .unwrap();
+
+        let out_buf = Arc::new(Mutex::new(Vec::new()));
+
+        let requests = [
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "symbols/outline", "params": {"path": "src/service.rs"}}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "symbols/search", "params": {"query": "worker"}}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 4, "method": "symbols/get", "params": {"path": "src/service.rs", "name": "WorkerService"}}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 5, "method": "shutdown", "params": {}}).to_string(),
+        ]
+        .join("\n")
+            + "\n";
+
+        let cfg = DaemonConfig {
+            root: tmp.clone(),
+            policy: ApprovalPolicy::Yolo,
+            landlock_enabled: false,
+            vfs_mode: VfsMode::MaterializedCow,
+            verify_command: None,
+        };
+
+        serve_acp(
+            BufReader::new(std::io::Cursor::new(requests.into_bytes())),
+            Box::new(SharedVecWriter(out_buf.clone())),
+            cfg,
+            Arc::new(DaemonTestLlm),
+        )
+        .unwrap();
+
+        let raw_output = String::from_utf8(out_buf.lock().unwrap().clone()).unwrap();
+        let lines: Vec<Value> = raw_output
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .collect();
+
+        // 1. Verify capability includes structuralSymbols and symbolOutline
+        assert!(lines.iter().any(|v| v["id"] == 1
+            && v["result"]["capabilities"]["structuralSymbols"] == true
+            && v["result"]["capabilities"]["symbolOutline"] == true));
+
+        // 2. Verify outline response
+        let outline_res = lines.iter().find(|v| v["id"] == 2).unwrap();
+        assert_eq!(outline_res["result"]["outline"]["language"], "rust");
+        assert!(outline_res["result"]["markdown"]
+            .as_str()
+            .unwrap()
+            .contains("WorkerService"));
+
+        // 3. Verify search response
+        let search_res = lines.iter().find(|v| v["id"] == 3).unwrap();
+        let matches = search_res["result"]["matches"].as_array().unwrap();
+        assert!(!matches.is_empty());
+        assert!(matches
+            .iter()
+            .any(|m| m["symbol"]["name"] == "WorkerService"));
+
+        // 4. Verify get symbol response
+        let get_res = lines.iter().find(|v| v["id"] == 4).unwrap();
+        assert_eq!(get_res["result"]["symbol"]["name"], "WorkerService");
+        assert!(get_res["result"]["source"]
+            .as_str()
+            .unwrap()
+            .contains("pub struct WorkerService"));
 
         let _ = std::fs::remove_dir_all(tmp);
     }

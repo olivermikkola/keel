@@ -761,6 +761,105 @@ fn cli_oracle(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result
     }
 }
 
+fn cli_symbols(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result<()> {
+    let sub = if !args.is_empty() && !args[0].starts_with('-') {
+        args.remove(0)
+    } else {
+        "search".to_string()
+    };
+    let json_mode = take_flag(&mut args, "--json");
+    let root = match root_opt {
+        Some(r) => std::fs::canonicalize(r)?,
+        None => std::env::current_dir()?,
+    };
+    let index = keel_agent::SymbolIndex::new();
+
+    match sub.as_str() {
+        "outline" => {
+            let file = args.first().cloned().unwrap_or_default();
+            if file.is_empty() {
+                eprintln!("Usage: keel symbols outline <file> [--json]");
+                std::process::exit(2);
+            }
+            let abs = keel_agent::tools::confine(&root, &file)?;
+            let outline = index.outline_file(&abs, &file)?;
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&outline)?);
+            } else {
+                print!("{}", keel_agent::render_outline_markdown(&outline));
+            }
+            Ok(())
+        }
+        "search" => {
+            let query = args.first().cloned().unwrap_or_default();
+            if query.is_empty() {
+                eprintln!(
+                    "Usage: keel symbols search <query> [--path <filter>] [--limit <n>] [--json]"
+                );
+                std::process::exit(2);
+            }
+            let path_filter = take_opt(&mut args, "--path");
+            let limit = take_opt(&mut args, "--limit")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(20);
+            let matches = index.search_symbols(&root, &query, path_filter.as_deref(), limit)?;
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&matches)?);
+            } else if matches.is_empty() {
+                println!("No symbols found matching `{query}`.");
+            } else {
+                println!("Symbol Matches for `{query}`:");
+                for m in matches {
+                    println!(
+                        "  [{}] {} (score: {})",
+                        m.symbol.kind.as_str(),
+                        m.symbol.name,
+                        m.score
+                    );
+                    println!(
+                        "    File: {}:{}-{}",
+                        m.path, m.symbol.start_line, m.symbol.end_line
+                    );
+                    println!("    Sig:  {}", m.symbol.signature);
+                }
+            }
+            Ok(())
+        }
+        "get" => {
+            if args.len() < 2 {
+                eprintln!("Usage: keel symbols get <file> <symbol_name>");
+                std::process::exit(2);
+            }
+            let file = &args[0];
+            let name = &args[1];
+            let abs = keel_agent::tools::confine(&root, file)?;
+            match index.get_symbol_source(&abs, file, name)? {
+                Some((sym, code)) => {
+                    println!(
+                        "Symbol `{}` ({} L{}-L{}):",
+                        sym.name,
+                        sym.kind.as_str(),
+                        sym.start_line,
+                        sym.end_line
+                    );
+                    println!("{code}");
+                }
+                None => {
+                    eprintln!("Symbol `{name}` not found in `{file}`.");
+                    std::process::exit(1);
+                }
+            }
+            Ok(())
+        }
+        other => {
+            eprintln!(
+                "unknown symbols subcommand `{other}`. Usage: keel symbols <outline|search|get> ..."
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
 fn cli_vfs(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result<()> {
     let json_mode = take_flag(&mut args, "--json");
     let root = match root_opt {
@@ -877,6 +976,10 @@ fn main() -> anyhow::Result<()> {
     if args.first().map(String::as_str) == Some("oracle") {
         args.remove(0);
         return cli_oracle(args, root_opt);
+    }
+    if args.first().map(String::as_str) == Some("symbols") {
+        args.remove(0);
+        return cli_symbols(args, root_opt);
     }
 
     let mut interactive = take_flag(&mut args, "-i") || take_flag(&mut args, "--interactive");
@@ -1153,6 +1256,7 @@ fn main() -> anyhow::Result<()> {
             .unwrap_or(keel_agent::SentinelMode::Warn),
         auto_baseline: sentinel_opt.is_some(),
     });
+    let _p_symbols = ctx.mount(&keel_agent::SymbolPlugin { root: root.clone() });
 
     let mut extra_servers = std::collections::HashMap::new();
     for spec in mcp_server_opts {
