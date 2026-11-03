@@ -60,7 +60,9 @@ pub use recorder::{
     FlightRecorder, FlightRecorderPlugin, ForkReport, RecordFrame, RecordedSession,
     RecordingSummary, ReplayEngine, ReplayEnginePlugin, RestoreReport, StepInspection,
 };
-pub use repomap::{compute_pagerank, ReferenceGraph, RepoMap, RepoMapPlugin, RepoMapTool};
+pub use repomap::{
+    compute_pagerank, LazyRepoMap, ReferenceGraph, RepoMap, RepoMapPlugin, RepoMapTool,
+};
 pub use sandbox::{
     LandlockPlugin, SandboxPolicy, COMMON_TOOLCHAIN_ROOTS, DEFAULT_DEVICE_NODES, TOOLCHAIN_ENV_VARS,
 };

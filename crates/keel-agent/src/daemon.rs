@@ -2761,7 +2761,8 @@ pub fn handle_acp_client<R: BufRead>(
                     server.llm.clone(),
                     server.broadcaster.clone(),
                 );
-                if let Some(map) = session.ctx.service::<Arc<crate::repomap::RepoMap>>() {
+                if let Some(lazy) = session.ctx.service::<Arc<crate::repomap::LazyRepoMap>>() {
+                    let map = lazy.get();
                     let markdown = map.render(max_tokens, focus.as_deref());
                     rpc_writer.send_response(
                         id,
@@ -2789,7 +2790,8 @@ pub fn handle_acp_client<R: BufRead>(
                     server.llm.clone(),
                     server.broadcaster.clone(),
                 );
-                if let Some(map) = session.ctx.service::<Arc<crate::repomap::RepoMap>>() {
+                if let Some(lazy) = session.ctx.service::<Arc<crate::repomap::LazyRepoMap>>() {
+                    let map = lazy.get();
                     let mut top_files: Vec<_> = map
                         .ranks
                         .iter()

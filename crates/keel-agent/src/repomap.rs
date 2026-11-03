@@ -299,6 +299,39 @@ pub fn compute_pagerank(
 // 3. RepoMap Architecture
 // ---------------------------------------------------------------------------
 
+const MAX_REPOMAP_DEPTH: usize = 32;
+const MAX_REPOMAP_VISITED: usize = 200_000;
+const MAX_REPOMAP_FILES: usize = 5_000;
+const MAX_REPOMAP_FILE_BYTES: u64 = 5 * 1024 * 1024;
+const MAX_REPOMAP_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+
+/// A [`RepoMap`] that is only built (once) when something first asks for it, so that
+/// mounting the plugin costs nothing for sessions that never use the map.
+pub struct LazyRepoMap {
+    root: PathBuf,
+    cell: std::sync::OnceLock<Arc<RepoMap>>,
+}
+
+impl LazyRepoMap {
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            cell: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Builds the map on first call; later calls return the cached result.
+    pub fn get(&self) -> &Arc<RepoMap> {
+        self.cell
+            .get_or_init(|| Arc::new(RepoMap::discover(&self.root)))
+    }
+
+    /// Whether the map has already been built.
+    pub fn is_built(&self) -> bool {
+        self.cell.get().is_some()
+    }
+}
+
 /// Scored repository architecture map for LLM context conditioning.
 #[derive(Clone, Debug)]
 pub struct RepoMap {
@@ -334,60 +367,74 @@ impl RepoMap {
     }
 
     /// Discover and build a `RepoMap` from the disk workspace, ignoring build/vcs artifacts.
+    ///
+    /// The walk is bounded (depth, visited entries, file count and total bytes) and never
+    /// follows symlinks, so a hostile or simply enormous tree cannot stall startup, exhaust
+    /// memory, or pull in files from outside the workspace.
     pub fn discover(root: &Path) -> Self {
         let mut pairs = Vec::new();
         let ignored: HashSet<&str> = [
             "target",
-            ".git",
             "node_modules",
             "dist",
             "build",
-            ".gemini",
-            ".venv",
             "venv",
             "__pycache__",
         ]
         .into_iter()
         .collect();
 
-        fn walk(dir: &Path, root: &Path, ignored: &HashSet<&str>, out: &mut Vec<(String, String)>) {
-            let Ok(entries) = std::fs::read_dir(dir) else {
-                return;
+        let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+        let (mut visited, mut total_bytes) = (0usize, 0u64);
+        'walk: while let Some((dir, depth)) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
             };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let file_name = entry.file_name().to_string_lossy().to_string();
-                if ignored.contains(file_name.as_str()) {
-                    continue;
+            let mut entries: Vec<_> = rd.flatten().collect();
+            entries.sort_by_key(|e| e.file_name());
+            for entry in entries {
+                visited += 1;
+                if visited > MAX_REPOMAP_VISITED || pairs.len() >= MAX_REPOMAP_FILES {
+                    break 'walk;
                 }
-                if path.is_dir() {
-                    walk(&path, root, ignored, out);
-                } else if path.is_file() {
-                    if let Ok(meta) = path.metadata() {
-                        if meta.len() > 5 * 1024 * 1024 {
-                            continue;
-                        }
+                let name = entry.file_name().to_string_lossy().to_string();
+                // `DirEntry::file_type` does not follow symlinks.
+                let Ok(ft) = entry.file_type() else { continue };
+                if ft.is_dir() {
+                    if name.starts_with('.') || ignored.contains(name.as_str()) {
+                        continue;
                     }
+                    if depth < MAX_REPOMAP_DEPTH {
+                        stack.push((entry.path(), depth + 1));
+                    }
+                } else if ft.is_file() {
+                    let path = entry.path();
                     let ext = path
                         .extension()
                         .and_then(|e| e.to_str())
                         .unwrap_or("")
                         .to_lowercase();
-                    if matches!(
+                    if !matches!(
                         ext.as_str(),
                         "rs" | "py" | "ts" | "js" | "go" | "c" | "cpp" | "h" | "hpp" | "sh"
                     ) {
-                        if let Ok(content) = std::fs::read_to_string(&path) {
-                            if let Ok(rel) = path.strip_prefix(root) {
-                                out.push((rel.to_string_lossy().to_string(), content));
-                            }
+                        continue;
+                    }
+                    let Ok(meta) = entry.metadata() else { continue };
+                    if meta.len() > MAX_REPOMAP_FILE_BYTES
+                        || total_bytes + meta.len() > MAX_REPOMAP_TOTAL_BYTES
+                    {
+                        continue;
+                    }
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        if let Ok(rel) = path.strip_prefix(root) {
+                            total_bytes += meta.len();
+                            pairs.push((rel.to_string_lossy().to_string(), content));
                         }
                     }
                 }
             }
         }
-
-        walk(root, root, &ignored, &mut pairs);
         Self::from_files(root.to_path_buf(), pairs)
     }
 
@@ -466,7 +513,7 @@ impl RepoMap {
 // ---------------------------------------------------------------------------
 
 pub struct RepoMapTool {
-    pub map: Arc<RepoMap>,
+    pub map: Arc<LazyRepoMap>,
 }
 
 impl Tool for RepoMapTool {
@@ -511,7 +558,7 @@ impl Tool for RepoMapTool {
             })
         });
 
-        Ok(self.map.render(max_tokens, focus.as_deref()))
+        Ok(self.map.get().render(max_tokens, focus.as_deref()))
     }
 }
 
@@ -531,7 +578,7 @@ impl Plugin for RepoMapPlugin {
     }
 
     fn apply(&self, scope: &mut Scope) {
-        let map = Arc::new(RepoMap::discover(&self.root));
+        let map = Arc::new(LazyRepoMap::new(self.root.clone()));
         scope.provide(map.clone());
         if let Some(registry) = scope.context().service::<crate::sandbox::ToolRegistry>() {
             registry.register(Arc::new(RepoMapTool { map }));
@@ -665,5 +712,44 @@ mod tests {
         assert!(rendered.contains("Repository Architecture Map"));
         assert!(rendered.contains("crates/agent/src/lib.rs"));
         assert!(rendered.contains("crates/agent/src/daemon.rs"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_does_not_follow_symlinks_or_hidden_dirs() {
+        let base = std::env::temp_dir().join(format!("keel-repomap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let ws = base.join("ws");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::create_dir_all(ws.join(".hidden")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(ws.join("src/lib.rs"), "pub fn inside() {}").unwrap();
+        std::fs::write(ws.join(".hidden/h.rs"), "pub fn hidden() {}").unwrap();
+        std::fs::write(outside.join("secret.rs"), "pub fn secret() {}").unwrap();
+        std::os::unix::fs::symlink(&outside, ws.join("link")).unwrap();
+        // A symlink loop back to the workspace root must not recurse forever.
+        std::os::unix::fs::symlink(&ws, ws.join("src/loop")).unwrap();
+
+        let map = RepoMap::discover(&ws);
+        let _ = std::fs::remove_dir_all(&base);
+        let mut paths: Vec<_> = map.outlines.keys().cloned().collect();
+        paths.sort();
+        assert_eq!(paths, vec!["src/lib.rs".to_string()]);
+    }
+
+    #[test]
+    fn lazy_repomap_builds_once_on_first_use() {
+        let base = std::env::temp_dir().join(format!("keel-lazymap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("a.rs"), "pub fn a() {}").unwrap();
+        let lazy = LazyRepoMap::new(base.clone());
+        assert!(!lazy.is_built());
+        let first = lazy.get().clone();
+        assert!(lazy.is_built());
+        assert!(Arc::ptr_eq(&first, lazy.get()));
+        assert_eq!(first.outlines.len(), 1);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

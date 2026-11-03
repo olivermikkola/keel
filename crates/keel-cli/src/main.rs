@@ -42,6 +42,7 @@ use serde_json::json;
 use std::io::Write;
 use std::sync::Arc;
 
+mod args;
 mod bench;
 
 /// Live terminal output: answer text on stdout, reasoning dimmed on stderr.
@@ -172,6 +173,35 @@ impl Plugin for JsonPrinter {
     }
 }
 
+const REPL_COMMANDS: &[&str] = &[
+    "/help",
+    "/?",
+    "/undo",
+    "/tree",
+    "/sentinel",
+    "/checkpoint",
+    "/checkpoints",
+    "/memory",
+    "/replay",
+    "/recordings",
+    "/clear",
+    "/history",
+];
+
+const REPL_HELP: &str = "REPL commands:
+  /undo         revert workspace to the most recent checkpoint
+  /checkpoint   list checkpoints
+  /memory       show epistemic working memory
+  /tree         show the exploration tree
+  /sentinel     show streaming-sentinel status
+  /replay       list recent session recordings
+  /history      show conversation depth
+  /clear        reset conversation history
+  /help         show this help
+  exit, quit    leave the REPL (Ctrl-D also works)
+anything else is sent to the model.
+";
+
 fn print_usage() {
     eprintln!(
         r#"usage:
@@ -195,7 +225,9 @@ fn print_usage() {
   keel sentinel <cmd>              streaming tool-call interception & early veto sentinel (status, check, rules)
   keel replay <cmd>                deterministic session flight recorder & time-travel (list, info, inspect, restore, fork)
   keel subagent "prompt" [opts]    run isolated read-only subagent query (roles: researcher, navigator, auditor)
+  keel repomap [options]           ranked repository map
   keel bench [filter] [--runs N]   run benchmark suite
+  keel --version                   print version
 
 options:
   --model <name>                   LLM model identifier (e.g. kat-coder, bonsai-9b, deepseek-chat)
@@ -211,7 +243,21 @@ options:
   --json                           emit machine-readable JSON output
   --dry-run                        preview patch/edit without writing
   --yolo                           allow mutating tools (write/edit/patch/shell)
+  --read-only                      deny all mutating tools
+  --safety-mode <mode>             approval policy (or KEEL_SAFETY_MODE)
+  --shadow                         in-memory shadow VFS (no writes until commit)
   --no-sandbox                     disable Linux Landlock sandbox
+  --sandbox-allow-read <path>      extra readable path (repeatable)
+  --sandbox-allow-write <path>     extra writable path (repeatable)
+  --no-toolchains                  skip toolchain directory discovery
+  --max-context-tokens <N>         context window budget (or KEEL_MAX_CONTEXT_TOKENS)
+  --compaction-keep-turns <N>      recent turns kept verbatim when compacting
+  --cascade <model>                escalate to a frontier model on repeated failure
+  --candidates <N>                 speculate: candidate count (1-4)
+  --apply                          speculate: apply the winning candidate
+  --runs <N>                       bench: runs per task
+  -i, --interactive                force REPL even with a prompt
+  --                               end of options; rest is the prompt
   --auto-rollback                  automatically revert workspace if verification fails
   --verify <cmd>                   enforce verification command gate
   --mcp-server <name=cmd...>       attach ad-hoc stdio MCP server
@@ -1559,6 +1605,10 @@ fn main() -> anyhow::Result<()> {
         print_usage();
         return Ok(());
     }
+    if take_flag(&mut args, "--version") || take_flag(&mut args, "-V") {
+        println!("keel {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
 
     let root_opt = take_opt(&mut args, "--root");
 
@@ -1623,6 +1673,7 @@ fn main() -> anyhow::Result<()> {
         return cli_repomap(args, root_opt);
     }
 
+    let literal_tail = args::split_literal_tail(&mut args);
     let mut interactive = take_flag(&mut args, "-i") || take_flag(&mut args, "--interactive");
     if args.first().map(String::as_str) == Some("repl") {
         args.remove(0);
@@ -1702,6 +1753,18 @@ fn main() -> anyhow::Result<()> {
     if bench_mode {
         args.remove(0);
     }
+    let any_mode = daemon_mode || subagent_mode || speculate_mode || bench_mode;
+    if let Err(msg) = args::validate_remaining(&args).and_then(|()| {
+        if any_mode || interactive || !literal_tail.is_empty() {
+            Ok(())
+        } else {
+            args::check_subcommand_typo(&args)
+        }
+    }) {
+        eprintln!("error: {msg}\n\nrun `keel --help` for usage");
+        std::process::exit(2);
+    }
+    args.extend(literal_tail);
     let mut prompt = args.join(" ");
 
     let root = match root_opt {
@@ -2062,8 +2125,12 @@ fn main() -> anyhow::Result<()> {
     }
 
     if prompt.is_empty() || interactive {
-        println!("keel v0.0.1 (interactive REPL, root: {})", root.display());
-        println!("Commands: /undo, /checkpoint, /memory, /clear, /history, exit, quit.\n");
+        println!(
+            "keel v{} (interactive REPL, root: {})",
+            env!("CARGO_PKG_VERSION"),
+            root.display()
+        );
+        println!("Type /help for commands, exit to quit.\n");
         let stdin = std::io::stdin();
         loop {
             print!("keel> ");
@@ -2079,6 +2146,18 @@ fn main() -> anyhow::Result<()> {
             }
             if matches!(trimmed, "exit" | "quit") {
                 break;
+            }
+            if trimmed == "/help" || trimmed == "/?" {
+                println!("{REPL_HELP}");
+                continue;
+            }
+            if trimmed.starts_with('/')
+                && !trimmed.contains(char::is_whitespace)
+                && trimmed.matches('/').count() == 1
+                && !REPL_COMMANDS.contains(&trimmed)
+            {
+                eprintln!("unknown command {trimmed} (try /help)\n");
+                continue;
             }
             if trimmed == "/undo" {
                 if let Some(mgr) = ctx.service::<CheckpointManager>() {
