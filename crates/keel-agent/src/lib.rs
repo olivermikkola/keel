@@ -25,8 +25,11 @@ pub mod provider;
 pub mod sandbox;
 pub mod speculate;
 pub mod subagent;
+pub mod swarm;
 pub mod tools;
 pub mod vfs;
+
+pub use swarm::{export_handoff, ingest_handoff, HandoffEnvelope, HandoffIngestReport};
 
 use anyhow::Result;
 use keel_kernel::{Context, Plugin, Scope};

@@ -704,6 +704,7 @@ pub fn handle_acp_client<R: BufRead>(
                             "epistemicMemory": true,
                             "persistentDaemon": true,
                             "sessionMultiplexing": true,
+                            "swarmHandoff": true,
                         }
                     }),
                 );
@@ -1235,6 +1236,96 @@ pub fn handle_acp_client<R: BufRead>(
                     rpc_writer.send_error(id, -32000, "EpistemicStore not mounted");
                 }
             }
+            "handoff/ingest" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let Some(env_val) = params.get("envelope") else {
+                    rpc_writer.send_error(id, -32602, "missing `envelope` object parameter");
+                    continue;
+                };
+                let envelope: crate::swarm::HandoffEnvelope =
+                    match serde_json::from_value(env_val.clone()) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            rpc_writer.send_error(
+                                id,
+                                -32602,
+                                &format!("invalid HandoffEnvelope: {e}"),
+                            );
+                            continue;
+                        }
+                    };
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                let mut h_guard = match session.history.lock() {
+                    Ok(g) => g,
+                    Err(_) => {
+                        rpc_writer.send_error(id, -32000, "session history mutex poisoned");
+                        continue;
+                    }
+                };
+                match crate::swarm::ingest_handoff(&envelope, &session.ctx, &mut h_guard) {
+                    Ok(report) => {
+                        rpc_writer.send_response(
+                            id,
+                            json!({
+                                "session_id": sid,
+                                "status": "ok",
+                                "report": report,
+                            }),
+                        );
+                    }
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32000, &format!("{e:#}"));
+                    }
+                }
+            }
+            "handoff/export" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let target_harness = params
+                    .get("target_harness")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("helm");
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                let h_guard = match session.history.lock() {
+                    Ok(g) => g,
+                    Err(_) => {
+                        rpc_writer.send_error(id, -32000, "session history mutex poisoned");
+                        continue;
+                    }
+                };
+                match crate::swarm::export_handoff(&sid, target_harness, &session.ctx, &h_guard) {
+                    Ok(envelope) => {
+                        rpc_writer.send_response(
+                            id,
+                            json!({
+                                "session_id": sid,
+                                "status": "ok",
+                                "envelope": envelope,
+                            }),
+                        );
+                    }
+                    Err(e) => {
+                        rpc_writer.send_error(id, -32000, &format!("{e:#}"));
+                    }
+                }
+            }
             "shutdown" | "exit" => {
                 if !id.is_null() {
                     rpc_writer.send_response(id, json!({ "status": "shutting_down" }));
@@ -1710,6 +1801,91 @@ mod tests {
 
         srv_handle.join().unwrap();
         assert!(!sock_path.exists());
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn acp_daemon_handoff_ingest_and_export_rpc() {
+        let tmp = std::env::temp_dir().join(format!("keel-handoff-rpc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let out_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+
+        struct SharedVecWriter(Arc<Mutex<Vec<u8>>>);
+        impl Write for SharedVecWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let handoff_payload = json!({
+            "source_conversation_id": "helm-session-888",
+            "source_harness": "helm",
+            "target_harness": "keel",
+            "goal": "Implement cross-harness bounce protocol",
+            "relevant_files": ["crates/keel-agent/src/swarm.rs"],
+            "open_tasks": ["Add ACP handoff JSON-RPC endpoints"],
+            "completed_tasks": ["Draft HandoffEnvelope struct"],
+            "context_summary": "Architecture verified on both sides"
+        });
+
+        let requests = [
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "handoff/ingest", "params": {"envelope": handoff_payload}}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "handoff/export", "params": {"target_harness": "claude"}}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 4, "method": "shutdown", "params": {}}).to_string(),
+        ]
+        .join("\n")
+            + "\n";
+
+        let cfg = DaemonConfig {
+            root: tmp.clone(),
+            policy: ApprovalPolicy::Yolo,
+            landlock_enabled: false,
+            vfs_mode: VfsMode::MaterializedCow,
+            verify_command: None,
+        };
+
+        serve_acp(
+            BufReader::new(std::io::Cursor::new(requests.into_bytes())),
+            Box::new(SharedVecWriter(out_buf.clone())),
+            cfg,
+            Arc::new(DaemonTestLlm),
+        )
+        .unwrap();
+
+        let raw_output = String::from_utf8(out_buf.lock().unwrap().clone()).unwrap();
+        let lines: Vec<Value> = raw_output
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .collect();
+
+        // 1. Verify capability includes swarmHandoff
+        assert!(lines
+            .iter()
+            .any(|v| v["id"] == 1 && v["result"]["capabilities"]["swarmHandoff"] == true));
+
+        // 2. Verify ingest response
+        assert!(lines.iter().any(|v| v["id"] == 2
+            && v["result"]["status"] == "ok"
+            && v["result"]["report"]["tasks_injected"] == 2
+            && v["result"]["report"]["goal"] == "Implement cross-harness bounce protocol"));
+
+        // 3. Verify export response
+        let export_msg = lines.iter().find(|v| v["id"] == 3).unwrap();
+        assert_eq!(export_msg["result"]["status"], "ok");
+        assert_eq!(
+            export_msg["result"]["envelope"]["goal"],
+            "Implement cross-harness bounce protocol"
+        );
+        assert_eq!(export_msg["result"]["envelope"]["source_harness"], "keel");
+        assert_eq!(export_msg["result"]["envelope"]["target_harness"], "claude");
+
         let _ = std::fs::remove_dir_all(tmp);
     }
 }
