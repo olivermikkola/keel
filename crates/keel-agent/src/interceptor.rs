@@ -439,6 +439,30 @@ impl StreamingSentinel {
 
 const MAX_PREWARM_FILE_SIZE: u64 = 1024 * 1024; // 1 MB cap on prewarmed file content
 const MAX_PREWARM_ENTRIES: usize = 64; // Max entries in LRU prewarm cache
+const PREWARM_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A prewarmed file plus the on-disk fingerprint it was read under.
+struct WarmEntry {
+    loaded: Instant,
+    mtime: Option<std::time::SystemTime>,
+    len: u64,
+    content: String,
+}
+
+impl WarmEntry {
+    /// Still valid only if young enough and the file is unchanged on disk.
+    fn is_fresh(&self, path: &Path) -> bool {
+        if self.loaded.elapsed() > PREWARM_TTL {
+            return false;
+        }
+        match std::fs::symlink_metadata(path) {
+            Ok(m) => {
+                m.file_type().is_file() && m.len() == self.len && m.modified().ok() == self.mtime
+            }
+            Err(_) => false,
+        }
+    }
+}
 
 /// Predictive Pre-warming Cache and Engine.
 ///
@@ -446,7 +470,7 @@ const MAX_PREWARM_ENTRIES: usize = 64; // Max entries in LRU prewarm cache
 /// as soon as the target `path` argument is streamed, eliminating disk wait times.
 pub struct PrewarmEngine {
     workspace_root: PathBuf,
-    file_cache: RwLock<HashMap<PathBuf, (Instant, String)>>,
+    file_cache: RwLock<HashMap<PathBuf, WarmEntry>>,
     prewarm_requests: AtomicU64,
     cache_hits: AtomicU64,
 }
@@ -506,31 +530,49 @@ impl PrewarmEngine {
         if cache.len() >= MAX_PREWARM_ENTRIES && !cache.contains_key(&canon_path) {
             if let Some(oldest_key) = cache
                 .iter()
-                .min_by_key(|(_, (instant, _))| *instant)
+                .min_by_key(|(_, e)| e.loaded)
                 .map(|(k, _)| k.clone())
             {
                 cache.remove(&oldest_key);
             }
         }
 
-        if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(canon_path.clone()) {
-            use std::io::Read;
-            if let Ok(mut f) = std::fs::File::open(&canon_path) {
-                let mut buf = Vec::new();
-                if f.by_ref()
-                    .take(MAX_PREWARM_FILE_SIZE)
-                    .read_to_end(&mut buf)
-                    .is_ok()
-                {
-                    if let Ok(content) = String::from_utf8(buf) {
-                        e.insert((Instant::now(), content));
-                        return true;
-                    }
+        // Keep a still-fresh entry; refresh anything stale.
+        if cache
+            .get(&canon_path)
+            .is_some_and(|e| e.is_fresh(&canon_path))
+        {
+            return false;
+        }
+        use std::io::Read;
+        if let Ok(mut f) = std::fs::File::open(&canon_path) {
+            let mut buf = Vec::new();
+            if f.by_ref()
+                .take(MAX_PREWARM_FILE_SIZE)
+                .read_to_end(&mut buf)
+                .is_ok()
+            {
+                if let Ok(content) = String::from_utf8(buf) {
+                    cache.insert(
+                        canon_path,
+                        WarmEntry {
+                            loaded: Instant::now(),
+                            mtime: meta.modified().ok(),
+                            len: meta.len(),
+                            content,
+                        },
+                    );
+                    return true;
                 }
             }
         }
 
         false
+    }
+
+    /// Drop every warmed entry (call after any tool that may have changed files).
+    pub fn invalidate_all(&self) {
+        self.file_cache.write().expect("lock poisoned").clear();
     }
 
     /// Retrieve warmed file contents, recording a cache hit if found.
@@ -551,12 +593,27 @@ impl PrewarmEngine {
             return None;
         }
 
-        let cache = self.file_cache.read().expect("lock poisoned");
-        if let Some((_, content)) = cache.get(&canon_path) {
-            self.cache_hits.fetch_add(1, Ordering::Relaxed);
-            Some(content.clone())
-        } else {
-            None
+        let hit = {
+            let cache = self.file_cache.read().expect("lock poisoned");
+            match cache.get(&canon_path) {
+                Some(e) if e.is_fresh(&canon_path) => Some(e.content.clone()),
+                Some(_) => None,
+                None => return None,
+            }
+        };
+        match hit {
+            Some(content) => {
+                self.cache_hits.fetch_add(1, Ordering::Relaxed);
+                Some(content)
+            }
+            None => {
+                // Stale: evict so memory is released and the next read goes to disk.
+                self.file_cache
+                    .write()
+                    .expect("lock poisoned")
+                    .remove(&canon_path);
+                None
+            }
         }
     }
 
@@ -801,5 +858,39 @@ mod tests {
         // Next field key extraction works cleanly even after large buffer
         parser.feed("\", \"path\": \"foo.rs\"}");
         assert_eq!(parser.fields().get("path").unwrap(), "foo.rs");
+    }
+
+    #[test]
+    fn prewarm_never_serves_stale_content() {
+        let tmp = std::env::temp_dir().join(format!("keel_prewarm_stale_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let f = tmp.join("a.rs");
+        std::fs::write(&f, "old").unwrap();
+
+        let engine = PrewarmEngine::new(&tmp);
+        let mut fields = HashMap::new();
+        fields.insert("path".into(), "a.rs".into());
+        assert!(engine.check_and_prewarm("read_file", &fields));
+        assert_eq!(engine.get_warmed(&f).as_deref(), Some("old"));
+
+        // Same-length edit with a different mtime must not be served from cache.
+        std::fs::write(&f, "new").unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(&f)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        assert_eq!(engine.get_warmed(&f), None);
+        assert_eq!(engine.metrics()["cached_entries"], 0);
+
+        // Re-prewarming picks up the new content; invalidate_all clears it.
+        assert!(engine.check_and_prewarm("read_file", &fields));
+        assert_eq!(engine.get_warmed(&f).as_deref(), Some("new"));
+        engine.invalidate_all();
+        assert_eq!(engine.get_warmed(&f), None);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
