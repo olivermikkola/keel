@@ -57,7 +57,11 @@ impl CheckpointManager {
             .current_dir(&self.root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            .env("GIT_AUTHOR_NAME", "keel")
+            .env("GIT_AUTHOR_EMAIL", "keel@local")
+            .env("GIT_COMMITTER_NAME", "keel")
+            .env("GIT_COMMITTER_EMAIL", "keel@local");
         for (k, v) in extra_env {
             cmd.env(k, v);
         }

@@ -21,6 +21,11 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      - name: Configure Git author identity
+        run: |
+          git config --global user.email "keel@local"
+          git config --global user.name "keel"
+
       - name: Cache Cargo registry and build artifacts
         uses: actions/cache@v4
         with:
