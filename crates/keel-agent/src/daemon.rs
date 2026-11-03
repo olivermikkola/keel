@@ -1731,8 +1731,9 @@ pub fn handle_acp_client<R: BufRead>(
                     server.llm.clone(),
                     server.broadcaster.clone(),
                 );
+                let filter = params.get("filter").and_then(|v| v.as_str());
                 if let Some(oracle) = session.ctx.service::<Arc<DiagnosticOracle>>() {
-                    match oracle.run_tests() {
+                    match oracle.run_tests_filtered(filter) {
                         Ok(snap) => {
                             rpc_writer
                                 .send_response(id, json!({ "session_id": sid, "snapshot": snap }));
