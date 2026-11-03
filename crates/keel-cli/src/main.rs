@@ -26,6 +26,7 @@ use keel_agent::{
     mcp::{McpClient, McpPlugin, McpServerConfig},
     plan::PlanPlugin,
     provider::OpenAiCompat,
+    repomap::{RepoMap, RepoMapPlugin},
     sandbox::LandlockPlugin,
     speculate::{SpeculatePlugin, SpeculationConfig, SpeculationEngine},
     subagent::SubagentPlugin,
@@ -37,6 +38,7 @@ use keel_agent::{
     SessionLogPlugin, StreamingSentinel, StreamingSentinelMode, ToolResult, ToolStart,
 };
 use keel_kernel::{Context, Plugin, Scope};
+use serde_json::json;
 use std::io::Write;
 use std::sync::Arc;
 
@@ -1439,6 +1441,52 @@ fn cli_replay(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result
     }
 }
 
+fn cli_repomap(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result<()> {
+    let max_tokens: usize = take_opt(&mut args, "--max-tokens")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1024);
+    let focus_opt = take_opt(&mut args, "--focus");
+    let json_mode = take_flag(&mut args, "--json");
+    let root = match root_opt {
+        Some(r) => std::fs::canonicalize(r)?,
+        None => std::env::current_dir()?,
+    };
+
+    let map = RepoMap::discover(&root);
+    let focus_vec: Option<Vec<String>> = focus_opt.map(|f| {
+        f.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    });
+
+    if json_mode {
+        let mut top_files: Vec<_> = map
+            .ranks
+            .iter()
+            .map(|(path, &rank)| json!({ "path": path, "rank": rank }))
+            .collect();
+        top_files.sort_by(|a, b| {
+            b["rank"]
+                .as_f64()
+                .unwrap_or(0.0)
+                .partial_cmp(&a["rank"].as_f64().unwrap_or(0.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "nodeCount": map.graph.node_count(),
+                "topFiles": top_files,
+            }))?
+        );
+    } else {
+        let rendered = map.render(max_tokens, focus_vec.as_deref());
+        println!("{rendered}");
+    }
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -1504,6 +1552,10 @@ fn main() -> anyhow::Result<()> {
     if args.first().map(String::as_str) == Some("replay") {
         args.remove(0);
         return cli_replay(args, root_opt);
+    }
+    if args.first().map(String::as_str) == Some("repomap") {
+        args.remove(0);
+        return cli_repomap(args, root_opt);
     }
 
     let mut interactive = take_flag(&mut args, "-i") || take_flag(&mut args, "--interactive");
@@ -1826,6 +1878,7 @@ fn main() -> anyhow::Result<()> {
         auto_baseline: sentinel_opt.is_some(),
     });
     let _p_symbols = ctx.mount(&keel_agent::SymbolPlugin { root: root.clone() });
+    let _p_repomap = ctx.mount(&RepoMapPlugin::new(root.clone()));
     let _p_tree = ctx.mount(&keel_agent::TreePlugin { root: root.clone() });
     let _p_sentinel = ctx.mount(&SentinelPlugin(Arc::new(StreamingSentinel::default())));
     let _p_prewarm = ctx.mount(&PrewarmPlugin(Arc::new(PrewarmEngine::new(root.clone()))));
