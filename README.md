@@ -54,3 +54,12 @@ crates/keel-agent    agent loop, tools, Landlock sandbox, OpenAI/DeepSeek provid
 crates/keel-cli      `keel` binary + `keel bench` harness benchmark suite
 docs/REFERENCES.md   what we study and borrow, with licenses
 ```
+
+## Resuming a conversation
+
+`keel run --resume session.jsonl "continue"` loads the complete saved conversation
+before mounting runtime plugins or calling the model. Missing, empty, malformed,
+or oversized session logs fail explicitly; Keel does not silently start fresh or
+use a truncated prefix. In `--json` mode, this returns a `done` event with
+`status: "error"` and exits unsuccessfully. The source log is left unchanged.
+Use a valid log, or omit `--resume` to deliberately start a new conversation.
