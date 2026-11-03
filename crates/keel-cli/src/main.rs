@@ -176,12 +176,20 @@ impl Plugin for JsonPrinter {
 const REPL_COMMANDS: &[&str] = &[
     "/help",
     "/?",
+    "/status",
+    "/diff",
     "/undo",
-    "/tree",
-    "/sentinel",
+    "/save",
     "/checkpoint",
     "/checkpoints",
+    "/vfs",
+    "/commit",
+    "/rollback",
+    "/context",
+    "/budget",
     "/memory",
+    "/tree",
+    "/sentinel",
     "/replay",
     "/recordings",
     "/clear",
@@ -189,17 +197,23 @@ const REPL_COMMANDS: &[&str] = &[
 ];
 
 const REPL_HELP: &str = "REPL commands:
-  /undo         revert workspace to the most recent checkpoint
-  /checkpoint   list checkpoints
-  /memory       show epistemic working memory
-  /tree         show the exploration tree
-  /sentinel     show streaming-sentinel status
-  /replay       list recent session recordings
-  /history      show conversation depth
-  /clear        reset conversation history
-  /help         show this help
-  exit, quit    leave the REPL (Ctrl-D also works)
-anything else is sent to the model.
+  /status               show harness status (model, tokens, modified files)
+  /diff                 show uncommitted or shadow VFS differences
+  /save <description>   snapshot workspace into a git shadow checkpoint
+  /undo                 revert workspace to the most recent checkpoint
+  /checkpoint [cmd]     manage checkpoints (list, save <desc>, restore <id>, diff <id>)
+  /vfs [cmd]            transactional VFS (status, diff, commit, rollback)
+  /context              show token budget usage and compaction metrics
+  /memory               show epistemic working memory
+  /tree                 show the branching exploration tree
+  /sentinel             show streaming-sentinel security metrics
+  /replay               list recent session recordings
+  /history              show conversation depth
+  /clear                reset conversation history
+  /help, /?             show this help
+  exit, quit            leave the REPL (Ctrl-D also works)
+Prefix with `//` to send a prompt starting with `/` to the model.
+Anything else is sent to the model.
 ";
 
 fn print_usage() {
@@ -2158,131 +2172,395 @@ fn main() -> anyhow::Result<()> {
             if matches!(trimmed, "exit" | "quit") {
                 break;
             }
-            if trimmed == "/help" || trimmed == "/?" {
-                println!("{REPL_HELP}");
-                continue;
-            }
-            if trimmed.starts_with('/')
-                && !trimmed.contains(char::is_whitespace)
-                && trimmed.matches('/').count() == 1
-                && !REPL_COMMANDS.contains(&trimmed)
-            {
-                eprintln!("unknown command {trimmed} (try /help)\n");
-                continue;
-            }
-            if trimmed == "/undo" {
-                if let Some(mgr) = ctx.service::<CheckpointManager>() {
-                    match mgr.undo() {
-                        Ok(rep) => {
-                            println!(
-                                "Restored checkpoint {} (restored {} files, removed {} newly created files).\n",
-                                rep.checkpoint_id, rep.restored_files, rep.removed_files
-                            );
-                        }
-                        Err(e) => eprintln!("Failed to undo: {e:#}\n"),
+            let prompt_to_run = if trimmed.starts_with("//") {
+                &trimmed[1..]
+            } else if trimmed.starts_with('/') {
+                let (cmd, args) = match trimmed.split_once(char::is_whitespace) {
+                    Some((c, a)) => (c, a.trim()),
+                    None => (trimmed, ""),
+                };
+
+                if cmd == "/help" || cmd == "/?" {
+                    println!("{REPL_HELP}");
+                    continue;
+                }
+                if cmd == "/status" {
+                    println!("=== Keel Harness Status ===");
+                    println!("  Workspace root : {}", root.display());
+                    println!("  Model          : {} ({})", model_name, base_url);
+                    if let Some(compactor) = ctx.service::<AdaptiveCompactor>() {
+                        let est_tokens = compactor.estimate_history_tokens(&history);
+                        let budget = &compactor.budget;
+                        println!(
+                            "  Context tokens : ~{} / {} max (threshold: {})",
+                            est_tokens,
+                            budget.max_context_tokens,
+                            budget.compaction_threshold_tokens
+                        );
                     }
-                } else {
-                    println!("Checkpoint manager is not active.\n");
-                }
-                continue;
-            }
-            if trimmed == "/tree" {
-                if let Some(tree_arc) =
-                    ctx.service::<Arc<std::sync::Mutex<keel_agent::ExplorationTree>>>()
-                {
-                    let tree = tree_arc.lock().unwrap();
-                    print!("{}", tree.render_ascii());
-                }
-                continue;
-            }
-            if trimmed == "/sentinel" {
-                if let Some(sentinel) = ctx.service::<Arc<StreamingSentinel>>() {
-                    let m = sentinel.metrics();
-                    println!(
-                        "Streaming Sentinel: Mode={:?}, Rules={}, Vetoes={}\n",
-                        sentinel.mode(),
-                        m["rule_count"],
-                        m["veto_count"]
-                    );
-                } else {
-                    println!("Streaming Sentinel is not mounted.\n");
-                }
-                continue;
-            }
-            if trimmed == "/checkpoint" || trimmed == "/checkpoints" {
-                if let Some(mgr) = ctx.service::<CheckpointManager>() {
-                    match mgr.list() {
-                        Ok(list) => {
-                            if list.is_empty() {
-                                println!("No checkpoints recorded yet.\n");
-                            } else {
-                                println!("Checkpoints ({}):", list.len());
-                                for c in list {
-                                    println!(
-                                        "  - {} [{}] ({})",
-                                        c.id,
-                                        c.commit_hash.chars().take(7).collect::<String>(),
-                                        c.description
-                                    );
-                                }
-                                println!();
+                    println!("  History depth  : {} messages", history.len());
+                    if let Some(vfs) = ctx.service::<Arc<TransactionalVfs>>() {
+                        let st = vfs.status();
+                        let mode_str = match vfs.mode() {
+                            VfsMode::ShadowMemory => "ShadowMemory (in-memory overlay)",
+                            VfsMode::MaterializedCow => "MaterializedCoW (atomic rollback journal)",
+                        };
+                        println!("  VFS Mode       : {}", mode_str);
+                        if st.is_empty() {
+                            println!("  Modified files : (none)");
+                        } else {
+                            println!("  Modified files ({}):", st.len());
+                            for f in st {
+                                println!("    [{:?}] {}", f.status, f.path);
                             }
                         }
-                        Err(e) => eprintln!("Failed to list checkpoints: {e:#}\n"),
                     }
+                    if let Some(mgr) = ctx.service::<CheckpointManager>() {
+                        if let Ok(list) = mgr.list() {
+                            println!("  Checkpoints    : {} snapshots recorded", list.len());
+                        }
+                    }
+                    println!();
+                    continue;
                 }
-                continue;
-            }
-            if trimmed == "/memory" {
-                if let Some(store) = ctx.service::<EpistemicStore>() {
-                    let state = store.get();
-                    if state.is_empty() {
-                        println!("Epistemic working memory is currently empty.\n");
+                if cmd == "/diff" {
+                    let mut shown = false;
+                    if let Some(vfs) = ctx.service::<Arc<TransactionalVfs>>() {
+                        let d = vfs.diff();
+                        if !d.trim().is_empty() {
+                            println!("--- VFS Uncommitted Diff ---\n{d}");
+                            shown = true;
+                        }
+                    }
+                    if !shown {
+                        if let Some(mgr) = ctx.service::<CheckpointManager>() {
+                            if let Ok(list) = mgr.list() {
+                                if let Some(last) = list.last() {
+                                    if let Ok(d) = mgr.diff(Some(&last.id)) {
+                                        if !d.trim().is_empty() {
+                                            println!(
+                                                "--- Diff since checkpoint {} ({}) ---\n{d}",
+                                                last.id, last.description
+                                            );
+                                            shown = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !shown {
+                        println!("No modified files or uncommitted diff in workspace.\n");
                     } else {
-                        println!("{}", state.render_markdown());
+                        println!();
                     }
-                } else {
-                    println!("Epistemic store is not active.\n");
+                    continue;
                 }
-                continue;
-            }
-            if trimmed == "/replay" || trimmed == "/recordings" {
-                if let Some(engine) = ctx.service::<Arc<ReplayEngine>>() {
-                    match engine.list_recordings() {
-                        Ok(recs) => {
-                            if recs.is_empty() {
-                                println!("No session recordings found in .keel/recordings.\n");
+                if cmd == "/save" || cmd == "/checkpoint" || cmd == "/checkpoints" {
+                    if let Some(mgr) = ctx.service::<CheckpointManager>() {
+                        let sub = args.split_whitespace().collect::<Vec<_>>();
+                        if cmd == "/save" || (!args.is_empty() && sub[0] == "save") {
+                            let desc = if cmd == "/save" {
+                                args
                             } else {
-                                println!("Session Recordings ({}):", recs.len());
-                                for r in recs.iter().take(5) {
-                                    println!(
-                                        "  - {} [{}] ({} turns, {} steps, {}ms)",
-                                        r.session_id,
-                                        r.model,
-                                        r.total_turns,
-                                        r.total_steps,
-                                        r.duration_ms
-                                    );
+                                args.strip_prefix("save").unwrap_or("").trim()
+                            };
+                            let desc = if desc.is_empty() {
+                                "manual checkpoint"
+                            } else {
+                                desc
+                            };
+                            match mgr.save(desc) {
+                                Ok(info) => println!(
+                                    "Saved checkpoint {} ({})\n",
+                                    info.id, info.description
+                                ),
+                                Err(e) => eprintln!("Failed to save checkpoint: {e:#}\n"),
+                            }
+                        } else if !sub.is_empty() && sub[0] == "restore" {
+                            let id = sub.get(1).copied().unwrap_or("latest");
+                            match mgr.restore(id) {
+                                Ok(rep) => println!(
+                                    "Restored checkpoint {} (restored {} files, removed {} newly created files)\n",
+                                    rep.checkpoint_id, rep.restored_files, rep.removed_files
+                                ),
+                                Err(e) => eprintln!("Failed to restore checkpoint: {e:#}\n"),
+                            }
+                        } else if !sub.is_empty() && sub[0] == "diff" {
+                            let id = sub.get(1).copied().unwrap_or("latest");
+                            match mgr.diff(Some(id)) {
+                                Ok(d) if !d.trim().is_empty() => println!("{d}\n"),
+                                Ok(_) => {
+                                    println!("No differences found against checkpoint {id}.\n")
                                 }
-                                println!();
+                                Err(e) => eprintln!("Failed to diff checkpoint: {e:#}\n"),
+                            }
+                        } else {
+                            match mgr.list() {
+                                Ok(list) => {
+                                    if list.is_empty() {
+                                        println!("No checkpoints recorded yet. Use `/save <description>` to snapshot.\n");
+                                    } else {
+                                        println!("Checkpoints ({}):", list.len());
+                                        for c in list {
+                                            println!(
+                                                "  - {} [{}] ({})",
+                                                c.id,
+                                                c.commit_hash.chars().take(7).collect::<String>(),
+                                                c.description
+                                            );
+                                        }
+                                        println!();
+                                    }
+                                }
+                                Err(e) => eprintln!("Failed to list checkpoints: {e:#}\n"),
                             }
                         }
-                        Err(e) => eprintln!("Failed to list recordings: {e:#}\n"),
+                    } else {
+                        println!("Checkpoint manager is not active.\n");
                     }
+                    continue;
                 }
-                continue;
-            }
-            if trimmed == "/clear" {
-                history.truncate(1);
-                println!("History cleared.\n");
-                continue;
-            }
-            if trimmed == "/history" {
-                println!("Active conversation depth: {} messages.\n", history.len());
-                continue;
-            }
+                if cmd == "/undo" {
+                    if let Some(mgr) = ctx.service::<CheckpointManager>() {
+                        match mgr.undo() {
+                            Ok(rep) => {
+                                println!(
+                                    "Restored checkpoint {} (restored {} files, removed {} newly created files).\n",
+                                    rep.checkpoint_id, rep.restored_files, rep.removed_files
+                                );
+                            }
+                            Err(e) => eprintln!("Failed to undo: {e:#}\n"),
+                        }
+                    } else {
+                        println!("Checkpoint manager is not active.\n");
+                    }
+                    continue;
+                }
+                if cmd == "/vfs" {
+                    if let Some(vfs) = ctx.service::<Arc<TransactionalVfs>>() {
+                        match args {
+                            "commit" => match vfs.commit() {
+                                Ok(rep) => println!(
+                                    "Committed {} staged files to workspace disk.\n",
+                                    rep.committed_files
+                                ),
+                                Err(e) => eprintln!("Failed to commit VFS: {e:#}\n"),
+                            },
+                            "rollback" => match vfs.rollback() {
+                                Ok(rep) => println!(
+                                    "Rolled back {} files in workspace.\n",
+                                    rep.restored_files + rep.removed_files
+                                ),
+                                Err(e) => eprintln!("Failed to rollback VFS: {e:#}\n"),
+                            },
+                            "diff" => {
+                                let d = vfs.diff();
+                                if d.trim().is_empty() {
+                                    println!("No staged VFS changes.\n");
+                                } else {
+                                    println!("{d}\n");
+                                }
+                            }
+                            _ => {
+                                let st = vfs.status();
+                                if st.is_empty() {
+                                    println!(
+                                        "VFS status: clean (0 modified files, mode: {:?})\n",
+                                        vfs.mode()
+                                    );
+                                } else {
+                                    println!(
+                                        "VFS status ({} modified files, mode: {:?}):",
+                                        st.len(),
+                                        vfs.mode()
+                                    );
+                                    for f in st {
+                                        println!("  [{:?}] {}", f.status, f.path);
+                                    }
+                                    println!(
+                                        "\nUse `/vfs commit` to persist or `/vfs rollback` to discard.\n"
+                                    );
+                                }
+                            }
+                        }
+                    } else {
+                        println!("Transactional VFS is not active.\n");
+                    }
+                    continue;
+                }
+                if cmd == "/commit" {
+                    if let Some(vfs) = ctx.service::<Arc<TransactionalVfs>>() {
+                        match vfs.commit() {
+                            Ok(rep) => println!(
+                                "Committed {} staged files to workspace disk.\n",
+                                rep.committed_files
+                            ),
+                            Err(e) => eprintln!("Failed to commit VFS: {e:#}\n"),
+                        }
+                    } else {
+                        println!("Transactional VFS is not active.\n");
+                    }
+                    continue;
+                }
+                if cmd == "/rollback" {
+                    if let Some(vfs) = ctx.service::<Arc<TransactionalVfs>>() {
+                        match vfs.rollback() {
+                            Ok(rep) => println!(
+                                "Rolled back {} files in workspace.\n",
+                                rep.restored_files + rep.removed_files
+                            ),
+                            Err(e) => eprintln!("Failed to rollback VFS: {e:#}\n"),
+                        }
+                    } else {
+                        println!("Transactional VFS is not active.\n");
+                    }
+                    continue;
+                }
+                if cmd == "/context" || cmd == "/budget" {
+                    if let Some(compactor) = ctx.service::<AdaptiveCompactor>() {
+                        let est_tokens = compactor.estimate_history_tokens(&history);
+                        let budget = &compactor.budget;
+                        let pct = if budget.max_context_tokens > 0 {
+                            (est_tokens as f64 / budget.max_context_tokens as f64) * 100.0
+                        } else {
+                            0.0
+                        };
+                        let threshold_pct = if budget.max_context_tokens > 0 {
+                            (budget.compaction_threshold_tokens as f64
+                                / budget.max_context_tokens as f64)
+                                * 100.0
+                        } else {
+                            0.0
+                        };
+                        println!("Context Usage & Budget:");
+                        println!("  Current tokens   : ~{} ({:.1}% of max)", est_tokens, pct);
+                        println!(
+                            "  Threshold tokens : {} ({:.1}% of max)",
+                            budget.compaction_threshold_tokens, threshold_pct
+                        );
+                        println!("  Max tokens       : {}", budget.max_context_tokens);
+                        println!("  Keep turns       : {}", budget.keep_recent_turns);
+                        let sys_count = history
+                            .iter()
+                            .filter(|m| matches!(m, Message::System { .. }))
+                            .count();
+                        let user_count = history
+                            .iter()
+                            .filter(|m| matches!(m, Message::User { .. }))
+                            .count();
+                        let asst_count = history
+                            .iter()
+                            .filter(|m| matches!(m, Message::Assistant { .. }))
+                            .count();
+                        let tool_count = history
+                            .iter()
+                            .filter(|m| matches!(m, Message::Tool { .. }))
+                            .count();
+                        println!(
+                            "  Messages         : {} total (system: {}, user: {}, assistant: {}, tool: {})\n",
+                            history.len(),
+                            sys_count,
+                            user_count,
+                            asst_count,
+                            tool_count
+                        );
+                    } else {
+                        println!("Adaptive compactor is not active.\n");
+                    }
+                    continue;
+                }
+                if cmd == "/tree" {
+                    if let Some(tree_arc) =
+                        ctx.service::<Arc<std::sync::Mutex<keel_agent::ExplorationTree>>>()
+                    {
+                        let tree = tree_arc.lock().unwrap();
+                        print!("{}", tree.render_ascii());
+                    }
+                    continue;
+                }
+                if cmd == "/sentinel" {
+                    if let Some(sentinel) = ctx.service::<Arc<StreamingSentinel>>() {
+                        let m = sentinel.metrics();
+                        println!(
+                            "Streaming Sentinel: Mode={:?}, Rules={}, Vetoes={}\n",
+                            sentinel.mode(),
+                            m["rule_count"],
+                            m["veto_count"]
+                        );
+                    } else {
+                        println!("Streaming Sentinel is not mounted.\n");
+                    }
+                    continue;
+                }
+                if cmd == "/memory" {
+                    if let Some(store) = ctx.service::<EpistemicStore>() {
+                        let state = store.get();
+                        if state.is_empty() {
+                            println!("Epistemic working memory is currently empty.\n");
+                        } else {
+                            println!("{}", state.render_markdown());
+                        }
+                    } else {
+                        println!("Epistemic store is not active.\n");
+                    }
+                    continue;
+                }
+                if cmd == "/replay" || cmd == "/recordings" {
+                    if let Some(engine) = ctx.service::<Arc<ReplayEngine>>() {
+                        match engine.list_recordings() {
+                            Ok(recs) => {
+                                if recs.is_empty() {
+                                    println!("No session recordings found in .keel/recordings.\n");
+                                } else {
+                                    println!("Session Recordings ({}):", recs.len());
+                                    for r in recs.iter().take(5) {
+                                        println!(
+                                            "  - {} [{}] ({} turns, {} steps, {}ms)",
+                                            r.session_id,
+                                            r.model,
+                                            r.total_turns,
+                                            r.total_steps,
+                                            r.duration_ms
+                                        );
+                                    }
+                                    println!();
+                                }
+                            }
+                            Err(e) => eprintln!("Failed to list recordings: {e:#}\n"),
+                        }
+                    }
+                    continue;
+                }
+                if cmd == "/clear" {
+                    history.truncate(1);
+                    println!("History cleared.\n");
+                    continue;
+                }
+                if cmd == "/history" {
+                    println!("Active conversation depth: {} messages.\n", history.len());
+                    continue;
+                }
+
+                // If cmd starts with '/' but looks like a filesystem path, send it as a prompt.
+                // Otherwise report an unknown command with a did-you-mean suggestion.
+                let looks_like_path = cmd[1..].contains('/') || std::path::Path::new(cmd).exists();
+                if !looks_like_path {
+                    let mut msg = format!("unknown command '{cmd}'");
+                    if let Some(s) = args::suggest(cmd, REPL_COMMANDS, 2) {
+                        msg.push_str(&format!(" (did you mean `{s}`?)"));
+                    }
+                    msg.push_str("\ntype `/help` for available commands, or prefix with `//` to send text starting with `/` to the model\n");
+                    eprintln!("{msg}");
+                    continue;
+                }
+                trimmed
+            } else {
+                trimmed
+            };
+
             cancel.reset();
-            if let Err(e) = Agent::run_from_context(&ctx, &mut history, trimmed, 40) {
+            if let Err(e) = Agent::run_from_context(&ctx, &mut history, prompt_to_run, 40) {
                 eprintln!("\nerror: {e:#}\n");
             } else {
                 println!();
