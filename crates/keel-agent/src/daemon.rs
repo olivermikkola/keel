@@ -717,6 +717,7 @@ pub fn handle_acp_client<R: BufRead>(
                             "checkpoints": true,
                             "speculation": true,
                             "epistemicMemory": true,
+                            "epistemicGraph": true,
                             "persistentDaemon": true,
                             "sessionMultiplexing": true,
                             "swarmHandoff": true,
@@ -1252,6 +1253,158 @@ pub fn handle_acp_client<R: BufRead>(
                     match store.clear() {
                         Ok(()) => rpc_writer.send_response(id, json!({ "status": "ok" })),
                         Err(e) => rpc_writer.send_error(id, -32000, &format!("{e:#}")),
+                    }
+                } else {
+                    rpc_writer.send_error(id, -32000, "EpistemicStore not mounted");
+                }
+            }
+            "memory/graph" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                if let Some(store) = session.ctx.service::<EpistemicStore>() {
+                    let mermaid = store.render_mermaid();
+                    let state = store.get();
+                    rpc_writer.send_response(
+                        id,
+                        json!({
+                            "session_id": sid,
+                            "mermaid": mermaid,
+                            "nodes": state.nodes,
+                            "edges": state.edges,
+                        }),
+                    );
+                } else {
+                    rpc_writer.send_error(id, -32000, "EpistemicStore not mounted");
+                }
+            }
+            "memory/link" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let from = params.get("from").and_then(|v| v.as_str()).unwrap_or("");
+                let to = params.get("to").and_then(|v| v.as_str()).unwrap_or("");
+                let rel_str = params
+                    .get("relation")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("supports");
+                let rel = crate::epistemic::RelationType::from_str_lossy(rel_str);
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                if let Some(store) = session.ctx.service::<EpistemicStore>() {
+                    match store.add_fact_node(
+                        from,
+                        crate::epistemic::FactCategory::ToolObservation,
+                        80,
+                        None,
+                    ) {
+                        Ok(from_id) => {
+                            match store.add_fact_node(
+                                to,
+                                crate::epistemic::FactCategory::ToolObservation,
+                                80,
+                                None,
+                            ) {
+                                Ok(to_id) => {
+                                    let _ = store.add_edge(&from_id, &to_id, rel);
+                                    let contradictions = store.detect_contradictions();
+                                    rpc_writer.send_response(
+                                        id,
+                                        json!({
+                                            "session_id": sid,
+                                            "status": "ok",
+                                            "from": from_id,
+                                            "to": to_id,
+                                            "relation": rel.as_str(),
+                                            "contradictions": contradictions,
+                                        }),
+                                    );
+                                }
+                                Err(e) => rpc_writer.send_error(id, -32000, &format!("{e:#}")),
+                            }
+                        }
+                        Err(e) => rpc_writer.send_error(id, -32000, &format!("{e:#}")),
+                    }
+                } else {
+                    rpc_writer.send_error(id, -32000, "EpistemicStore not mounted");
+                }
+            }
+            "memory/contradictions" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                if let Some(store) = session.ctx.service::<EpistemicStore>() {
+                    let contradictions = store.detect_contradictions();
+                    rpc_writer.send_response(
+                        id,
+                        json!({
+                            "session_id": sid,
+                            "contradictions": contradictions,
+                            "has_conflicts": !contradictions.is_empty(),
+                        }),
+                    );
+                } else {
+                    rpc_writer.send_error(id, -32000, "EpistemicStore not mounted");
+                }
+            }
+            "memory/sync" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                if let Some(store) = session.ctx.service::<EpistemicStore>() {
+                    if let Some(other_state) = params.get("state") {
+                        match serde_json::from_value::<crate::epistemic::EpistemicState>(
+                            other_state.clone(),
+                        ) {
+                            Ok(state) => {
+                                let _ = store.merge_state(&state);
+                                rpc_writer.send_response(
+                                    id,
+                                    json!({
+                                        "session_id": sid,
+                                        "status": "synced",
+                                        "memory": store.get(),
+                                    }),
+                                );
+                            }
+                            Err(e) => rpc_writer.send_error(
+                                id,
+                                -32602,
+                                &format!("invalid state payload: {e:#}"),
+                            ),
+                        }
+                    } else {
+                        rpc_writer.send_error(id, -32602, "missing `state` parameter");
                     }
                 } else {
                     rpc_writer.send_error(id, -32000, "EpistemicStore not mounted");
@@ -2489,6 +2642,77 @@ impl WorkerService {
         let back_res = lines.iter().find(|v| v["id"] == 4).unwrap();
         assert_eq!(back_res["result"]["parent"]["id"], "root");
         assert_eq!(back_res["result"]["current_id"], "root");
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn acp_daemon_epistemic_graph_and_contradictions_rpc() {
+        let tmp = std::env::temp_dir().join(format!("keel-graph-rpc-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let out_buf = Arc::new(Mutex::new(Vec::new()));
+
+        let requests = [
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "memory/link", "params": {
+                "from": "Port 8000 is open",
+                "to": "Port 8000 is blocked by firewall",
+                "relation": "contradicts"
+            }})
+            .to_string(),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "memory/contradictions", "params": {}})
+                .to_string(),
+            json!({"jsonrpc": "2.0", "id": 4, "method": "memory/graph", "params": {}}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 5, "method": "shutdown", "params": {}}).to_string(),
+        ]
+        .join("\n")
+            + "\n";
+
+        let cfg = DaemonConfig {
+            root: tmp.clone(),
+            policy: ApprovalPolicy::Yolo,
+            landlock_enabled: false,
+            vfs_mode: VfsMode::MaterializedCow,
+            verify_command: None,
+        };
+
+        serve_acp(
+            BufReader::new(std::io::Cursor::new(requests.into_bytes())),
+            Box::new(SharedVecWriter(out_buf.clone())),
+            cfg,
+            Arc::new(DaemonTestLlm),
+        )
+        .unwrap();
+
+        let raw_output = String::from_utf8(out_buf.lock().unwrap().clone()).unwrap();
+        let lines: Vec<Value> = raw_output
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .collect();
+
+        // 1. Verify capability
+        assert!(lines
+            .iter()
+            .any(|v| v["id"] == 1 && v["result"]["capabilities"]["epistemicGraph"] == true));
+
+        // 2. Verify link response
+        let link_res = lines.iter().find(|v| v["id"] == 2).unwrap();
+        assert_eq!(link_res["result"]["status"], "ok");
+        assert_eq!(link_res["result"]["relation"], "contradicts");
+
+        // 3. Verify contradictions detected
+        let contra_res = lines.iter().find(|v| v["id"] == 3).unwrap();
+        assert_eq!(contra_res["result"]["has_conflicts"], true);
+        let contra_list = contra_res["result"]["contradictions"].as_array().unwrap();
+        assert_eq!(contra_list.len(), 1);
+
+        // 4. Verify mermaid graph
+        let graph_res = lines.iter().find(|v| v["id"] == 4).unwrap();
+        let mermaid = graph_res["result"]["mermaid"].as_str().unwrap();
+        assert!(mermaid.contains("Port 8000"));
+        assert!(mermaid.contains("contradicts"));
 
         let _ = std::fs::remove_dir_all(tmp);
     }
