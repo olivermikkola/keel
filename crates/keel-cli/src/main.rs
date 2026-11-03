@@ -44,6 +44,8 @@ use std::sync::Arc;
 
 mod args;
 mod bench;
+mod line_reader;
+use line_reader::LineReader;
 
 /// Live terminal output: answer text on stdout, reasoning dimmed on stderr.
 struct Printer;
@@ -170,6 +172,48 @@ impl Plugin for JsonPrinter {
             );
             let _ = std::io::stdout().flush();
         });
+        s.on::<keel_agent::TurnSummary, _>(|summary| {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "type": "turn_summary",
+                    "summary": summary,
+                })
+            );
+            let _ = std::io::stdout().flush();
+        });
+    }
+}
+
+/// Prints a clean summary line at the end of each completed turn.
+struct TurnSummaryPrinter;
+impl Plugin for TurnSummaryPrinter {
+    fn name(&self) -> &str {
+        "turn-summary-printer"
+    }
+    fn apply(&self, s: &mut Scope) {
+        s.on::<keel_agent::TurnSummary, _>(|summary| {
+            println!("\n{}", summary.render_line());
+        });
+    }
+}
+
+/// Automatically prints colorized unified diff of staged changes at turn end when `--diff` is enabled.
+struct StagedDiffPrinter(Arc<TransactionalVfs>);
+impl Plugin for StagedDiffPrinter {
+    fn name(&self) -> &str {
+        "staged-diff-printer"
+    }
+    fn apply(&self, s: &mut Scope) {
+        let vfs = self.0.clone();
+        s.on::<keel_agent::TurnSummary, _>(move |summary| {
+            if !summary.modified_files.is_empty() {
+                let d = vfs.diff();
+                if !d.trim().is_empty() {
+                    println!("\n--- Staged Diff ---\n{d}");
+                }
+            }
+        });
     }
 }
 
@@ -244,7 +288,7 @@ fn print_usage() {
   keel replay <cmd>                deterministic session flight recorder & time-travel (list, info, inspect, restore, fork)
   keel subagent "prompt" [opts]    run isolated read-only subagent query (roles: researcher, navigator, auditor)
   keel repomap [options]           ranked repository map
-  keel bench [filter] [--runs N]   run benchmark suite
+  keel bench [filter] [--runs N] [--json] run benchmark suite
   keel --version                   print version
 
 options:
@@ -261,6 +305,8 @@ options:
   --json                           emit machine-readable JSON output
   --dry-run                        preview patch/edit without writing
   --yolo                           allow mutating tools (write/edit/patch/shell)
+  --allow-protected               permit modifications to .git, .env, .ssh, .keel
+  --diff                          display unified diff of modified files after turn completion
   --read-only                      deny all mutating tools
   --safety-mode <mode>             approval policy (or KEEL_SAFETY_MODE)
   --shadow                         in-memory shadow VFS (no writes until commit)
@@ -1702,6 +1748,8 @@ fn main() -> anyhow::Result<()> {
     }
 
     let yolo = take_flag(&mut args, "--yolo");
+    let allow_protected = take_flag(&mut args, "--allow-protected");
+    let show_diff = take_flag(&mut args, "--diff");
     let read_only = take_flag(&mut args, "--read-only");
     let shadow_vfs = take_flag(&mut args, "--shadow");
     let safety_mode_opt = take_opt(&mut args, "--safety-mode");
@@ -1847,7 +1895,7 @@ fn main() -> anyhow::Result<()> {
         primary_llm
     };
     if bench_mode {
-        return bench::run(llm, args.first().map(String::as_str), runs);
+        return bench::run(llm, args.first().map(String::as_str), runs, json_mode);
     }
     if subagent_mode {
         return cli_subagent(
@@ -2000,6 +2048,7 @@ fn main() -> anyhow::Result<()> {
         ctx.mount(&JsonPrinter);
     } else {
         ctx.mount(&Printer);
+        ctx.mount(&TurnSummaryPrinter);
     }
     let cancel = keel_agent::CancelToken::new();
     keel_agent::interrupt::install_sigint_cancel(&cancel);
@@ -2017,6 +2066,7 @@ fn main() -> anyhow::Result<()> {
     let _p_tools = ctx.mount(&BuiltinToolsPlugin {
         root: root.clone(),
         landlock_enabled: !no_sandbox,
+        allow_protected,
     });
     let _p_guard = ctx.mount(&RepeatToolReminderPlugin::default());
     let _p_breaker = ctx.mount(&EnvironmentCircuitBreakerPlugin::default());
@@ -2068,6 +2118,12 @@ fn main() -> anyhow::Result<()> {
         },
         persist: !shadow_vfs,
     });
+    let _p_diff_printer = if show_diff && !json_mode {
+        ctx.service::<Arc<TransactionalVfs>>()
+            .map(|vfs| ctx.mount(&StagedDiffPrinter((*vfs).clone())))
+    } else {
+        None
+    };
     let _p_oracle = ctx.mount(&keel_agent::OraclePlugin {
         root: root.clone(),
         test_command: verify_cmd.clone(),
@@ -2160,15 +2216,15 @@ fn main() -> anyhow::Result<()> {
             root.display()
         );
         println!("Type /help for commands, exit to quit.\n");
-        let stdin = std::io::stdin();
+        let mut reader = LineReader::new();
         loop {
-            print!("keel> ");
-            let _ = std::io::stdout().flush();
-            let mut line = String::new();
-            if stdin.read_line(&mut line)? == 0 {
-                println!();
-                break;
-            }
+            let line = match reader.read_line("keel> ", REPL_COMMANDS)? {
+                Some(l) => l,
+                None => {
+                    println!();
+                    break;
+                }
+            };
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
@@ -2176,6 +2232,7 @@ fn main() -> anyhow::Result<()> {
             if matches!(trimmed, "exit" | "quit") {
                 break;
             }
+            reader.add_history(trimmed);
             let prompt_to_run = if trimmed.starts_with("//") {
                 &trimmed[1..]
             } else if trimmed.starts_with('/') {

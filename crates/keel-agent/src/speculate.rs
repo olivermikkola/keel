@@ -329,6 +329,7 @@ fn run_single_candidate(
     let _p_tools = ctx.mount(&BuiltinToolsPlugin {
         root: sb_dir.clone(),
         landlock_enabled,
+        allow_protected: false,
     });
     let _p_guard = ctx.mount(&RepeatToolReminderPlugin::default());
     let _p_pruner = ctx.mount(&ToolResultPrunerPlugin::default());
