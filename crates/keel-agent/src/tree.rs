@@ -121,14 +121,16 @@ impl ExplorationTree {
         Ok(tree)
     }
 
-    /// Persist tree metadata to disk.
+    /// Persist tree metadata to disk atomically.
     pub fn save(&self) -> Result<()> {
         let p = tree_file_path(&self.root_path);
         if let Some(parent) = p.parent() {
             fs::create_dir_all(parent)?;
         }
         let data = serde_json::to_string_pretty(self)?;
-        fs::write(&p, data)?;
+        let tmp = p.with_extension(format!("tmp.{}", std::process::id()));
+        fs::write(&tmp, data)?;
+        fs::rename(&tmp, &p)?;
         Ok(())
     }
 

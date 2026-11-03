@@ -303,12 +303,16 @@ pub fn parse_test_output(raw: &str, elapsed_ms: u64) -> TestSnapshot {
     }
 }
 
+/// Default execution timeout for test runs (180 seconds).
+pub const DEFAULT_ORACLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
 /// The diagnostic oracle service managing test execution, baselining, and regression sentinel checks.
 pub struct DiagnosticOracle {
     pub root: PathBuf,
     pub test_command: Option<String>,
     pub baseline: Arc<Mutex<Option<TestSnapshot>>>,
     pub mode: SentinelMode,
+    pub timeout: std::time::Duration,
 }
 
 impl DiagnosticOracle {
@@ -318,7 +322,13 @@ impl DiagnosticOracle {
             test_command,
             baseline: Arc::new(Mutex::new(None)),
             mode,
+            timeout: DEFAULT_ORACLE_TIMEOUT,
         }
+    }
+
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// Run the test suite and capture a baseline snapshot.
@@ -357,15 +367,73 @@ impl DiagnosticOracle {
             .env("CARGO_BUILD_JOBS", "2")
             .env("RAYON_NUM_THREADS", "2");
 
-        let out = cmd
-            .output()
-            .with_context(|| format!("executing test command: {cmd_str}"))?;
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("spawning test command: {cmd_str}"))?;
+
+        let mut stdout_handle = child.stdout.take();
+        let mut stderr_handle = child.stderr.take();
+
+        let stdout_thread = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut stream) = stdout_handle.take() {
+                use std::io::Read;
+                let _ = stream.by_ref().take(2 * 1024 * 1024).read_to_end(&mut buf);
+                let mut discard = [0u8; 8192];
+                while let Ok(n) = stream.read(&mut discard) {
+                    if n == 0 {
+                        break;
+                    }
+                }
+            }
+            buf
+        });
+
+        let stderr_thread = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut stream) = stderr_handle.take() {
+                use std::io::Read;
+                let _ = stream.by_ref().take(2 * 1024 * 1024).read_to_end(&mut buf);
+                let mut discard = [0u8; 8192];
+                while let Ok(n) = stream.read(&mut discard) {
+                    if n == 0 {
+                        break;
+                    }
+                }
+            }
+            buf
+        });
+
+        loop {
+            match child.try_wait() {
+                Ok(Some(_status)) => break,
+                Ok(None) => {
+                    if start.elapsed() > self.timeout {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        anyhow::bail!(
+                            "test execution timed out after {}s (killed)",
+                            self.timeout.as_secs()
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(e).context("waiting on test runner process");
+                }
+            }
+        }
+
+        let out_bytes = stdout_thread.join().unwrap_or_default();
+        let err_bytes = stderr_thread.join().unwrap_or_default();
 
         let elapsed_ms = start.elapsed().as_millis() as u64;
-        let mut raw = String::from_utf8_lossy(&out.stdout).to_string();
-        if !out.stderr.is_empty() {
+        let mut raw = String::from_utf8_lossy(&out_bytes).to_string();
+        if !err_bytes.is_empty() {
             raw.push('\n');
-            raw.push_str(&String::from_utf8_lossy(&out.stderr));
+            raw.push_str(&String::from_utf8_lossy(&err_bytes));
         }
 
         Ok(parse_test_output(&raw, elapsed_ms))
@@ -553,5 +621,23 @@ test result: FAILED. 1 passed; 1 failed; 1 ignored; 0 measured; 0 filtered out; 
         assert!(delta.is_clean);
         assert_eq!(delta.new_regressions.len(), 0);
         assert_eq!(delta.render_remediation(), None);
+    }
+
+    #[test]
+    fn oracle_enforces_execution_timeout() {
+        let tmp = std::env::temp_dir().join(format!("keel_oracle_timeout_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let oracle =
+            DiagnosticOracle::new(tmp.clone(), Some("sleep 5".to_string()), SentinelMode::Warn)
+                .with_timeout(std::time::Duration::from_millis(200));
+
+        let res = oracle.run_tests();
+        assert!(res.is_err());
+        let err_msg = format!("{:#}", res.unwrap_err());
+        assert!(err_msg.contains("timed out"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
