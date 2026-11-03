@@ -592,6 +592,7 @@ fn create_session(
         ctx.mount(&BuiltinToolsPlugin {
             root: cfg.root.clone(),
             landlock_enabled: cfg.landlock_enabled,
+            allow_protected: false,
         }),
         ctx.mount(&RepeatToolReminderPlugin::default()),
         ctx.mount(&crate::guard::EnvironmentCircuitBreakerPlugin::default()),

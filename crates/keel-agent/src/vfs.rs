@@ -420,6 +420,21 @@ impl TransactionalVfs {
         out
     }
 
+    /// Calculate added and deleted line counts across all staged diffs.
+    pub fn diff_stats(&self) -> (usize, usize) {
+        let diff = self.diff();
+        let mut added = 0;
+        let mut deleted = 0;
+        for line in diff.lines() {
+            if line.starts_with('+') && !line.starts_with("+++") {
+                added += 1;
+            } else if line.starts_with('-') && !line.starts_with("---") {
+                deleted += 1;
+            }
+        }
+        (added, deleted)
+    }
+
     /// Commit all staged changes to disk (for `ShadowMemory` mode) and clear the transaction journal.
     pub fn commit(&self) -> Result<VfsCommitReport> {
         let mut guard = self

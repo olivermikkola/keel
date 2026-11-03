@@ -243,6 +243,7 @@ dependencies = [
  "anyhow",
  "keel-agent",
  "keel-kernel",
+ "libc",
  "serde_json",
 ]
 

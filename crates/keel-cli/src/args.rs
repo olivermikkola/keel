@@ -21,6 +21,8 @@ pub const BOOL_FLAGS: &[&str] = &[
     "--apply",
     "--help",
     "--version",
+    "--allow-protected",
+    "--diff",
 ];
 
 /// Flags that consume the following argument as their value.

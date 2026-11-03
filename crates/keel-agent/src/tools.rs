@@ -151,6 +151,87 @@ pub fn confine(root: &Path, rel: &str) -> Result<PathBuf> {
     Ok(joined)
 }
 
+/// Returns true if the relative path targets sensitive repository or environment structures:
+/// - `.git/` or `.git`
+/// - `.env` or `.env.*`
+/// - `.ssh/` or `.ssh`
+/// - `.keel/` or `.keel` (session logs, flight recordings, checkpoints)
+pub fn is_protected_path(rel: &str) -> bool {
+    let p = Path::new(rel);
+    for component in p.components() {
+        if let Component::Normal(c) = component {
+            let s = c.to_string_lossy();
+            if s == ".git" || s == ".ssh" || s == ".keel" || s == ".env" || s.starts_with(".env.") {
+                return true;
+            }
+        }
+    }
+    let trimmed = rel
+        .trim()
+        .trim_start_matches("./")
+        .trim_start_matches(".\\");
+    trimmed == ".env"
+        || trimmed.starts_with(".env.")
+        || trimmed == ".git"
+        || trimmed.starts_with(".git/")
+        || trimmed.starts_with(".git\\")
+        || trimmed == ".ssh"
+        || trimmed.starts_with(".ssh/")
+        || trimmed.starts_with(".ssh\\")
+        || trimmed == ".keel"
+        || trimmed.starts_with(".keel/")
+        || trimmed.starts_with(".keel\\")
+}
+
+/// Detects destructive commands that would wipe the workspace root, root filesystem, or git repository.
+pub fn is_destructive_command(cmd: &str) -> Option<&'static str> {
+    let lower = cmd.to_ascii_lowercase();
+    let trimmed = lower.trim();
+
+    let dangerous_patterns = [
+        (
+            "rm -rf /",
+            "destructive root directory removal (`rm -rf /`)",
+        ),
+        (
+            "rm -fr /",
+            "destructive root directory removal (`rm -fr /`)",
+        ),
+        ("rm -rf /*", "destructive root directory wipe (`rm -rf /*`)"),
+        (
+            "rm -rf .",
+            "destructive workspace directory wipe (`rm -rf .`)",
+        ),
+        (
+            "rm -rf *",
+            "destructive workspace wildcard wipe (`rm -rf *`)",
+        ),
+        (
+            "rm -rf .git",
+            "destructive git repository removal (`rm -rf .git`)",
+        ),
+        (
+            "rm -rf .keel",
+            "destructive keel harness directory removal (`rm -rf .keel`)",
+        ),
+        (
+            "rm -rf .ssh",
+            "destructive ssh credentials removal (`rm -rf .ssh`)",
+        ),
+        ("mkfs", "destructive filesystem formatting (`mkfs`)"),
+        ("> /dev/sda", "raw disk wipe (`> /dev/sda`)"),
+        ("dd if=/dev/zero", "raw disk wipe (`dd if=/dev/zero`)"),
+        (":(){ :|:& };:", "fork bomb"),
+    ];
+
+    for (pat, reason) in dangerous_patterns {
+        if trimmed.contains(pat) {
+            return Some(reason);
+        }
+    }
+    None
+}
+
 fn truncate(mut s: String) -> String {
     if s.len() > MAX_OUT {
         let mut cut = MAX_OUT;
@@ -342,7 +423,27 @@ impl Tool for ListDir {
     }
 }
 
-pub struct WriteFile(pub PathBuf);
+pub struct WriteFile {
+    pub root: PathBuf,
+    pub allow_protected: bool,
+}
+
+impl WriteFile {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            allow_protected: false,
+        }
+    }
+
+    pub fn with_allow_protected(root: impl Into<PathBuf>, allow_protected: bool) -> Self {
+        Self {
+            root: root.into(),
+            allow_protected,
+        }
+    }
+}
+
 impl Tool for WriteFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
@@ -355,7 +456,11 @@ impl Tool for WriteFile {
         true
     }
     fn run(&self, a: &Value) -> Result<String> {
-        let p = confine(&self.0, arg(a, "path")?)?;
+        let rel = arg(a, "path")?;
+        if !self.allow_protected && is_protected_path(rel) {
+            bail!("access denied: `{rel}` is a protected path (.git, .env, .ssh, .keel). Modifying sensitive workspace metadata is forbidden (use --allow-protected to override).");
+        }
+        let p = confine(&self.root, rel)?;
         if let Some(d) = p.parent() {
             std::fs::create_dir_all(d)?;
         }
@@ -375,7 +480,27 @@ impl Tool for WriteFile {
 
 /// Surgical edit: replace one occurrence of `old` with `new`.
 /// Supports exact match, whitespace-normalized line matching, and fuzzy matching.
-pub struct EditFile(pub PathBuf);
+pub struct EditFile {
+    pub root: PathBuf,
+    pub allow_protected: bool,
+}
+
+impl EditFile {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            allow_protected: false,
+        }
+    }
+
+    pub fn with_allow_protected(root: impl Into<PathBuf>, allow_protected: bool) -> Self {
+        Self {
+            root: root.into(),
+            allow_protected,
+        }
+    }
+}
+
 impl Tool for EditFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
@@ -388,7 +513,11 @@ impl Tool for EditFile {
         true
     }
     fn run(&self, a: &Value) -> Result<String> {
-        let p = confine(&self.0, arg(a, "path")?)?;
+        let rel = arg(a, "path")?;
+        if !self.allow_protected && is_protected_path(rel) {
+            bail!("access denied: `{rel}` is a protected path (.git, .env, .ssh, .keel). Modifying sensitive workspace metadata is forbidden (use --allow-protected to override).");
+        }
+        let p = confine(&self.root, rel)?;
         let meta = std::fs::symlink_metadata(&p)
             .with_context(|| format!("checking metadata for {}", p.display()))?;
         if !meta.file_type().is_file() {
@@ -410,7 +539,27 @@ impl Tool for EditFile {
 }
 
 /// Multi-hunk patch tool: applies search/replace blocks or unified diff hunks.
-pub struct PatchFile(pub PathBuf);
+pub struct PatchFile {
+    pub root: PathBuf,
+    pub allow_protected: bool,
+}
+
+impl PatchFile {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            allow_protected: false,
+        }
+    }
+
+    pub fn with_allow_protected(root: impl Into<PathBuf>, allow_protected: bool) -> Self {
+        Self {
+            root: root.into(),
+            allow_protected,
+        }
+    }
+}
+
 impl Tool for PatchFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
@@ -423,7 +572,11 @@ impl Tool for PatchFile {
         true
     }
     fn run(&self, a: &Value) -> Result<String> {
-        let p = confine(&self.0, arg(a, "path")?)?;
+        let rel = arg(a, "path")?;
+        if !self.allow_protected && is_protected_path(rel) {
+            bail!("access denied: `{rel}` is a protected path (.git, .env, .ssh, .keel). Modifying sensitive workspace metadata is forbidden (use --allow-protected to override).");
+        }
+        let p = confine(&self.root, rel)?;
         let meta = std::fs::symlink_metadata(&p)
             .with_context(|| format!("checking metadata for {}", p.display()))?;
         if !meta.file_type().is_file() {
@@ -611,6 +764,7 @@ pub struct Shell {
     pub root: PathBuf,
     pub sandbox: SandboxPolicy,
     pub timeout: Duration,
+    pub allow_protected: bool,
 }
 
 impl Shell {
@@ -619,11 +773,17 @@ impl Shell {
             sandbox: SandboxPolicy::new(root.clone(), true),
             root,
             timeout: Duration::from_secs(120),
+            allow_protected: false,
         }
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    pub fn with_allow_protected(mut self, allow_protected: bool) -> Self {
+        self.allow_protected = allow_protected;
         self
     }
 }
@@ -648,11 +808,16 @@ impl Tool for Shell {
         true
     }
     fn run(&self, a: &Value) -> Result<String> {
+        let cmd_str = arg(a, "command")?;
+        if !self.allow_protected {
+            if let Some(reason) = is_destructive_command(cmd_str) {
+                bail!("command denied: {reason} is prohibited for workspace safety (use --allow-protected to override)");
+            }
+        }
+
         let policy = self.sandbox.clone();
         let mut cmd = Command::new("sh");
-        cmd.arg("-c")
-            .arg(arg(a, "command")?)
-            .current_dir(&self.root);
+        cmd.arg("-c").arg(cmd_str).current_dir(&self.root);
 
         // Scrub sensitive environment variables to prevent credential exfiltration
         for (k, _) in std::env::vars() {
@@ -691,17 +856,35 @@ pub fn builtin(root: &Path) -> Vec<Box<dyn Tool>> {
         Box::new(ReadFile(root.into())),
         Box::new(ListDir(root.into())),
         Box::new(Grep(root.into())),
-        Box::new(EditFile(root.into())),
-        Box::new(PatchFile(root.into())),
-        Box::new(WriteFile(root.into())),
+        Box::new(EditFile::new(root)),
+        Box::new(PatchFile::new(root)),
+        Box::new(WriteFile::new(root)),
         Box::new(Shell::new(root.into())),
     ]
 }
 
+/// Policy controlling protection of repository metadata (.git, .env, .ssh, .keel).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WorkspaceSafetyPolicy {
+    pub allow_protected: bool,
+}
+
 /// Plugin that mounts all built-in tools into the kernel's [`ToolRegistry`].
+#[derive(Debug, Clone)]
 pub struct BuiltinToolsPlugin {
     pub root: PathBuf,
     pub landlock_enabled: bool,
+    pub allow_protected: bool,
+}
+
+impl Default for BuiltinToolsPlugin {
+    fn default() -> Self {
+        Self {
+            root: PathBuf::from("."),
+            landlock_enabled: true,
+            allow_protected: false,
+        }
+    }
 }
 
 impl Plugin for BuiltinToolsPlugin {
@@ -715,12 +898,28 @@ impl Plugin for BuiltinToolsPlugin {
             .map(|r| (*r).clone())
             .unwrap_or_default();
         let r = &self.root;
+        let allow_protected = self.allow_protected
+            || scope
+                .context()
+                .service::<WorkspaceSafetyPolicy>()
+                .map(|p| p.allow_protected)
+                .unwrap_or(false);
+
         reg.register(Arc::new(ReadFile(r.clone())));
         reg.register(Arc::new(ListDir(r.clone())));
         reg.register(Arc::new(Grep(r.clone())));
-        reg.register(Arc::new(EditFile(r.clone())));
-        reg.register(Arc::new(PatchFile(r.clone())));
-        reg.register(Arc::new(WriteFile(r.clone())));
+        reg.register(Arc::new(EditFile::with_allow_protected(
+            r.clone(),
+            allow_protected,
+        )));
+        reg.register(Arc::new(PatchFile::with_allow_protected(
+            r.clone(),
+            allow_protected,
+        )));
+        reg.register(Arc::new(WriteFile::with_allow_protected(
+            r.clone(),
+            allow_protected,
+        )));
         let sandbox_policy = scope
             .context()
             .service::<SandboxPolicy>()
@@ -731,6 +930,7 @@ impl Plugin for BuiltinToolsPlugin {
             root: r.clone(),
             sandbox: sandbox_policy,
             timeout: Duration::from_secs(120),
+            allow_protected,
         }));
         scope.provide(reg);
     }
@@ -778,7 +978,7 @@ mod tests {
         let d = std::env::temp_dir().join(format!("keel-test-edit-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join("f.txt"), "a\nb\na\n").unwrap();
-        let e = EditFile(d.clone());
+        let e = EditFile::new(d.clone());
         assert!(e.run(&json!({"path":"f.txt","old":"a","new":"z"})).is_err()); // ambiguous
         assert!(e.run(&json!({"path":"f.txt","old":"q","new":"z"})).is_err()); // missing
         e.run(&json!({"path":"f.txt","old":"b","new":"B"})).unwrap();
@@ -799,19 +999,19 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
 
         // WriteFile on directory
-        let w = WriteFile(d.clone());
+        let w = WriteFile::new(d.clone());
         assert!(w
             .run(&json!({"path": "subdir", "content": "text"}))
             .is_err());
 
         // EditFile on directory
-        let e = EditFile(d.clone());
+        let e = EditFile::new(d.clone());
         assert!(e
             .run(&json!({"path": "subdir", "old": "a", "new": "b"}))
             .is_err());
 
         // PatchFile on directory
-        let p = PatchFile(d.clone());
+        let p = PatchFile::new(d.clone());
         assert!(p
             .run(&json!({"path": "subdir", "patch": "@@ -1 +1 @@"}))
             .is_err());
@@ -823,7 +1023,7 @@ mod tests {
     fn write_then_read_roundtrip() {
         let d = std::env::temp_dir().join(format!("keel-test-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
-        WriteFile(d.clone())
+        WriteFile::new(d.clone())
             .run(&json!({"path":"x/y.txt","content":"hello"}))
             .unwrap();
         assert_eq!(
@@ -868,7 +1068,7 @@ mod tests {
         std::fs::write(&target, "fn run() {\n    let count = 0;\n    count\n}\n").unwrap();
 
         // 1. Test resilient edit with indentation discrepancy (2 spaces vs 4)
-        let edit = EditFile(d.clone());
+        let edit = EditFile::new(d.clone());
         let res = edit
             .run(&json!({
                 "path": "app.rs",
@@ -882,7 +1082,7 @@ mod tests {
             .contains("let count = 10;"));
 
         // 2. Test patch tool with Search/Replace block
-        let patch = PatchFile(d.clone());
+        let patch = PatchFile::new(d.clone());
         let block = "<<<<<<< SEARCH\n    count\n=======\n    count + 1\n>>>>>>> REPLACE\n";
         let res2 = patch
             .run(&json!({
@@ -1113,6 +1313,76 @@ mod tests {
             .run(&json!({"pattern": "hello world", "path": "mixed.txt", "case_insensitive": true}))
             .unwrap();
         assert_eq!(ci.lines().count(), 3);
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn protected_path_detection_and_mutating_tool_enforcement() {
+        assert!(is_protected_path(".git"));
+        assert!(is_protected_path(".git/config"));
+        assert!(is_protected_path(".git/HEAD"));
+        assert!(is_protected_path(".env"));
+        assert!(is_protected_path(".env.local"));
+        assert!(is_protected_path(".env.production"));
+        assert!(is_protected_path(".ssh/id_rsa"));
+        assert!(is_protected_path(".keel/recordings/test.jsonl"));
+        assert!(is_protected_path("nested/.git/hooks"));
+        assert!(is_protected_path("./.env"));
+
+        assert!(!is_protected_path("src/main.rs"));
+        assert!(!is_protected_path("README.md"));
+        assert!(!is_protected_path("env_helper.py"));
+
+        let ws = std::env::temp_dir().join(format!("keel-prot-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+
+        // 1. WriteFile denies protected path by default
+        let writer = WriteFile::new(ws.clone());
+        let err = writer.run(&json!({"path": ".env", "content": "SECRET=123"}));
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("protected path"));
+
+        // 2. WriteFile with allow_protected succeeds
+        let writer_allowed = WriteFile::with_allow_protected(ws.clone(), true);
+        assert!(writer_allowed
+            .run(&json!({"path": ".env", "content": "SECRET=123"}))
+            .is_ok());
+        assert_eq!(
+            std::fs::read_to_string(ws.join(".env")).unwrap(),
+            "SECRET=123"
+        );
+
+        // 3. EditFile denies protected path by default
+        let editor = EditFile::new(ws.clone());
+        let edit_err = editor.run(&json!({"path": ".env", "old": "123", "new": "456"}));
+        assert!(edit_err.is_err());
+        assert!(edit_err.unwrap_err().to_string().contains("protected path"));
+
+        // 4. EditFile with allow_protected succeeds
+        let editor_allowed = EditFile::with_allow_protected(ws.clone(), true);
+        assert!(editor_allowed
+            .run(&json!({"path": ".env", "old": "123", "new": "456"}))
+            .is_ok());
+        assert_eq!(
+            std::fs::read_to_string(ws.join(".env")).unwrap(),
+            "SECRET=456"
+        );
+
+        // 5. Destructive shell command detection
+        assert!(is_destructive_command("rm -rf /").is_some());
+        assert!(is_destructive_command("rm -rf .git").is_some());
+        assert!(is_destructive_command("rm -rf *").is_some());
+        assert!(is_destructive_command("echo ok").is_none());
+
+        let sh = Shell::new(ws.clone());
+        let sh_err = sh.run(&json!({"command": "rm -rf .git"}));
+        assert!(sh_err.is_err());
+        assert!(sh_err
+            .unwrap_err()
+            .to_string()
+            .contains("prohibited for workspace safety"));
 
         let _ = std::fs::remove_dir_all(&ws);
     }

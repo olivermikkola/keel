@@ -76,7 +76,7 @@ pub use symbols::{
     parse_structural_outline, render_outline_markdown, FileOutline, Symbol, SymbolIndex,
     SymbolKind, SymbolPlugin, SymbolSearchResult,
 };
-pub use tools::{BuiltinToolsPlugin, ReadOnlyToolsPlugin};
+pub use tools::{BuiltinToolsPlugin, ReadOnlyToolsPlugin, WorkspaceSafetyPolicy};
 pub use tree::{ExplorationTree, NodeStatus, TreeNode, TreePlugin};
 
 use anyhow::Result;
@@ -265,11 +265,13 @@ impl InteractiveApprover {
             .unwrap_or("")
             .to_ascii_lowercase();
         target.contains("/etc/")
-            || target.contains(".ssh/")
+            || target.contains(".ssh")
             || target.contains(".bashrc")
             || target.contains(".zshrc")
             || target.contains(".profile")
             || target.contains(".env")
+            || target.contains(".git")
+            || target.contains(".keel")
     }
 }
 
@@ -508,6 +510,69 @@ pub struct ToolDenied(pub ToolCall);
 pub struct ToolResult(pub String, pub String);
 pub struct TurnEnd(pub String);
 
+/// Detailed summary of actions, metrics, and outcomes for an agent turn.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct TurnSummary {
+    pub duration_ms: u64,
+    pub tool_calls: usize,
+    pub modified_files: Vec<String>,
+    pub lines_added: usize,
+    pub lines_deleted: usize,
+    pub tests_passed: Option<usize>,
+    pub tests_regressions: Option<usize>,
+    pub estimated_tokens: Option<usize>,
+}
+
+impl TurnSummary {
+    pub fn render_line(&self) -> String {
+        let mut parts = Vec::new();
+        parts.push(format!(
+            "turn complete in {:.1}s",
+            self.duration_ms as f64 / 1000.0
+        ));
+
+        if !self.modified_files.is_empty() {
+            let files_word = if self.modified_files.len() == 1 {
+                "file"
+            } else {
+                "files"
+            };
+            parts.push(format!(
+                "{} {} modified (+{}/-{} lines)",
+                self.modified_files.len(),
+                files_word,
+                self.lines_added,
+                self.lines_deleted
+            ));
+        }
+
+        if self.tool_calls > 0 {
+            let calls_word = if self.tool_calls == 1 {
+                "tool call"
+            } else {
+                "tool calls"
+            };
+            parts.push(format!("{} {}", self.tool_calls, calls_word));
+        }
+
+        if let Some(passed) = self.tests_passed {
+            let reg = self.tests_regressions.unwrap_or(0);
+            let reg_str = if reg == 0 {
+                "0 regressions".to_string()
+            } else {
+                format!("{reg} regression(s)!")
+            };
+            parts.push(format!("tests: {passed} passed ({reg_str})"));
+        }
+
+        if let Some(tok) = self.estimated_tokens {
+            parts.push(format!("~{tok} tokens"));
+        }
+
+        format!("[{}]", parts.join(" · "))
+    }
+}
+
 pub struct Agent<'a> {
     pub ctx: &'a Context,
     pub llm: &'a dyn Llm,
@@ -683,6 +748,8 @@ impl Agent<'_> {
             .filter(|m| matches!(m, Message::User { .. }))
             .count();
         let turn_start_instant = std::time::Instant::now();
+        let mut turn_tool_calls_count = 0;
+        let mut turn_touched_files = std::collections::BTreeSet::new();
         if let Some(recorder) = self.ctx.service::<Arc<recorder::FlightRecorder>>() {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -824,11 +891,62 @@ impl Agent<'_> {
                         timestamp_ms: now_ms,
                     });
                 }
+
+                let elapsed_ms = turn_start_instant.elapsed().as_millis() as u64;
+                let (modified_files, lines_added, lines_deleted) =
+                    if let Some(vfs) = self.ctx.service::<Arc<vfs::TransactionalVfs>>() {
+                        let (added, deleted) = vfs.diff_stats();
+                        let files: Vec<String> = vfs.status().into_iter().map(|f| f.path).collect();
+                        (files, added, deleted)
+                    } else {
+                        (turn_touched_files.into_iter().collect(), 0, 0)
+                    };
+
+                let (tests_passed, tests_regressions) =
+                    if let Some(oracle) = self.ctx.service::<Arc<oracle::DiagnosticOracle>>() {
+                        if let Some(baseline) = oracle.get_baseline() {
+                            if let Ok(delta) = oracle.check_delta() {
+                                (Some(baseline.passed), Some(delta.new_regressions.len()))
+                            } else {
+                                (Some(baseline.passed), None)
+                            }
+                        } else {
+                            (None, None)
+                        }
+                    } else {
+                        (None, None)
+                    };
+
+                let estimated_tokens = self
+                    .ctx
+                    .service::<compaction::AdaptiveCompactor>()
+                    .map(|c| c.estimate_history_tokens(history));
+
+                let summary = TurnSummary {
+                    duration_ms: elapsed_ms,
+                    tool_calls: turn_tool_calls_count,
+                    modified_files,
+                    lines_added,
+                    lines_deleted,
+                    tests_passed,
+                    tests_regressions,
+                    estimated_tokens,
+                };
+                self.ctx.emit(&summary);
                 self.ctx.emit(&TurnEnd(text.clone()));
                 return Ok(text);
             }
             let mut step_results = Vec::new();
             for call in &tool_calls {
+                turn_tool_calls_count += 1;
+                if matches!(
+                    call.name.as_str(),
+                    "write_file" | "edit_file" | "patch_file"
+                ) {
+                    if let Some(p) = call.args.get("path").and_then(|v| v.as_str()) {
+                        turn_touched_files.insert(p.to_string());
+                    }
+                }
                 if cancel_token.as_ref().is_some_and(|c| c.is_cancelled()) {
                     anyhow::bail!("turn cancelled by client");
                 }
@@ -1439,6 +1557,7 @@ mod tests {
         let _p_tools = ctx.mount(&tools::BuiltinToolsPlugin {
             root: tmp.clone(),
             landlock_enabled: false,
+            allow_protected: false,
         });
         let _p_lsp = ctx.mount(&lsp::LspPlugin {
             root: tmp.clone(),
@@ -1495,6 +1614,7 @@ mod tests {
         let _p_tools = ctx.mount(&tools::BuiltinToolsPlugin {
             root: tmp.clone(),
             landlock_enabled: false,
+            allow_protected: false,
         });
 
         // Context budget configured with low threshold so intermediate tool turns trigger compaction
@@ -1640,5 +1760,25 @@ mod tests {
         ));
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn turn_summary_render_line_formatting() {
+        let summary = TurnSummary {
+            duration_ms: 1250,
+            tool_calls: 3,
+            modified_files: vec!["src/lib.rs".into(), "src/main.rs".into()],
+            lines_added: 18,
+            lines_deleted: 4,
+            tests_passed: Some(15),
+            tests_regressions: Some(0),
+            estimated_tokens: Some(3200),
+        };
+        let line = summary.render_line();
+        assert!(line.contains("turn complete in 1.2s"));
+        assert!(line.contains("2 files modified (+18/-4 lines)"));
+        assert!(line.contains("3 tool calls"));
+        assert!(line.contains("tests: 15 passed (0 regressions)"));
+        assert!(line.contains("~3200 tokens"));
     }
 }
