@@ -24,6 +24,7 @@ pub mod oracle;
 pub mod patch;
 pub mod plan;
 pub mod provider;
+pub mod recorder;
 pub mod sandbox;
 pub mod speculate;
 pub mod subagent;
@@ -44,6 +45,10 @@ pub use interceptor::{
 pub use oracle::{
     parse_test_output, DiagnosticOracle, OraclePlugin, RegressionDelta, SentinelMode, TestFailure,
     TestSnapshot,
+};
+pub use recorder::{
+    FlightRecorder, FlightRecorderPlugin, ForkReport, RecordFrame, RecordedSession,
+    RecordingSummary, ReplayEngine, ReplayEnginePlugin, RestoreReport, StepInspection,
 };
 pub use swarm::{export_handoff, ingest_handoff, HandoffEnvelope, HandoffIngestReport};
 pub use symbols::{
@@ -598,6 +603,23 @@ impl Agent<'_> {
         };
 
         self.ctx.emit(&TurnStart);
+        let turn_idx = history
+            .iter()
+            .filter(|m| matches!(m, Message::User { .. }))
+            .count();
+        let turn_start_instant = std::time::Instant::now();
+        if let Some(recorder) = self.ctx.service::<Arc<recorder::FlightRecorder>>() {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let _ = recorder.record(&recorder::RecordFrame::TurnStart {
+                turn_index: turn_idx,
+                user_prompt: user.to_string(),
+                timestamp_ms: now_ms,
+                pre_checkpoint_id: pre_turn_ckpt.as_ref().map(|c| c.id.clone()),
+            });
+        }
         if let Some(store) = self.ctx.service::<epistemic::EpistemicStore>() {
             let memory_md = store.get().render_markdown();
             if !memory_md.is_empty() {
@@ -616,6 +638,7 @@ impl Agent<'_> {
 
         let cancel_token = self.ctx.service::<CancelToken>();
         for step in 0..self.max_steps {
+            let step_start_instant = std::time::Instant::now();
             if cancel_token.as_ref().is_some_and(|c| c.is_cancelled()) {
                 anyhow::bail!("turn cancelled by client");
             }
@@ -667,27 +690,79 @@ impl Agent<'_> {
                         continue;
                     }
                 }
+                if let Some(recorder) = self.ctx.service::<Arc<recorder::FlightRecorder>>() {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let _ = recorder.record(&recorder::RecordFrame::TurnEnd {
+                        turn_index: turn_idx,
+                        status: "success".into(),
+                        duration_ms: turn_start_instant.elapsed().as_millis() as u64,
+                        timestamp_ms: now_ms,
+                    });
+                }
                 self.ctx.emit(&TurnEnd(text.clone()));
                 return Ok(text);
             }
-            for call in tool_calls {
+            let mut step_results = Vec::new();
+            for call in &tool_calls {
                 if cancel_token.as_ref().is_some_and(|c| c.is_cancelled()) {
                     anyhow::bail!("turn cancelled by client");
                 }
                 self.ctx.emit(&ToolStart(call.clone()));
-                let mut out = self.execute(&call);
+                let mut out = self.execute(call);
                 if let Some(guard) = self.ctx.service::<guard::RepeatToolGuard>() {
-                    if let Some(reminder) = guard.observe(&call) {
+                    if let Some(reminder) = guard.observe(call) {
                         out.push_str(&reminder);
                     }
                 }
                 self.log
                     .append("tool", serde_json::json!({"id": call.id, "content": out}))?;
                 history.push(Message::Tool {
-                    id: call.id,
-                    content: out,
+                    id: call.id.clone(),
+                    content: out.clone(),
+                });
+                step_results.push((call.id.clone(), out));
+            }
+
+            if let Some(recorder) = self.ctx.service::<Arc<recorder::FlightRecorder>>() {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let post_ckpt =
+                    if let Some(mgr) = self.ctx.service::<checkpoint::CheckpointManager>() {
+                        mgr.save(&format!("post-step {turn_idx}-{step}"))
+                            .ok()
+                            .map(|c| c.id)
+                    } else {
+                        None
+                    };
+                let _ = recorder.record(&recorder::RecordFrame::StepExecution {
+                    turn_index: turn_idx,
+                    step_index: step,
+                    thinking: None,
+                    response_text: text.clone(),
+                    tool_calls: tool_calls.clone(),
+                    tool_results: step_results,
+                    post_checkpoint_id: post_ckpt,
+                    duration_ms: step_start_instant.elapsed().as_millis() as u64,
+                    timestamp_ms: now_ms,
                 });
             }
+        }
+        if let Some(recorder) = self.ctx.service::<Arc<recorder::FlightRecorder>>() {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let _ = recorder.record(&recorder::RecordFrame::TurnEnd {
+                turn_index: turn_idx,
+                status: "step_limit".into(),
+                duration_ms: turn_start_instant.elapsed().as_millis() as u64,
+                timestamp_ms: now_ms,
+            });
         }
         if policy.auto_rollback {
             if let Some(vfs_svc) = self.ctx.service::<Arc<vfs::TransactionalVfs>>() {

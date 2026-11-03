@@ -28,9 +28,10 @@ use keel_agent::{
     subagent::SubagentPlugin,
     tools::BuiltinToolsPlugin,
     vfs::{TransactionalVfs, VfsMode, VfsPlugin},
-    Agent, AllowAll, ApprovalPolicy, Approver, ApproverPlugin, InteractiveApprover, Llm, LlmPlugin,
-    Message, PrewarmEngine, PrewarmPlugin, ReadOnly, SentinelPlugin, SessionLog, SessionLogPlugin,
-    StreamingSentinel, StreamingSentinelMode, ToolResult, ToolStart,
+    Agent, AllowAll, ApprovalPolicy, Approver, ApproverPlugin, FlightRecorder,
+    FlightRecorderPlugin, InteractiveApprover, Llm, LlmPlugin, Message, PrewarmEngine,
+    PrewarmPlugin, ReadOnly, ReplayEngine, ReplayEnginePlugin, SentinelPlugin, SessionLog,
+    SessionLogPlugin, StreamingSentinel, StreamingSentinelMode, ToolResult, ToolStart,
 };
 use keel_kernel::{Context, Plugin, Scope};
 use std::io::Write;
@@ -169,6 +170,7 @@ fn print_usage() {
   keel symbols <cmd>               structural symbol index & outline navigator (outline, search, get)
   keel tree <cmd>                  branching exploration tree DAG (status, fork, switch, backtrack)
   keel sentinel <cmd>              streaming tool-call interception & early veto sentinel (status, check, rules)
+  keel replay <cmd>                deterministic session flight recorder & time-travel (list, info, inspect, restore, fork)
   keel bench [filter] [--runs N]   run benchmark suite
 
 options:
@@ -1259,6 +1261,163 @@ fn cli_sentinel(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Resu
     }
 }
 
+fn cli_replay(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result<()> {
+    let json_mode = take_flag(&mut args, "--json");
+    let turn_opt = take_opt(&mut args, "--turn").and_then(|s| s.parse::<usize>().ok());
+    let step_opt = take_opt(&mut args, "--step").and_then(|s| s.parse::<usize>().ok());
+    let new_sid_opt = take_opt(&mut args, "--new-session");
+    let root = match root_opt {
+        Some(r) => std::fs::canonicalize(r)?,
+        None => std::env::current_dir()?,
+    };
+
+    let engine = ReplayEngine::new(&root);
+    let cp = CheckpointManager::new(root.clone());
+
+    let subcmd = args.first().map(String::as_str).unwrap_or("list");
+    match subcmd {
+        "list" => {
+            let recordings = engine.list_recordings()?;
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&recordings)?);
+            } else if recordings.is_empty() {
+                println!("No session recordings found in .keel/recordings.");
+            } else {
+                println!(
+                    "Recorded Sessions ({}) in {}:",
+                    recordings.len(),
+                    engine.recordings_dir().display()
+                );
+                for r in recordings {
+                    println!(
+                        "  - {} [{}] {} turn(s), {} step(s), status: {} ({}ms)",
+                        r.session_id,
+                        r.model,
+                        r.total_turns,
+                        r.total_steps,
+                        r.last_status,
+                        r.duration_ms
+                    );
+                    if !r.modified_files.is_empty() {
+                        println!("    modified: {}", r.modified_files.join(", "));
+                    }
+                }
+            }
+            Ok(())
+        }
+        "info" => {
+            let sid = if args.len() > 1 {
+                &args[1]
+            } else {
+                eprintln!("Usage: keel replay info <session_id> [--json]");
+                std::process::exit(2);
+            };
+            let sess = engine.load_session(sid)?;
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&sess)?);
+            } else {
+                println!("=== Session Recording: {} ===", sess.session_id);
+                println!("Model: {}", sess.model);
+                println!("Workspace: {}", sess.workspace_root.display());
+                println!("Total Turns: {}", sess.total_turns());
+                println!("Total Steps: {}", sess.total_steps());
+                println!("Duration: {}ms", sess.duration_ms());
+                println!("User Prompts:");
+                for (i, p) in sess.user_prompts().iter().enumerate() {
+                    println!("  {}. \"{}\"", i + 1, p);
+                }
+                let mods = sess.modified_files();
+                if !mods.is_empty() {
+                    println!("Files Touched: {}", mods.join(", "));
+                }
+            }
+            Ok(())
+        }
+        "inspect" => {
+            let sid = if args.len() > 1 {
+                &args[1]
+            } else {
+                eprintln!("Usage: keel replay inspect <session_id> [--turn T] [--step S] [--json]");
+                std::process::exit(2);
+            };
+            let turn_idx = turn_opt.unwrap_or(0);
+            let step_idx = step_opt.unwrap_or(0);
+            let step = engine.inspect_step(sid, turn_idx, step_idx)?;
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&step)?);
+            } else {
+                println!(
+                    "=== Step Inspection: {} (Turn {}, Step {}) ===",
+                    sid, turn_idx, step_idx
+                );
+                if let Some(ref th) = step.thinking {
+                    println!("Thinking: {}", th);
+                }
+                println!("Response: {}", step.response_text);
+                println!("Checkpoint ID: {:?}", step.checkpoint_id);
+                println!("Tool Calls ({}):", step.tool_calls.len());
+                for (c, r) in step.tool_calls.iter().zip(&step.tool_results) {
+                    println!("  - `{}` ({}) -> result len: {}", c.name, c.args, r.1.len());
+                }
+            }
+            Ok(())
+        }
+        "restore" => {
+            let sid = if args.len() > 1 {
+                &args[1]
+            } else {
+                eprintln!("Usage: keel replay restore <session_id> [--turn T] [--step S] [--json]");
+                std::process::exit(2);
+            };
+            let turn_idx = turn_opt.unwrap_or(0);
+            let step_idx = step_opt.unwrap_or(0);
+            let rep = engine.restore_step(sid, turn_idx, step_idx, &cp)?;
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&rep)?);
+            } else {
+                println!(
+                    "Workspace restored to session `{}` at Turn {}, Step {} (checkpoint `{}`). Restored {} file(s).",
+                    sid, turn_idx, step_idx, rep.restored_checkpoint_id, rep.restored_files_count
+                );
+            }
+            Ok(())
+        }
+        "fork" => {
+            let sid = if args.len() > 1 {
+                &args[1]
+            } else {
+                eprintln!(
+                    "Usage: keel replay fork <session_id> [--turn T] [--step S] [--new-session <id>] [--json]"
+                );
+                std::process::exit(2);
+            };
+            let turn_idx = turn_opt.unwrap_or(0);
+            let step_idx = step_opt.unwrap_or(0);
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let new_sid = new_sid_opt.unwrap_or_else(|| format!("fork-{ts}"));
+            let rep = engine.fork_step(sid, turn_idx, step_idx, &new_sid, &cp)?;
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&rep)?);
+            } else {
+                println!(
+                    "Forked session `{}` into `{}` from Turn {}, Step {} (restored checkpoint `{}`). Conversation history primed with {} message(s).",
+                    sid, rep.new_session_id, turn_idx, step_idx, rep.checkpoint_id, rep.conversation_length
+                );
+            }
+            Ok(())
+        }
+        other => {
+            eprintln!(
+                "unknown replay subcommand `{other}`. Usage: keel replay <list|info|inspect|restore|fork> ..."
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -1320,6 +1479,10 @@ fn main() -> anyhow::Result<()> {
     if args.first().map(String::as_str) == Some("sentinel") {
         args.remove(0);
         return cli_sentinel(args, root_opt);
+    }
+    if args.first().map(String::as_str) == Some("replay") {
+        args.remove(0);
+        return cli_replay(args, root_opt);
     }
 
     let mut interactive = take_flag(&mut args, "-i") || take_flag(&mut args, "--interactive");
@@ -1604,6 +1767,23 @@ fn main() -> anyhow::Result<()> {
     let _p_tree = ctx.mount(&keel_agent::TreePlugin { root: root.clone() });
     let _p_sentinel = ctx.mount(&SentinelPlugin(Arc::new(StreamingSentinel::default())));
     let _p_prewarm = ctx.mount(&PrewarmPlugin(Arc::new(PrewarmEngine::new(root.clone()))));
+    let _p_replay = ctx.mount(&ReplayEnginePlugin(Arc::new(ReplayEngine::new(
+        root.clone(),
+    ))));
+    let rec_dir = root.join(".keel").join("recordings");
+    let rec_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let _p_recorder = FlightRecorder::create(
+        &rec_dir,
+        &format!("session-{rec_ts}"),
+        root.clone(),
+        "keel",
+        None,
+    )
+    .ok()
+    .map(|r| ctx.mount(&FlightRecorderPlugin(Arc::new(r))));
 
     let mut extra_servers = std::collections::HashMap::new();
     for spec in mcp_server_opts {
@@ -1750,6 +1930,32 @@ fn main() -> anyhow::Result<()> {
                     }
                 } else {
                     println!("Epistemic store is not active.\n");
+                }
+                continue;
+            }
+            if trimmed == "/replay" || trimmed == "/recordings" {
+                if let Some(engine) = ctx.service::<Arc<ReplayEngine>>() {
+                    match engine.list_recordings() {
+                        Ok(recs) => {
+                            if recs.is_empty() {
+                                println!("No session recordings found in .keel/recordings.\n");
+                            } else {
+                                println!("Session Recordings ({}):", recs.len());
+                                for r in recs.iter().take(5) {
+                                    println!(
+                                        "  - {} [{}] ({} turns, {} steps, {}ms)",
+                                        r.session_id,
+                                        r.model,
+                                        r.total_turns,
+                                        r.total_steps,
+                                        r.duration_ms
+                                    );
+                                }
+                                println!();
+                            }
+                        }
+                        Err(e) => eprintln!("Failed to list recordings: {e:#}\n"),
+                    }
                 }
                 continue;
             }

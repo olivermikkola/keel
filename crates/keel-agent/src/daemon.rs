@@ -597,6 +597,9 @@ fn create_session(
         ctx.mount(&crate::interceptor::PrewarmPlugin(Arc::new(
             crate::interceptor::PrewarmEngine::new(cfg.root.clone()),
         ))),
+        ctx.mount(&crate::recorder::ReplayEnginePlugin(Arc::new(
+            crate::recorder::ReplayEngine::new(cfg.root.clone()),
+        ))),
     ];
 
     let mut sys_text = format!(
@@ -764,6 +767,8 @@ pub fn handle_acp_client<R: BufRead>(
                             "multiStepBacktracking": true,
                             "streamingSentinel": true,
                             "predictivePrewarm": true,
+                            "flightRecorder": true,
+                            "timeTravelReplay": true,
                         }
                     }),
                 );
@@ -2088,6 +2093,165 @@ pub fn handle_acp_client<R: BufRead>(
                     rpc_writer.send_error(id, -32000, "PrewarmEngine not mounted");
                 }
             }
+            "replay/list" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                if let Some(engine) = session.ctx.service::<Arc<crate::recorder::ReplayEngine>>() {
+                    match engine.list_recordings() {
+                        Ok(recordings) => {
+                            rpc_writer.send_response(
+                                id,
+                                json!({ "session_id": sid, "recordings": recordings }),
+                            );
+                        }
+                        Err(e) => rpc_writer.send_error(id, -32000, &format!("{e:#}")),
+                    }
+                } else {
+                    rpc_writer.send_error(id, -32000, "ReplayEngine not mounted");
+                }
+            }
+            "replay/info" => {
+                let target_sid = params
+                    .get("target_session_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let session = server.registry.get_or_create(
+                    &current_session_id.lock().unwrap(),
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                if let Some(engine) = session.ctx.service::<Arc<crate::recorder::ReplayEngine>>() {
+                    match engine.load_session(target_sid) {
+                        Ok(sess) => {
+                            rpc_writer.send_response(
+                                id,
+                                json!({
+                                    "session_id": sess.session_id,
+                                    "model": sess.model,
+                                    "total_turns": sess.total_turns(),
+                                    "total_steps": sess.total_steps(),
+                                    "duration_ms": sess.duration_ms(),
+                                    "user_prompts": sess.user_prompts(),
+                                    "modified_files": sess.modified_files(),
+                                }),
+                            );
+                        }
+                        Err(e) => rpc_writer.send_error(id, -32000, &format!("{e:#}")),
+                    }
+                } else {
+                    rpc_writer.send_error(id, -32000, "ReplayEngine not mounted");
+                }
+            }
+            "replay/step" => {
+                let target_sid = params
+                    .get("target_session_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let turn_idx = params
+                    .get("turn_index")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
+                let step_idx = params
+                    .get("step_index")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
+                let session = server.registry.get_or_create(
+                    &current_session_id.lock().unwrap(),
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                if let Some(engine) = session.ctx.service::<Arc<crate::recorder::ReplayEngine>>() {
+                    match engine.inspect_step(target_sid, turn_idx, step_idx) {
+                        Ok(inspection) => {
+                            rpc_writer.send_response(id, json!({ "step": inspection }));
+                        }
+                        Err(e) => rpc_writer.send_error(id, -32000, &format!("{e:#}")),
+                    }
+                } else {
+                    rpc_writer.send_error(id, -32000, "ReplayEngine not mounted");
+                }
+            }
+            "replay/restore" => {
+                let target_sid = params
+                    .get("target_session_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let turn_idx = params
+                    .get("turn_index")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
+                let step_idx = params
+                    .get("step_index")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
+                let cp = CheckpointManager::new(server.cfg.root.clone());
+                let session = server.registry.get_or_create(
+                    &current_session_id.lock().unwrap(),
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                if let Some(engine) = session.ctx.service::<Arc<crate::recorder::ReplayEngine>>() {
+                    match engine.restore_step(target_sid, turn_idx, step_idx, &cp) {
+                        Ok(report) => {
+                            rpc_writer.send_response(
+                                id,
+                                json!({ "status": "restored", "report": report }),
+                            );
+                        }
+                        Err(e) => rpc_writer.send_error(id, -32000, &format!("{e:#}")),
+                    }
+                } else {
+                    rpc_writer.send_error(id, -32000, "ReplayEngine not mounted");
+                }
+            }
+            "replay/fork" => {
+                let target_sid = params
+                    .get("target_session_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let new_sid = params
+                    .get("new_session_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("forked-session");
+                let turn_idx = params
+                    .get("turn_index")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
+                let step_idx = params
+                    .get("step_index")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
+                let cp = CheckpointManager::new(server.cfg.root.clone());
+                let session = server.registry.get_or_create(
+                    &current_session_id.lock().unwrap(),
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                if let Some(engine) = session.ctx.service::<Arc<crate::recorder::ReplayEngine>>() {
+                    match engine.fork_step(target_sid, turn_idx, step_idx, new_sid, &cp) {
+                        Ok(report) => {
+                            rpc_writer
+                                .send_response(id, json!({ "status": "forked", "report": report }));
+                        }
+                        Err(e) => rpc_writer.send_error(id, -32000, &format!("{e:#}")),
+                    }
+                } else {
+                    rpc_writer.send_error(id, -32000, "ReplayEngine not mounted");
+                }
+            }
             "shutdown" | "exit" => {
                 if !id.is_null() {
                     rpc_writer.send_response(id, json!({ "status": "shutting_down" }));
@@ -2953,6 +3117,118 @@ impl WorkerService {
         // 5. Verify prewarm metrics
         let prewarm_res = lines.iter().find(|v| v["id"] == 5).unwrap();
         assert!(prewarm_res["result"]["prewarm"]["prewarm_requests"].is_number());
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn acp_daemon_flight_recorder_and_replay_rpc() {
+        let tmp = std::env::temp_dir().join(format!("keel-replay-rpc-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let rec_dir = tmp.join(".keel").join("recordings");
+        let rec = crate::recorder::FlightRecorder::create(
+            &rec_dir,
+            "session-replay-rpc-01",
+            tmp.clone(),
+            "kat-coder",
+            Some("You are an autonomous edge coder."),
+        )
+        .unwrap();
+
+        rec.record(&crate::recorder::RecordFrame::TurnStart {
+            turn_index: 0,
+            user_prompt: "Build time-travel recorder".into(),
+            timestamp_ms: 1000,
+            pre_checkpoint_id: None,
+        })
+        .unwrap();
+
+        rec.record(&crate::recorder::RecordFrame::StepExecution {
+            turn_index: 0,
+            step_index: 0,
+            thinking: Some("Writing recorder.rs".into()),
+            response_text: "Created recorder.rs".into(),
+            tool_calls: vec![ToolCall {
+                id: "call-1".into(),
+                name: "write_file".into(),
+                args: serde_json::json!({ "path": "recorder.rs" }),
+            }],
+            tool_results: vec![("call-1".into(), "ok".into())],
+            post_checkpoint_id: Some("ckpt-test-1".into()),
+            duration_ms: 120,
+            timestamp_ms: 1120,
+        })
+        .unwrap();
+
+        let out_buf = Arc::new(Mutex::new(Vec::new()));
+
+        let requests = [
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "replay/list", "params": {}}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "replay/info", "params": {
+                "target_session_id": "session-replay-rpc-01"
+            }})
+            .to_string(),
+            json!({"jsonrpc": "2.0", "id": 4, "method": "replay/step", "params": {
+                "target_session_id": "session-replay-rpc-01",
+                "turn_index": 0,
+                "step_index": 0
+            }})
+            .to_string(),
+            json!({"jsonrpc": "2.0", "id": 5, "method": "shutdown", "params": {}}).to_string(),
+        ]
+        .join("\n")
+            + "\n";
+
+        let cfg = DaemonConfig {
+            root: tmp.clone(),
+            policy: ApprovalPolicy::Yolo,
+            landlock_enabled: false,
+            vfs_mode: VfsMode::MaterializedCow,
+            verify_command: None,
+        };
+
+        serve_acp(
+            BufReader::new(std::io::Cursor::new(requests.into_bytes())),
+            Box::new(SharedVecWriter(out_buf.clone())),
+            cfg,
+            Arc::new(DaemonTestLlm),
+        )
+        .unwrap();
+
+        let raw_output = String::from_utf8(out_buf.lock().unwrap().clone()).unwrap();
+        let lines: Vec<Value> = raw_output
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .collect();
+
+        // 1. Verify capabilities
+        assert!(lines.iter().any(|v| v["id"] == 1
+            && v["result"]["capabilities"]["flightRecorder"] == true
+            && v["result"]["capabilities"]["timeTravelReplay"] == true));
+
+        // 2. Verify replay/list
+        let list_res = lines.iter().find(|v| v["id"] == 2).unwrap();
+        let recs = list_res["result"]["recordings"].as_array().unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0]["session_id"], "session-replay-rpc-01");
+
+        // 3. Verify replay/info
+        let info_res = lines.iter().find(|v| v["id"] == 3).unwrap();
+        assert_eq!(info_res["result"]["session_id"], "session-replay-rpc-01");
+        assert_eq!(info_res["result"]["model"], "kat-coder");
+        assert_eq!(info_res["result"]["total_turns"], 1);
+
+        // 4. Verify replay/step
+        let step_res = lines.iter().find(|v| v["id"] == 4).unwrap();
+        assert_eq!(step_res["result"]["step"]["turn_index"], 0);
+        assert_eq!(step_res["result"]["step"]["step_index"], 0);
+        assert_eq!(
+            step_res["result"]["step"]["tool_calls"][0]["name"],
+            "write_file"
+        );
 
         let _ = std::fs::remove_dir_all(tmp);
     }
