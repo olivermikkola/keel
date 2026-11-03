@@ -530,42 +530,56 @@ impl Agent<'_> {
         agent.run_turn(history, user)
     }
 
-    /// Extract inline `<tool_call>{"name": ..., "arguments": ...}</tool_call>` or JSON blocks
-    /// when a smaller/weak model emits tool invocations in plain text instead of native `tool_calls`.
-    fn fallback_parse_text_tool_calls(text: &str) -> Vec<ToolCall> {
+    /// Extract inline `<tool_call>{"name": ..., "arguments": ...}</tool_call>`, `<function_call>`,
+    /// or fenced JSON blocks when a smaller/local model emits tool invocations in plain text instead of native `tool_calls`.
+    ///
+    /// Returns `(recovered_tool_calls, cleaned_text)` with raw tool markup removed from text.
+    pub fn fallback_parse_text_tool_calls(text: &str) -> (Vec<ToolCall>, String) {
         let mut out = Vec::new();
-        // 1. `<tool_call>...</tool_call>` tags (Qwen / Hermes / Bonsai style)
-        let mut rest = text;
-        while let Some(start) = rest.find("<tool_call>") {
-            let after = &rest[start + "<tool_call>".len()..];
-            let Some(end) = after.find("</tool_call>") else {
-                break;
-            };
-            let inner = after[..end].trim();
-            if let Ok(v) = serde_json::from_str::<Value>(inner) {
-                if let Some(name) = v["name"].as_str() {
-                    let args = v
-                        .get("arguments")
-                        .or_else(|| v.get("args"))
-                        .or_else(|| v.get("parameters"))
-                        .cloned()
-                        .unwrap_or_else(|| json_without_name(&v));
-                    out.push(ToolCall {
-                        id: format!("fallback-{}", out.len() + 1),
-                        name: name.to_string(),
-                        args,
-                    });
+        let mut cleaned = text.to_string();
+
+        // 1. XML-style tool calls: <tool_call>, <function_call>
+        for (open_tag, close_tag) in [
+            ("<tool_call>", "</tool_call>"),
+            ("<function_call>", "</function_call>"),
+        ] {
+            while let Some(start) = cleaned.find(open_tag) {
+                let after = &cleaned[start + open_tag.len()..];
+                let Some(end) = after.find(close_tag) else {
+                    break;
+                };
+                let inner = after[..end].trim();
+                if let Ok(v) = serde_json::from_str::<Value>(inner) {
+                    if let Some(name) = v
+                        .get("name")
+                        .or_else(|| v.get("tool"))
+                        .and_then(|v| v.as_str())
+                    {
+                        let args = v
+                            .get("arguments")
+                            .or_else(|| v.get("args"))
+                            .or_else(|| v.get("parameters"))
+                            .cloned()
+                            .unwrap_or_else(|| json_without_name(&v));
+                        out.push(ToolCall {
+                            id: format!("fallback-{}", out.len() + 1),
+                            name: name.to_string(),
+                            args,
+                        });
+                    }
                 }
+                let total_len = open_tag.len() + end + close_tag.len();
+                cleaned.replace_range(start..start + total_len, "");
             }
-            rest = &after[end + "</tool_call>".len()..];
         }
+
         if !out.is_empty() {
-            return out;
+            return (out, cleaned.trim().to_string());
         }
+
         // 2. Fenced ```json or ```tool_call blocks containing {"name": ..., "arguments": ...}
-        let mut scan = text;
-        while let Some(fence) = scan.find("```") {
-            let after_fence = &scan[fence + 3..];
+        while let Some(fence) = cleaned.find("```") {
+            let after_fence = &cleaned[fence + 3..];
             let Some(nl) = after_fence.find('\n') else {
                 break;
             };
@@ -575,7 +589,11 @@ impl Agent<'_> {
             };
             let candidate = body_start[..close].trim();
             if let Ok(v) = serde_json::from_str::<Value>(candidate) {
-                if let Some(name) = v["name"].as_str() {
+                if let Some(name) = v
+                    .get("name")
+                    .or_else(|| v.get("tool"))
+                    .and_then(|v| v.as_str())
+                {
                     let args = v
                         .get("arguments")
                         .or_else(|| v.get("args"))
@@ -587,11 +605,15 @@ impl Agent<'_> {
                         name: name.to_string(),
                         args,
                     });
+                    let total_len = 3 + nl + 1 + close + 3;
+                    cleaned.replace_range(fence..fence + total_len, "");
+                    continue;
                 }
             }
-            scan = &body_start[close + 3..];
+            break;
         }
-        out
+
+        (out, cleaned.trim().to_string())
     }
 
     /// Run one turn against `history` (mutated in place). Returns the final assistant text.
@@ -675,14 +697,15 @@ impl Agent<'_> {
                 anyhow::bail!("turn cancelled by client");
             }
             if let Message::Assistant {
-                ref text,
+                ref mut text,
                 ref mut tool_calls,
             } = reply
             {
                 if tool_calls.is_empty() {
-                    let recovered = Self::fallback_parse_text_tool_calls(text);
+                    let (recovered, cleaned) = Self::fallback_parse_text_tool_calls(text);
                     if !recovered.is_empty() {
                         *tool_calls = recovered;
+                        *text = cleaned;
                     }
                 }
             }
@@ -1002,7 +1025,29 @@ mod tests {
         };
         let mut h = vec![];
         assert_eq!(agent.run_turn(&mut h, "go").unwrap(), "all good");
+        assert!(
+            matches!(&h[1], Message::Assistant { text, tool_calls } if text == "Let me run echo:" && tool_calls.len() == 1)
+        );
         assert!(matches!(&h[2], Message::Tool { content, .. } if content == "recovered"));
+    }
+
+    #[test]
+    fn fallback_parses_function_call_and_fenced_blocks_with_text_cleaning() {
+        let (calls1, clean1) = Agent::fallback_parse_text_tool_calls(
+            "Executing query now:\n<function_call>{\"name\":\"grep\",\"arguments\":{\"pattern\":\"User\"}}</function_call>\nWaiting for results.",
+        );
+        assert_eq!(calls1.len(), 1);
+        assert_eq!(calls1[0].name, "grep");
+        assert_eq!(calls1[0].args["pattern"], "User");
+        assert_eq!(clean1, "Executing query now:\n\nWaiting for results.");
+
+        let (calls2, clean2) = Agent::fallback_parse_text_tool_calls(
+            "Here is the change:\n```json\n{\"name\": \"patch_file\", \"arguments\": {\"path\": \"app.rs\"}}\n```\nDone.",
+        );
+        assert_eq!(calls2.len(), 1);
+        assert_eq!(calls2[0].name, "patch_file");
+        assert_eq!(calls2[0].args["path"], "app.rs");
+        assert_eq!(clean2, "Here is the change:\n\nDone.");
     }
 
     #[test]

@@ -197,6 +197,9 @@ fn print_usage() {
   keel bench [filter] [--runs N]   run benchmark suite
 
 options:
+  --model <name>                   LLM model identifier (e.g. kat-coder, bonsai-9b, deepseek-chat)
+  --base-url <url>                 OpenAI-compatible chat completions endpoint
+  --api-key <key>                  API key for LLM provider
   --sentinel <mode>                regression sentinel mode (warn, rollback, strict)
   --handoff <file>                 bootstrap session directly from handoff envelope
   --listen <addr>                  listen on TCP address (e.g. 127.0.0.1:4040)
@@ -1597,6 +1600,13 @@ fn main() -> anyhow::Result<()> {
     let mut log_opt = take_opt(&mut args, "--log");
     let resume_opt = take_opt(&mut args, "--resume");
     let verify_cmd = take_opt(&mut args, "--verify");
+    let model_opt = take_opt(&mut args, "--model").or_else(|| std::env::var("KEEL_MODEL").ok());
+    let base_url_opt =
+        take_opt(&mut args, "--base-url").or_else(|| std::env::var("KEEL_BASE_URL").ok());
+    let api_key_opt = take_opt(&mut args, "--api-key")
+        .or_else(|| std::env::var("KEEL_API_KEY").ok())
+        .or_else(|| std::env::var("DEEPSEEK_API_KEY").ok());
+
     let runs: usize = take_opt(&mut args, "--runs")
         .and_then(|r| r.parse().ok())
         .unwrap_or(1);
@@ -1626,6 +1636,11 @@ fn main() -> anyhow::Result<()> {
     }
     let mut prompt = args.join(" ");
 
+    let root = match root_opt {
+        Some(r) => std::fs::canonicalize(r)?,
+        None => std::env::current_dir()?,
+    };
+
     if log_opt.is_none() {
         if let Some(r) = &resume_opt {
             log_opt = Some(r.clone());
@@ -1638,28 +1653,37 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    let model_name = model_opt.unwrap_or_else(|| "deepseek-chat".into());
+    let base_url = base_url_opt.unwrap_or_else(|| {
+        if model_name.contains("kat-coder") || model_name.contains("kat") {
+            "http://127.0.0.1:8085/v1".into()
+        } else if model_name.contains("bonsai") || model_name.contains("qwen") {
+            "http://127.0.0.1:8080/v1".into()
+        } else {
+            "https://api.deepseek.com".into()
+        }
+    });
+
+    let streaming_sentinel = Arc::new(StreamingSentinel::default());
+    let prewarm_engine = Arc::new(PrewarmEngine::new(root.clone()));
+
     let primary_llm: Arc<dyn Llm> = Arc::new(OpenAiCompat {
-        base_url: std::env::var("KEEL_BASE_URL")
-            .unwrap_or_else(|_| "https://api.deepseek.com".into()),
-        api_key: std::env::var("KEEL_API_KEY")
-            .or_else(|_| std::env::var("DEEPSEEK_API_KEY"))
-            .ok(),
-        model: std::env::var("KEEL_MODEL").unwrap_or_else(|_| "deepseek-chat".into()),
+        base_url: base_url.clone(),
+        api_key: api_key_opt.clone(),
+        model: model_name.clone(),
         enable_thinking: std::env::var("KEEL_THINKING").ok().map(|v| v != "0"),
-        sentinel: None,
-        prewarm: None,
+        sentinel: Some(streaming_sentinel.clone()),
+        prewarm: Some(prewarm_engine.clone()),
     });
     let llm: Arc<dyn Llm> = if let Some(frontier_model) = cascade_model_opt {
         let frontier: Arc<dyn Llm> = Arc::new(OpenAiCompat {
             base_url: std::env::var("KEEL_CASCADE_URL")
                 .unwrap_or_else(|_| "https://api.deepseek.com".into()),
-            api_key: std::env::var("DEEPSEEK_API_KEY")
-                .or_else(|_| std::env::var("KEEL_API_KEY"))
-                .ok(),
+            api_key: api_key_opt,
             model: frontier_model,
             enable_thinking: Some(true),
-            sentinel: None,
-            prewarm: None,
+            sentinel: Some(streaming_sentinel.clone()),
+            prewarm: Some(prewarm_engine.clone()),
         });
         Arc::new(CascadeProvider::new(primary_llm, frontier, 2))
     } else {
@@ -1668,11 +1692,6 @@ fn main() -> anyhow::Result<()> {
     if bench_mode {
         return bench::run(llm, args.first().map(String::as_str), runs);
     }
-
-    let root = match root_opt {
-        Some(r) => std::fs::canonicalize(r)?,
-        None => std::env::current_dir()?,
-    };
     if let Some(path) = handoff_opt {
         use std::io::Read;
         let raw_json = if path == "-" {
@@ -1880,8 +1899,8 @@ fn main() -> anyhow::Result<()> {
     let _p_symbols = ctx.mount(&keel_agent::SymbolPlugin { root: root.clone() });
     let _p_repomap = ctx.mount(&RepoMapPlugin::new(root.clone()));
     let _p_tree = ctx.mount(&keel_agent::TreePlugin { root: root.clone() });
-    let _p_sentinel = ctx.mount(&SentinelPlugin(Arc::new(StreamingSentinel::default())));
-    let _p_prewarm = ctx.mount(&PrewarmPlugin(Arc::new(PrewarmEngine::new(root.clone()))));
+    let _p_sentinel = ctx.mount(&SentinelPlugin(streaming_sentinel.clone()));
+    let _p_prewarm = ctx.mount(&PrewarmPlugin(prewarm_engine.clone()));
     let _p_replay = ctx.mount(&ReplayEnginePlugin(Arc::new(ReplayEngine::new(
         root.clone(),
     ))));
