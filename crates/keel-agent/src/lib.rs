@@ -774,6 +774,44 @@ impl Agent<'_> {
                         continue;
                     }
                 }
+                if let Some(oracle) = self.ctx.service::<Arc<oracle::DiagnosticOracle>>() {
+                    if oracle.get_baseline().is_some() {
+                        if let Ok(delta) = oracle.check_delta() {
+                            if !delta.is_clean {
+                                let count = delta.new_regressions.len();
+                                let summary = format!("{count} new test regression(s) introduced");
+                                if let Some(store) = self.ctx.service::<epistemic::EpistemicStore>()
+                                {
+                                    let _ = store.record_failure(
+                                        &format!("attempt at step {}", step + 1),
+                                        &summary,
+                                    );
+                                }
+                                if oracle.mode == oracle::SentinelMode::Strict {
+                                    anyhow::bail!(
+                                        "turn failed due to test regressions:\n{}",
+                                        delta.render_remediation().unwrap_or_default()
+                                    );
+                                }
+                                if oracle.mode == oracle::SentinelMode::Rollback {
+                                    if let Some(vfs_svc) =
+                                        self.ctx.service::<Arc<vfs::TransactionalVfs>>()
+                                    {
+                                        let _ = vfs_svc.rollback();
+                                    }
+                                }
+                                let remediation = delta.render_remediation().unwrap_or(summary);
+                                let feedback = format!(
+                                    "[regression sentinel alert]\n{remediation}\nDo not finish until all regressions are resolved. Fix the issue or revert breaking changes."
+                                );
+                                self.log
+                                    .append("user", serde_json::json!({ "text": feedback }))?;
+                                history.push(Message::User { text: feedback });
+                                continue;
+                            }
+                        }
+                    }
+                }
                 if let Some(recorder) = self.ctx.service::<Arc<recorder::FlightRecorder>>() {
                     let now_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -1554,6 +1592,49 @@ mod tests {
                 text: "Hello".into()
             }
         );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn sentinel_gate_forces_continuation_on_regression() {
+        let ctx = Context::new();
+        let llm = Script(Mutex::new(vec![
+            asst("I'm done", vec![]),
+            asst("Fixed all regressions", vec![]),
+        ]));
+
+        let tmp = std::env::temp_dir().join(format!("keel-sentinel-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Marker script: baseline run succeeds (passes), first check introduces failure, second check passes
+        let test_cmd = format!(
+            "if [ ! -f {0}/step1 ]; then touch {0}/step1; echo 'running 1 tests\ntest test_a ... ok\ntest result: ok. 1 passed; 0 failed;'; elif [ ! -f {0}/step2 ]; then touch {0}/step2; echo 'running 1 tests\ntest test_a ... FAILED\ntest result: FAILED. 0 passed; 1 failed;'; else echo 'running 1 tests\ntest test_a ... ok\ntest result: ok. 1 passed; 0 failed;'; fi",
+            tmp.display()
+        );
+
+        let _p = ctx.mount(&oracle::OraclePlugin {
+            root: tmp.clone(),
+            test_command: Some(test_cmd),
+            mode: oracle::SentinelMode::Warn,
+            auto_baseline: true,
+        });
+
+        let agent = Agent {
+            ctx: &ctx,
+            llm: &llm,
+            tools: vec![Box::new(Echo)],
+            approver: &AllowAll,
+            log: &SessionLog::none(),
+            max_steps: 5,
+        };
+        let mut h = vec![];
+        let res = agent.run_turn(&mut h, "implement feature").unwrap();
+        assert_eq!(res, "Fixed all regressions");
+        assert!(h.iter().any(
+            |m| matches!(m, Message::User { text } if text.contains("[regression sentinel alert]"))
+        ));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

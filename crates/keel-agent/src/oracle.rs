@@ -7,12 +7,15 @@
 //! - Self-Healing Oracle: injects targeted failure remediation context into agent loop
 //! - Reversible Sentinel: triggers automatic VFS rollback when a regression is introduced
 
-use anyhow::{Context as _, Result};
+use crate::sandbox::ToolRegistry;
+use crate::{Tool, ToolSpec};
+use anyhow::Result;
 use keel_kernel::{Plugin, Scope};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -354,90 +357,35 @@ impl DiagnosticOracle {
 
     /// Execute the configured test command (or `cargo test` defaulting to 2 threads).
     pub fn run_tests(&self) -> Result<TestSnapshot> {
+        self.run_tests_filtered(None)
+    }
+
+    /// Execute the configured test command with an optional test filter.
+    pub fn run_tests_filtered(&self, filter: Option<&str>) -> Result<TestSnapshot> {
         let start = Instant::now();
-        let cmd_str = self.resolve_test_command();
+        let mut cmd_str = self.resolve_test_command();
+        if let Some(f) = filter {
+            let f_trim = f.trim();
+            if !f_trim.is_empty() {
+                cmd_str.push(' ');
+                cmd_str.push_str(f_trim);
+            }
+        }
 
         let mut cmd = Command::new("sh");
         cmd.arg("-c")
             .arg(&cmd_str)
             .current_dir(&self.root)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
             .env("CARGO_BUILD_JOBS", "2")
-            .env("RAYON_NUM_THREADS", "2");
+            .env("RAYON_NUM_THREADS", "2")
+            .env("GIT_TERMINAL_PROMPT", "0");
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-        }
-
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("spawning test command: {cmd_str}"))?;
-
-        let mut stdout_handle = child.stdout.take();
-        let mut stderr_handle = child.stderr.take();
-
-        let stdout_thread = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut stream) = stdout_handle.take() {
-                use std::io::Read;
-                let _ = stream.by_ref().take(2 * 1024 * 1024).read_to_end(&mut buf);
-                let mut discard = [0u8; 8192];
-                while let Ok(n) = stream.read(&mut discard) {
-                    if n == 0 {
-                        break;
-                    }
-                }
-            }
-            buf
-        });
-
-        let stderr_thread = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut stream) = stderr_handle.take() {
-                use std::io::Read;
-                let _ = stream.by_ref().take(2 * 1024 * 1024).read_to_end(&mut buf);
-                let mut discard = [0u8; 8192];
-                while let Ok(n) = stream.read(&mut discard) {
-                    if n == 0 {
-                        break;
-                    }
-                }
-            }
-            buf
-        });
-
-        loop {
-            match child.try_wait() {
-                Ok(Some(_status)) => break,
-                Ok(None) => {
-                    if start.elapsed() > self.timeout {
-                        crate::tools::kill_process_group(&mut child);
-                        anyhow::bail!(
-                            "test execution timed out after {}s (killed)",
-                            self.timeout.as_secs()
-                        );
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                Err(e) => {
-                    crate::tools::kill_process_group(&mut child);
-                    return Err(e).context("waiting on test runner process");
-                }
-            }
-        }
-
-        let out_bytes = stdout_thread.join().unwrap_or_default();
-        let err_bytes = stderr_thread.join().unwrap_or_default();
-
+        let out = crate::tools::run_command_bounded(cmd, self.timeout)?;
         let elapsed_ms = start.elapsed().as_millis() as u64;
-        let mut raw = String::from_utf8_lossy(&out_bytes).to_string();
-        if !err_bytes.is_empty() {
+        let mut raw = String::from_utf8_lossy(&out.stdout).to_string();
+        if !out.stderr.is_empty() {
             raw.push('\n');
-            raw.push_str(&String::from_utf8_lossy(&err_bytes));
+            raw.push_str(&String::from_utf8_lossy(&out.stderr));
         }
 
         Ok(parse_test_output(&raw, elapsed_ms))
@@ -466,6 +414,104 @@ impl DiagnosticOracle {
     }
 }
 
+/// Tool enabling the agent to execute tests and receive diagnostic oracle output.
+pub struct OracleTestTool {
+    pub oracle: Arc<DiagnosticOracle>,
+}
+
+impl Tool for OracleTestTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "test_run".into(),
+            description: "Run workspace tests using the diagnostic oracle. Returns test results (passed/failed counts, failure locations, assertion messages) and regression delta against pre-turn baseline.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "filter": {
+                        "type": "string",
+                        "description": "Optional test name or path filter to focus the test run"
+                    }
+                }
+            }),
+        }
+    }
+
+    fn mutating(&self) -> bool {
+        false
+    }
+
+    fn run(&self, input: &Value) -> Result<String> {
+        let filter = input.get("filter").and_then(|v| v.as_str());
+        match self.oracle.run_tests_filtered(filter) {
+            Ok(snapshot) => {
+                let baseline = self.oracle.get_baseline();
+                let delta = baseline
+                    .as_ref()
+                    .map(|b| RegressionDelta::compute(b, &snapshot));
+                let mut out = format!(
+                    "Test run completed in {}ms: {} total, {} passed, {} failed, {} ignored.\n",
+                    snapshot.elapsed_ms,
+                    snapshot.total,
+                    snapshot.passed,
+                    snapshot.failed,
+                    snapshot.ignored
+                );
+                if let Some(d) = delta {
+                    if !d.is_clean {
+                        out.push_str("\n⚠️ REGRESSION DETECTED against baseline:\n");
+                        for (i, f) in d.new_regressions.iter().enumerate() {
+                            out.push_str(&format!("{}. {}\n", i + 1, f.name));
+                            if let Some(loc) = &f.location {
+                                out.push_str(&format!("   Location: {loc}\n"));
+                            }
+                            if let Some(assert_msg) = &f.assertion {
+                                out.push_str(&format!("   Assertion: {assert_msg}\n"));
+                            }
+                            if !f.snippet.is_empty() {
+                                out.push_str("   Snippet:\n");
+                                for line in f.snippet.lines().take(6) {
+                                    out.push_str(&format!("     {line}\n"));
+                                }
+                            }
+                        }
+                    }
+                    if !d.resolved_tests.is_empty() {
+                        out.push_str(&format!(
+                            "\n✅ Fixed tests: {}\n",
+                            d.resolved_tests.join(", ")
+                        ));
+                    }
+                    if !d.pre_existing_failures.is_empty() {
+                        out.push_str(&format!(
+                            "\nℹ️ Quarantined pre-existing failures: {}\n",
+                            d.pre_existing_failures.join(", ")
+                        ));
+                    }
+                } else if !snapshot.failures.is_empty() {
+                    out.push_str("\nFailures:\n");
+                    for (i, f) in snapshot.failures.iter().enumerate() {
+                        out.push_str(&format!("{}. {}\n", i + 1, f.name));
+                        if let Some(loc) = &f.location {
+                            out.push_str(&format!("   Location: {loc}\n"));
+                        }
+                        if let Some(assert_msg) = &f.assertion {
+                            out.push_str(&format!("   Assertion: {assert_msg}\n"));
+                        }
+                        if !f.snippet.is_empty() {
+                            out.push_str("   Snippet:\n");
+                            for line in f.snippet.lines().take(6) {
+                                out.push_str(&format!("     {line}\n"));
+                            }
+                        }
+                    }
+                }
+                Ok(out)
+            }
+            Err(e) => Ok(format!("test execution failed: {e:#}")),
+        }
+    }
+}
+
 /// Plugin mounting [`DiagnosticOracle`] onto the kernel context.
 pub struct OraclePlugin {
     pub root: PathBuf,
@@ -486,6 +532,16 @@ impl Plugin for OraclePlugin {
             self.mode,
         ));
         scope.provide(oracle.clone());
+
+        let reg = scope
+            .context()
+            .service::<ToolRegistry>()
+            .map(|r| (*r).clone())
+            .unwrap_or_default();
+        reg.register(Arc::new(OracleTestTool {
+            oracle: oracle.clone(),
+        }));
+        scope.provide(reg);
 
         if self.auto_baseline {
             let o_clone = oracle.clone();
@@ -641,6 +697,30 @@ test result: FAILED. 1 passed; 1 failed; 1 ignored; 0 measured; 0 filtered out; 
         assert!(res.is_err());
         let err_msg = format!("{:#}", res.unwrap_err());
         assert!(err_msg.contains("timed out"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn oracle_test_tool_execution_and_delta() {
+        let tmp = std::env::temp_dir().join(format!("keel_oracle_tool_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let oracle = Arc::new(DiagnosticOracle::new(
+            tmp.clone(),
+            Some("echo 'running 1 tests\ntest test_sample ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored;'".to_string()),
+            SentinelMode::Warn,
+        ));
+
+        let tool = OracleTestTool {
+            oracle: oracle.clone(),
+        };
+        assert_eq!(tool.spec().name, "test_run");
+
+        let out = tool.run(&json!({})).unwrap();
+        assert!(out.contains("1 passed"));
+        assert!(out.contains("0 failed"));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

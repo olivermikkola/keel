@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -77,6 +77,14 @@ struct EphemeralSandbox {
     parent_root: PathBuf,
 }
 
+fn run_git_bounded(root: &Path, args: &[&str], timeout_secs: u64) -> Option<std::process::Output> {
+    let mut cmd = Command::new("git");
+    cmd.args(args)
+        .current_dir(root)
+        .env("GIT_TERMINAL_PROMPT", "0");
+    crate::tools::run_command_bounded(cmd, std::time::Duration::from_secs(timeout_secs)).ok()
+}
+
 impl EphemeralSandbox {
     fn create(parent_root: &Path, candidate_id: usize) -> Result<Self> {
         let dir = std::env::temp_dir().join(format!(
@@ -89,21 +97,18 @@ impl EphemeralSandbox {
         // Check if parent_root is a clean git repo with a valid HEAD commit
         let mut used_git_worktree = false;
         if parent_root.join(".git").exists() && is_git_clean_with_head(parent_root) {
-            let status = Command::new("git")
-                .args([
+            if let Some(out) = run_git_bounded(
+                parent_root,
+                &[
                     "worktree",
                     "add",
                     "--detach",
                     &dir.to_string_lossy(),
                     "HEAD",
-                ])
-                .current_dir(parent_root)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            if let Ok(s) = status {
-                if s.success() {
+                ],
+                30,
+            ) {
+                if out.status.success() {
                     used_git_worktree = true;
                 }
             }
@@ -123,13 +128,11 @@ impl EphemeralSandbox {
 
     fn cleanup(&self) {
         if self.used_git_worktree {
-            let _ = Command::new("git")
-                .args(["worktree", "remove", "--force", &self.dir.to_string_lossy()])
-                .current_dir(&self.parent_root)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+            let _ = run_git_bounded(
+                &self.parent_root,
+                &["worktree", "remove", "--force", &self.dir.to_string_lossy()],
+                30,
+            );
         }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
@@ -142,26 +145,16 @@ impl Drop for EphemeralSandbox {
 }
 
 fn is_git_clean_with_head(root: &Path) -> bool {
-    let head_ok = Command::new("git")
-        .args(["rev-parse", "--verify", "HEAD"])
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
+    let head_ok = run_git_bounded(root, &["rev-parse", "--verify", "HEAD"], 10)
+        .map(|o| o.status.success())
         .unwrap_or(false);
     if !head_ok {
         return false;
     }
-    let status_out = Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .output();
+    let status_out = run_git_bounded(root, &["status", "--porcelain"], 15);
     match status_out {
-        Ok(o) => o.status.success() && o.stdout.is_empty(),
-        Err(_) => false,
+        Some(o) => o.status.success() && o.stdout.is_empty(),
+        None => false,
     }
 }
 
