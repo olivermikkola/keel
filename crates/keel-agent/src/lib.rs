@@ -64,6 +64,9 @@ pub use repomap::{compute_pagerank, ReferenceGraph, RepoMap, RepoMapPlugin, Repo
 pub use sandbox::{
     LandlockPlugin, SandboxPolicy, COMMON_TOOLCHAIN_ROOTS, DEFAULT_DEVICE_NODES, TOOLCHAIN_ENV_VARS,
 };
+pub use subagent::{
+    run_subagent, SubagentEnd, SubagentPlugin, SubagentReport, SubagentRole, SubagentStart,
+};
 pub use swarm::{export_handoff, ingest_handoff, HandoffEnvelope, HandoffIngestReport};
 pub use symbols::{
     parse_structural_outline, render_outline_markdown, FileOutline, Symbol, SymbolIndex,

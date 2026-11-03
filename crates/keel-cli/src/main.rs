@@ -29,7 +29,7 @@ use keel_agent::{
     repomap::{RepoMap, RepoMapPlugin},
     sandbox::LandlockPlugin,
     speculate::{SpeculatePlugin, SpeculationConfig, SpeculationEngine},
-    subagent::SubagentPlugin,
+    subagent::{run_subagent, SubagentPlugin, SubagentRole},
     tools::BuiltinToolsPlugin,
     vfs::{TransactionalVfs, VfsMode, VfsPlugin},
     Agent, AllowAll, ApprovalPolicy, Approver, ApproverPlugin, FlightRecorder,
@@ -194,12 +194,15 @@ fn print_usage() {
   keel tree <cmd>                  branching exploration tree DAG (status, fork, switch, backtrack)
   keel sentinel <cmd>              streaming tool-call interception & early veto sentinel (status, check, rules)
   keel replay <cmd>                deterministic session flight recorder & time-travel (list, info, inspect, restore, fork)
+  keel subagent "prompt" [opts]    run isolated read-only subagent query (roles: researcher, navigator, auditor)
   keel bench [filter] [--runs N]   run benchmark suite
 
 options:
   --model <name>                   LLM model identifier (e.g. kat-coder, bonsai-9b, deepseek-chat)
   --base-url <url>                 OpenAI-compatible chat completions endpoint
   --api-key <key>                  API key for LLM provider
+  --role <role>                    subagent role (researcher, navigator, auditor; default: researcher)
+  --steps <N>                      maximum agent execution steps
   --sentinel <mode>                regression sentinel mode (warn, rollback, strict)
   --handoff <file>                 bootstrap session directly from handoff envelope
   --listen <addr>                  listen on TCP address (e.g. 127.0.0.1:4040)
@@ -1490,6 +1493,51 @@ fn cli_repomap(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Resul
     Ok(())
 }
 
+fn cli_subagent(
+    prompt: &str,
+    role_str: Option<&str>,
+    steps_opt: Option<usize>,
+    root: &std::path::Path,
+    llm: Arc<dyn Llm>,
+    landlock_enabled: bool,
+    json_mode: bool,
+) -> anyhow::Result<()> {
+    if prompt.trim().is_empty() {
+        eprintln!(
+            "usage: keel subagent \"<prompt>\" [--role researcher|navigator|auditor] [--steps N] [--json]"
+        );
+        std::process::exit(2);
+    }
+    let role = role_str
+        .map(SubagentRole::from_str_lossy)
+        .unwrap_or(SubagentRole::Researcher);
+    let max_steps = steps_opt.unwrap_or(8).clamp(1, 20);
+
+    let report = run_subagent(root, llm, prompt, role, max_steps, landlock_enabled)?;
+
+    if json_mode {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("=== Subagent Report ({:?}) ===", report.role);
+        println!("Prompt: {}", report.prompt);
+        println!("Steps Taken: {}", report.steps_taken);
+        let tools_str = if report.tools_called.is_empty() {
+            "none".to_string()
+        } else {
+            report.tools_called.join(", ")
+        };
+        println!("Tools Called: {}", tools_str);
+        println!(
+            "Status: {}",
+            if report.success { "success" } else { "failed" }
+        );
+        println!("----------------------------------------");
+        println!("{}", report.answer);
+    }
+
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -1622,8 +1670,14 @@ fn main() -> anyhow::Result<()> {
     let socket_opt = take_opt(&mut args, "--socket");
     let auth_token_opt =
         take_opt(&mut args, "--auth-token").or_else(|| std::env::var("KEEL_DAEMON_TOKEN").ok());
+    let role_opt = take_opt(&mut args, "--role");
+    let steps_opt: Option<usize> = take_opt(&mut args, "--steps").and_then(|s| s.parse().ok());
     let daemon_mode = args.first().map(String::as_str) == Some("daemon");
     if daemon_mode {
+        args.remove(0);
+    }
+    let subagent_mode = args.first().map(String::as_str) == Some("subagent");
+    if subagent_mode {
         args.remove(0);
     }
     let speculate_mode = args.first().map(String::as_str) == Some("speculate");
@@ -1691,6 +1745,17 @@ fn main() -> anyhow::Result<()> {
     };
     if bench_mode {
         return bench::run(llm, args.first().map(String::as_str), runs);
+    }
+    if subagent_mode {
+        return cli_subagent(
+            &prompt,
+            role_opt.as_deref(),
+            steps_opt,
+            &root,
+            llm,
+            !no_sandbox,
+            json_mode,
+        );
     }
     if let Some(path) = handoff_opt {
         use std::io::Read;
