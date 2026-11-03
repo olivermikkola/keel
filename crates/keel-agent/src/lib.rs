@@ -230,6 +230,8 @@ pub struct InteractiveApprover {
     pub json_mode: bool,
     whitelisted: std::sync::Mutex<std::collections::HashSet<String>>,
     reader: std::sync::Mutex<Option<Box<dyn std::io::BufRead + Send>>>,
+    output: std::sync::Mutex<Option<Box<dyn std::io::Write + Send>>>,
+    interaction: std::sync::Mutex<()>,
 }
 
 impl InteractiveApprover {
@@ -239,6 +241,8 @@ impl InteractiveApprover {
             json_mode,
             whitelisted: std::sync::Mutex::new(std::collections::HashSet::new()),
             reader: std::sync::Mutex::new(None),
+            output: std::sync::Mutex::new(None),
+            interaction: std::sync::Mutex::new(()),
         }
     }
 
@@ -252,6 +256,48 @@ impl InteractiveApprover {
             json_mode,
             whitelisted: std::sync::Mutex::new(std::collections::HashSet::new()),
             reader: std::sync::Mutex::new(Some(reader)),
+            output: std::sync::Mutex::new(None),
+            interaction: std::sync::Mutex::new(()),
+        }
+    }
+
+    /// Parent integrations can supply both streams; requests are flushed before input is read.
+    pub fn with_io(
+        policy: ApprovalPolicy,
+        json_mode: bool,
+        reader: Box<dyn std::io::BufRead + Send>,
+        output: Box<dyn std::io::Write + Send>,
+    ) -> Self {
+        Self {
+            policy,
+            json_mode,
+            whitelisted: std::sync::Mutex::new(std::collections::HashSet::new()),
+            reader: std::sync::Mutex::new(Some(reader)),
+            output: std::sync::Mutex::new(Some(output)),
+            interaction: std::sync::Mutex::new(()),
+        }
+    }
+
+    fn emit_request(&self, call: &ToolCall) -> std::io::Result<()> {
+        static NEXT_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let request = serde_json::json!({
+            "type":"approval_request", "protocol":"stdio-line-v1",
+            "id":format!("approval-{}-{}",std::process::id(),NEXT_REQUEST.fetch_add(1,std::sync::atomic::Ordering::Relaxed)),
+            "tool_call_id":call.id, "tool":call.name, "arguments":call.args,
+            "choices":["allow","deny","always"]
+        });
+        let write_request = |out: &mut dyn std::io::Write| -> std::io::Result<()> {
+            writeln!(out, "{request}")?;
+            out.flush()
+        };
+        let mut output = self
+            .output
+            .lock()
+            .map_err(|_| std::io::Error::other("approval output lock poisoned"))?;
+        if let Some(output) = output.as_mut() {
+            write_request(output.as_mut())
+        } else {
+            write_request(&mut std::io::stdout().lock())
         }
     }
 
@@ -295,6 +341,20 @@ impl Approver for InteractiveApprover {
             return Decision::Allow;
         }
 
+        // Serialize the entire request/response exchange, not just the read.
+        let Ok(_interaction) = self.interaction.lock() else {
+            return Decision::Deny("approval channel unavailable".into());
+        };
+        if self
+            .whitelisted
+            .lock()
+            .is_ok_and(|entries| entries.contains(&call.name))
+        {
+            return Decision::Allow;
+        }
+        if self.json_mode && self.emit_request(call).is_err() {
+            return Decision::Deny("approval request could not be delivered to the parent".into());
+        }
         if !self.json_mode {
             eprint!(
                 "[keel] Approve tool call `{}` ({})? [y/N]: ",
@@ -1520,6 +1580,33 @@ mod tests {
         assert!(state.failed_attempts[0].failure_reason.contains("exit 1"));
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn json_approval_fails_closed_when_parent_output_is_unavailable() {
+        struct BrokenOutput;
+        impl std::io::Write for BrokenOutput {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("closed"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let approver = InteractiveApprover::with_io(
+            ApprovalPolicy::Standard,
+            true,
+            Box::new(std::io::Cursor::new(b"allow\n")),
+            Box::new(BrokenOutput),
+        );
+        let call = ToolCall {
+            id: "test".into(),
+            name: "shell".into(),
+            args: serde_json::json!({"command":"true"}),
+        };
+        assert!(
+            matches!(approver.decide(&call,true),Decision::Deny(reason) if reason.contains("could not be delivered"))
+        );
     }
 
     #[test]

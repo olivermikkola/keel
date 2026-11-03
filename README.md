@@ -63,3 +63,20 @@ or oversized session logs fail explicitly; Keel does not silently start fresh or
 use a truncated prefix. In `--json` mode, this returns a `done` event with
 `status: "error"` and exits unsuccessfully. The source log is left unchanged.
 Use a valid log, or omit `--resume` to deliberately start a new conversation.
+
+## JSON approval requests
+
+One-shot `keel run --json` advertises `approval_protocol: "stdio-line-v1"` in a
+`capabilities` event. A `tool_call` event is progress, not a permission request.
+When the active policy actually needs a decision, Keel emits and flushes:
+
+```json
+{"type":"approval_request","protocol":"stdio-line-v1","id":"approval-123-1","tool_call_id":"call-1","tool":"shell","arguments":{"command":"cargo test"},"choices":["allow","deny","always"]}
+```
+
+The parent responds with one line on stdin: `allow`, `deny`, or `always` (existing
+`y`, `n`, and `a` responses remain supported). Exchanges are serialized; the
+command waits for the decision. EOF or a failed request write denies the call.
+Reads, policy-authorized calls, read-only rejections, and previously authorized
+calls do not emit an approval request. Parents should scope every response to
+its current subprocess/run and never infer a request from ordinary tool progress.

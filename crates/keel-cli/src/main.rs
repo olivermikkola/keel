@@ -155,6 +155,7 @@ impl Plugin for JsonPrinter {
                 "{}",
                 serde_json::json!({
                     "type": "tool_call",
+                    "id": ts.0.id,
                     "name": ts.0.name,
                     "arguments": ts.0.args,
                 })
@@ -2064,6 +2065,13 @@ fn main() -> anyhow::Result<()> {
     let ctx = Context::new();
     if json_mode {
         ctx.mount(&JsonPrinter);
+        if !dump_config {
+            println!(
+                "{}",
+                json!({"type":"capabilities","approval_protocol":"stdio-line-v1"})
+            );
+            let _ = std::io::stdout().flush();
+        }
     } else {
         ctx.mount(&Printer);
         ctx.mount(&TurnSummaryPrinter);
