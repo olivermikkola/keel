@@ -573,9 +573,83 @@ fn cli_memory(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result
                 println!("Epistemic memory cleared.");
             }
         }
+        "graph" => {
+            let mermaid_mode = take_flag(&mut args, "--mermaid");
+            if json_mode {
+                let state = store.get();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "nodes": state.nodes,
+                        "edges": state.edges,
+                        "mermaid": store.render_mermaid()
+                    }))?
+                );
+            } else if mermaid_mode {
+                println!("{}", store.render_mermaid());
+            } else {
+                let state = store.get();
+                println!(
+                    "Epistemic Graph ({} nodes, {} edges):",
+                    state.nodes.len(),
+                    state.edges.len()
+                );
+                for n in &state.nodes {
+                    println!(
+                        "  [{}] ({}) {} (confidence: {}%)",
+                        n.id,
+                        n.category.as_str(),
+                        n.statement,
+                        n.confidence
+                    );
+                }
+                for e in &state.edges {
+                    println!("  {} --[{}]--> {}", e.from, e.relation.as_str(), e.to);
+                }
+            }
+        }
+        "link" => {
+            if args.len() < 4 {
+                eprintln!("usage: keel memory link <from> <to> <relation> [--json]");
+                std::process::exit(2);
+            }
+            let from = &args[1];
+            let to = &args[2];
+            let rel_str = &args[3];
+            let rel = keel_agent::RelationType::from_str_lossy(rel_str);
+            let from_id =
+                store.add_fact_node(from, keel_agent::FactCategory::ToolObservation, 80, None)?;
+            let to_id =
+                store.add_fact_node(to, keel_agent::FactCategory::ToolObservation, 80, None)?;
+            store.add_edge(&from_id, &to_id, rel)?;
+            if json_mode {
+                println!(
+                    "{}",
+                    serde_json::json!({ "status": "ok", "from": from_id, "to": to_id, "relation": rel.as_str() })
+                );
+            } else {
+                println!(
+                    "Linked `{from_id}` -> `{to_id}` with relationship `{}`.",
+                    rel.as_str()
+                );
+            }
+        }
+        "check" => {
+            let alerts = store.detect_contradictions();
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&alerts)?);
+            } else if alerts.is_empty() {
+                println!("✅ Zero contradictions detected in epistemic knowledge graph.");
+            } else {
+                println!("⚠️ Detected {} contradiction(s):", alerts.len());
+                for a in alerts {
+                    println!("  - {}", a.reason);
+                }
+            }
+        }
         other => {
             eprintln!(
-                "unknown memory subcommand `{other}`. Available: show, add-fact, set-hypothesis, record-failure, clear"
+                "unknown memory subcommand `{other}`. Available: show, add-fact, set-hypothesis, record-failure, graph, link, check, clear"
             );
             std::process::exit(2);
         }

@@ -32,6 +32,10 @@ pub mod tools;
 pub mod tree;
 pub mod vfs;
 
+pub use epistemic::{
+    ContradictionAlert, EpistemicGraphLinkTool, EpistemicMemoryPlugin, EpistemicState,
+    EpistemicStore, FactCategory, FactNode, GraphEdge, RelationType,
+};
 pub use oracle::{
     parse_test_output, DiagnosticOracle, OraclePlugin, RegressionDelta, SentinelMode, TestFailure,
     TestSnapshot,
