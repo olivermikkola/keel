@@ -15,7 +15,10 @@ use keel_agent::Chunk;
 use keel_agent::{
     cascade::CascadeProvider,
     checkpoint::{CheckpointManager, CheckpointPlugin},
-    compaction::{ToolResultPrunerPlugin, WorkspaceContextPlugin, WorkspaceInstructions},
+    compaction::{
+        AdaptiveCompactor, AdaptiveCompactorPlugin, ContextBudget, ToolResultPrunerPlugin,
+        WorkspaceContextPlugin, WorkspaceInstructions,
+    },
     daemon::DaemonConfig,
     epistemic::{EpistemicMemoryPlugin, EpistemicStore},
     guard::{EnvironmentCircuitBreakerPlugin, RepeatToolReminderPlugin},
@@ -1528,6 +1531,13 @@ fn main() -> anyhow::Result<()> {
             .map(std::path::PathBuf::from)
             .collect();
     let no_toolchains = take_flag(&mut args, "--no-toolchains");
+    let max_context_tokens: Option<usize> = take_opt(&mut args, "--max-context-tokens")
+        .or_else(|| std::env::var("KEEL_MAX_CONTEXT_TOKENS").ok())
+        .and_then(|s| s.parse().ok());
+    let keep_recent_turns: usize = take_opt(&mut args, "--compaction-keep-turns")
+        .or_else(|| std::env::var("KEEL_COMPACTION_KEEP_TURNS").ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
     let dump_config = take_flag(&mut args, "--dump-config");
     let json_mode = take_flag(&mut args, "--json");
     let auto_rollback = take_flag(&mut args, "--auto-rollback");
@@ -1661,6 +1671,8 @@ fn main() -> anyhow::Result<()> {
             sandbox_allow_read,
             sandbox_allow_write,
             discover_toolchains: !no_toolchains,
+            max_context_tokens,
+            keep_recent_turns: Some(keep_recent_turns),
         };
         if let Some(addr) = listen_opt {
             return keel_agent::daemon::serve_acp_tcp(&addr, cfg, llm, auth_token_opt);
@@ -1757,6 +1769,20 @@ fn main() -> anyhow::Result<()> {
     let _p_guard = ctx.mount(&RepeatToolReminderPlugin::default());
     let _p_breaker = ctx.mount(&EnvironmentCircuitBreakerPlugin::default());
     let _p_pruner = ctx.mount(&ToolResultPrunerPlugin::default());
+    let budget = match max_context_tokens {
+        Some(max_tok) => ContextBudget::builder()
+            .max_context_tokens(max_tok)
+            .compaction_threshold_tokens(((max_tok as f32) * 0.75) as usize)
+            .target_tokens(((max_tok as f32) * 0.50) as usize)
+            .keep_recent_turns(keep_recent_turns)
+            .build(),
+        None => ContextBudget::builder()
+            .keep_recent_turns(keep_recent_turns)
+            .build(),
+    };
+    let _p_compactor = ctx.mount(&AdaptiveCompactorPlugin::new(
+        AdaptiveCompactor::with_default_summarizer(budget),
+    ));
     let _p_ws = ctx.mount(&WorkspaceContextPlugin { root: root.clone() });
     let _p_plan = ctx.mount(&PlanPlugin {
         root: root.clone(),

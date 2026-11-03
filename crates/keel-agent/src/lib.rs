@@ -34,6 +34,11 @@ pub mod tools;
 pub mod tree;
 pub mod vfs;
 
+pub use compaction::{
+    AdaptiveCompactor, AdaptiveCompactorPlugin, CompactionEvent, CompactionReport, ContextBudget,
+    ContextBudgetBuilder, DeterministicSummarizer, HistorySummarizer, ToolResultPruner,
+    ToolResultPrunerPlugin, WorkspaceContextPlugin, WorkspaceInstructions,
+};
 pub use epistemic::{
     ContradictionAlert, EpistemicGraphLinkTool, EpistemicMemoryPlugin, EpistemicState,
     EpistemicStore, FactCategory, FactNode, GraphEdge, RelationType,
@@ -650,6 +655,14 @@ impl Agent<'_> {
                 anyhow::bail!("turn cancelled by client");
             }
             self.ctx.emit(&StepStart(step));
+            if let Some(compactor) = self.ctx.service::<compaction::AdaptiveCompactor>() {
+                if let Some(report) = compactor.compact_history(history) {
+                    self.ctx.emit(&compaction::CompactionEvent(report.clone()));
+                    let _ = self
+                        .log
+                        .append("compaction", serde_json::to_value(&report)?);
+                }
+            }
             if let Some(pruner) = self.ctx.service::<compaction::ToolResultPruner>() {
                 pruner.prune_history(history);
             }
@@ -1332,6 +1345,82 @@ mod tests {
         assert!(
             tool_msg.contains("[diagnostics: 1 issue(s) detected in `config.json`]"),
             "expected post-edit diagnostics in tool result, got: {tool_msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn adaptive_compactor_compacts_history_during_agent_run() {
+        let tmp =
+            std::env::temp_dir().join(format!("keel-compact-agent-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let ctx = Context::new();
+        let _p_tools = ctx.mount(&tools::BuiltinToolsPlugin {
+            root: tmp.clone(),
+            landlock_enabled: false,
+        });
+
+        // Context budget configured with low threshold so intermediate tool turns trigger compaction
+        let budget = ContextBudget {
+            max_context_tokens: 500,
+            compaction_threshold_tokens: 150,
+            target_tokens: 80,
+            keep_recent_turns: 1,
+            chars_per_token: 4.0,
+        };
+        let _p_compactor = ctx.mount(&AdaptiveCompactorPlugin::new(
+            AdaptiveCompactor::with_default_summarizer(budget),
+        ));
+
+        let llm = Script(Mutex::new(vec![
+            // Step 0: generates large tool output
+            asst(
+                "Searching codebase",
+                vec![ToolCall {
+                    id: "s1".into(),
+                    name: "write_file".into(),
+                    args: serde_json::json!({
+                        "path": "step1.txt",
+                        "content": "A".repeat(400)
+                    }),
+                }],
+            ),
+            // Step 1: generates another tool output (now crossing compaction threshold)
+            asst(
+                "Inspecting step1",
+                vec![ToolCall {
+                    id: "s2".into(),
+                    name: "read_file".into(),
+                    args: serde_json::json!({
+                        "path": "step1.txt"
+                    }),
+                }],
+            ),
+            // Step 2: final answer
+            asst("All tasks completed.", vec![]),
+        ]));
+
+        let _p_llm = ctx.mount(&LlmPlugin(Arc::new(llm)));
+        let _p_app = ctx.mount(&ApproverPlugin(Arc::new(AllowAll)));
+        let _p_log = ctx.mount(&SessionLogPlugin(SessionLog::none()));
+
+        let mut h = vec![];
+        let ans = Agent::run_from_context(&ctx, &mut h, "Execute multistep workflow", 5).unwrap();
+        assert_eq!(ans, "All tasks completed.");
+
+        // Verify history contains the compacted summary message
+        let summary_found = h.iter().any(|m| match m {
+            Message::User { text } => {
+                text.contains("Context Virtualization: Compacted History Summary")
+            }
+            _ => false,
+        });
+        assert!(
+            summary_found,
+            "Expected history to contain compacted summary"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
