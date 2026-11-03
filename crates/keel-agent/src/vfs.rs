@@ -104,12 +104,21 @@ impl TransactionalVfs {
 
     fn normalize_rel(&self, full_or_rel: &Path) -> Result<(PathBuf, String)> {
         if full_or_rel.is_absolute() {
-            let rel = full_or_rel
-                .strip_prefix(&self.root)
-                .unwrap_or(full_or_rel)
+            let canon_root = self
+                .root
+                .canonicalize()
+                .unwrap_or_else(|_| self.root.clone());
+            let canon_full = full_or_rel
+                .canonicalize()
+                .unwrap_or_else(|_| full_or_rel.to_path_buf());
+            if !canon_full.starts_with(&canon_root) {
+                anyhow::bail!("absolute path escapes workspace: {}", full_or_rel.display());
+            }
+            let rel = canon_full
+                .strip_prefix(&canon_root)?
                 .to_string_lossy()
                 .to_string();
-            Ok((full_or_rel.to_path_buf(), rel))
+            Ok((canon_full, rel))
         } else {
             let rel_str = full_or_rel.to_string_lossy();
             let clean = rel_str.trim_start_matches("./");
@@ -147,6 +156,11 @@ impl TransactionalVfs {
                     };
                 }
             }
+        }
+        let meta = std::fs::symlink_metadata(&full)
+            .with_context(|| format!("checking metadata for {}", full.display()))?;
+        if !meta.file_type().is_file() {
+            anyhow::bail!("{} is not a regular file", full.display());
         }
         std::fs::read_to_string(&full).with_context(|| format!("reading {}", full.display()))
     }
@@ -690,6 +704,32 @@ mod tests {
             std::fs::read_to_string(tmp.join("new_mod.py")).unwrap(),
             "y = 99\n"
         );
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn vfs_rejects_out_of_workspace_absolute_paths() {
+        let tmp = std::env::temp_dir().join(format!("keel-vfs-sec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let vfs = TransactionalVfs::new(tmp.clone(), VfsMode::MaterializedCow, false);
+
+        // Absolute path outside workspace must be rejected
+        let res_read = vfs.read_to_string(Path::new("/etc/passwd"));
+        assert!(res_read.is_err());
+        assert!(res_read
+            .unwrap_err()
+            .to_string()
+            .contains("escapes workspace"));
+
+        let res_write = vfs.write_string(Path::new("/etc/passwd"), "bad");
+        assert!(res_write.is_err());
+        assert!(res_write
+            .unwrap_err()
+            .to_string()
+            .contains("escapes workspace"));
 
         let _ = std::fs::remove_dir_all(tmp);
     }

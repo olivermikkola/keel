@@ -42,11 +42,20 @@ pub struct McpToolDef {
     pub input_schema: Value,
 }
 
+const MAX_MCP_LINE_BYTES: usize = 16 * 1024 * 1024; // 16 MB max JSON-RPC line
+
 struct McpProcess {
     _child: Child,
     stdin: ChildStdin,
     reader: BufReader<ChildStdout>,
     next_id: u64,
+}
+
+impl Drop for McpProcess {
+    fn drop(&mut self) {
+        let _ = self._child.kill();
+        let _ = self._child.wait();
+    }
 }
 
 impl McpProcess {
@@ -69,8 +78,17 @@ impl McpProcess {
 
         loop {
             let mut res_line = String::new();
-            if self.reader.read_line(&mut res_line)? == 0 {
+            use std::io::Read;
+            let n = self
+                .reader
+                .by_ref()
+                .take((MAX_MCP_LINE_BYTES + 1) as u64)
+                .read_line(&mut res_line)?;
+            if n == 0 {
                 bail!("MCP server terminated stream unexpectedly while awaiting `{method}`");
+            }
+            if res_line.len() > MAX_MCP_LINE_BYTES {
+                bail!("MCP server response line exceeds maximum allowable size (16MB)");
             }
             let trimmed = res_line.trim();
             if trimmed.is_empty() {
