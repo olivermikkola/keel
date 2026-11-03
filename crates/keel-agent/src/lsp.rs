@@ -162,16 +162,16 @@ impl LspClient {
                         let mut items = Vec::new();
                         if let Some(arr) = params.get("diagnostics").and_then(|d| d.as_array()) {
                             for d in arr {
-                                let line = d
-                                    .pointer("/range/start/line")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0) as usize
-                                    + 1;
-                                let col = d
-                                    .pointer("/range/start/character")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0) as usize
-                                    + 1;
+                                let line =
+                                    d.pointer("/range/start/line")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0) as usize
+                                        + 1;
+                                let col =
+                                    d.pointer("/range/start/character")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0) as usize
+                                        + 1;
                                 let sev = match d.get("severity").and_then(|v| v.as_u64()) {
                                     Some(1) => "error",
                                     Some(2) => "warning",
@@ -256,7 +256,10 @@ impl LspClient {
                 return Ok(resp.get("result").cloned().unwrap_or(Value::Null));
             }
             if guard.closed {
-                bail!("LSP `{}` connection closed while awaiting `{method}`", self.name);
+                bail!(
+                    "LSP `{}` connection closed while awaiting `{method}`",
+                    self.name
+                );
             }
             let now = std::time::Instant::now();
             if now >= deadline {
@@ -674,16 +677,12 @@ fn run_fast_syntax_check(
                                     .and_then(|f| f.as_str())
                                     .unwrap_or(rel_path)
                                     .to_string();
-                                let line_num = sp
-                                    .get("line_start")
-                                    .and_then(|l| l.as_u64())
-                                    .unwrap_or(1)
-                                    as usize;
-                                let col_num = sp
-                                    .get("column_start")
-                                    .and_then(|c| c.as_u64())
-                                    .unwrap_or(1)
-                                    as usize;
+                                let line_num =
+                                    sp.get("line_start").and_then(|l| l.as_u64()).unwrap_or(1)
+                                        as usize;
+                                let col_num =
+                                    sp.get("column_start").and_then(|c| c.as_u64()).unwrap_or(1)
+                                        as usize;
                                 items.push(DiagnosticItem {
                                     file: file_name,
                                     line: line_num,

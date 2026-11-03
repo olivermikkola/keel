@@ -1,22 +1,27 @@
 //! Agent Client Protocol (ACP) Bidirectional JSON-RPC 2.0 Daemon (`keel daemon`).
 //!
-//! Turns `keel` into a long-lived, multiplexed JSON-RPC 2.0 server over `stdio`
-//! (or any `BufRead` + `Write` stream pair) for IDE extensions, Zed/Neovim clients,
-//! and orchestrators like Helm.
+//! Turns `keel` into a long-lived, multiplexed JSON-RPC 2.0 server over `stdio`,
+//! persistent Unix domain socket (`--socket <path>`), or TCP (`--listen <addr>`)
+//! for IDE extensions, Zed/Neovim clients, and orchestrators like Helm.
 //!
 //! Supported JSON-RPC 2.0 methods:
-//! - `initialize`: capability negotiation
+//! - `initialize`: capability negotiation & optional bearer token authentication
+//! - `ping`: keepalive health probe
 //! - `session/new` / `session/load`: initialize or resume conversation history
+//! - `session/list`: enumerate active multiplexed sessions and statuses
+//! - `session/close`: terminate and unload a session
 //! - `session/prompt`: run an agent turn asynchronously while streaming `session/update`
 //!   notifications (`text`, `reasoning`, `tool_call`, `tool_result`, `tool_denied`)
 //! - `session/cancel`: cooperatively cancel an in-flight turn via [`CancelToken`]
 //! - `approval/respond`: resolve an in-flight HITL `approval/request`
 //! - `vfs/status`, `vfs/diff`, `vfs/commit`, `vfs/rollback`: transactional VFS control
 //! - `checkpoint/list`, `checkpoint/save`, `checkpoint/restore`: git shadow checkpoints
+//! - `memory/show`, `memory/add_fact`, `memory/set_hypothesis`, `memory/record_failure`, `memory/clear`: epistemic memory
+//! - `shutdown`: gracefully terminate daemon process
 
 use crate::checkpoint::{CheckpointManager, CheckpointPlugin};
 use crate::compaction::{ToolResultPrunerPlugin, WorkspaceContextPlugin, WorkspaceInstructions};
-use crate::epistemic::EpistemicMemoryPlugin;
+use crate::epistemic::{EpistemicMemoryPlugin, EpistemicStore};
 use crate::guard::RepeatToolReminderPlugin;
 use crate::lsp::LspPlugin;
 use crate::plan::PlanPlugin;
@@ -30,15 +35,17 @@ use crate::{
     Decision, Llm, LlmPlugin, Message, SessionLog, SessionLogPlugin, ToolCall, ToolDenied,
     ToolResult, ToolStart,
 };
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use keel_kernel::{Context, Plugin, Scope};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+#[derive(Clone)]
 pub struct DaemonConfig {
     pub root: PathBuf,
     pub policy: ApprovalPolicy,
@@ -50,13 +57,23 @@ pub struct DaemonConfig {
 /// Thread-safe JSON-RPC 2.0 writer that emits newline-delimited JSON messages.
 pub struct RpcWriter {
     inner: Mutex<Box<dyn Write + Send>>,
+    closed: AtomicBool,
 }
 
 impl RpcWriter {
     pub fn new(w: Box<dyn Write + Send>) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(w),
+            closed: AtomicBool::new(false),
         })
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Relaxed)
+    }
+
+    pub fn mark_closed(&self) {
+        self.closed.store(true, Ordering::Relaxed);
     }
 
     pub fn send_response(&self, id: Value, result: Value) {
@@ -90,9 +107,46 @@ impl RpcWriter {
     }
 
     fn write_raw(&self, val: &Value) {
+        if self.is_closed() {
+            return;
+        }
         if let Ok(mut guard) = self.inner.lock() {
-            let _ = writeln!(guard, "{val}");
-            let _ = guard.flush();
+            if writeln!(guard, "{val}").is_err() || guard.flush().is_err() {
+                self.closed.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Multiplexed broadcaster capable of sending JSON-RPC notifications to all connected clients.
+#[derive(Clone, Default)]
+pub struct RpcBroadcaster {
+    clients: Arc<Mutex<Vec<Arc<RpcWriter>>>>,
+}
+
+impl RpcBroadcaster {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(&self, writer: Arc<RpcWriter>) {
+        if let Ok(mut g) = self.clients.lock() {
+            g.push(writer);
+        }
+    }
+
+    pub fn unregister(&self, writer: &Arc<RpcWriter>) {
+        if let Ok(mut g) = self.clients.lock() {
+            g.retain(|w| !Arc::ptr_eq(w, writer));
+        }
+    }
+
+    pub fn send_notification(&self, method: &str, params: Value) {
+        if let Ok(mut g) = self.clients.lock() {
+            g.retain(|w| !w.is_closed());
+            for w in g.iter() {
+                w.send_notification(method, params.clone());
+            }
         }
     }
 }
@@ -101,27 +155,31 @@ impl RpcWriter {
 struct ApprovalHubState {
     decisions: HashMap<String, String>,
     whitelisted: HashSet<String>,
+    pending: HashSet<String>,
 }
 
 /// RPC-backed HITL approver that emits `approval/request` notifications and awaits
-/// `approval/respond` (or `session/cancel`) from the connected client.
+/// `approval/respond` (or `session/cancel`) from connected clients.
 pub struct AcpApprover {
     policy: ApprovalPolicy,
-    writer: Arc<RpcWriter>,
+    broadcaster: RpcBroadcaster,
     cancel_token: CancelToken,
+    session_id: String,
     state: Arc<(Mutex<ApprovalHubState>, Condvar)>,
 }
 
 impl AcpApprover {
     pub fn new(
         policy: ApprovalPolicy,
-        writer: Arc<RpcWriter>,
+        broadcaster: RpcBroadcaster,
         cancel_token: CancelToken,
+        session_id: String,
     ) -> Arc<Self> {
         Arc::new(Self {
             policy,
-            writer,
+            broadcaster,
             cancel_token,
+            session_id,
             state: Arc::new((Mutex::new(ApprovalHubState::default()), Condvar::new())),
         })
     }
@@ -133,6 +191,15 @@ impl AcpApprover {
                 .decisions
                 .insert(call_id.to_string(), decision.to_ascii_lowercase());
             cvar.notify_all();
+        }
+    }
+
+    pub fn is_pending(&self, call_id: &str) -> bool {
+        let (lock, _) = &*self.state;
+        if let Ok(guard) = lock.lock() {
+            guard.pending.contains(call_id)
+        } else {
+            false
         }
     }
 
@@ -180,9 +247,14 @@ impl Approver for AcpApprover {
             return Decision::Allow;
         }
 
-        self.writer.send_notification(
+        if let Ok(mut guard) = lock.lock() {
+            guard.pending.insert(call.id.clone());
+        }
+
+        self.broadcaster.send_notification(
             "approval/request",
             json!({
+                "session_id": self.session_id,
                 "call_id": call.id,
                 "tool": call.name,
                 "arguments": call.args,
@@ -195,9 +267,11 @@ impl Approver for AcpApprover {
         let deadline = std::time::Instant::now() + Duration::from_secs(300);
         loop {
             if self.cancel_token.is_cancelled() {
+                guard.pending.remove(&call.id);
                 return Decision::Deny("turn cancelled while awaiting approval".into());
             }
             if let Some(dec) = guard.decisions.remove(&call.id) {
+                guard.pending.remove(&call.id);
                 return match dec.as_str() {
                     "allow" | "allow_once" | "y" | "yes" => Decision::Allow,
                     "allow_always" | "always" | "a" => {
@@ -209,6 +283,7 @@ impl Approver for AcpApprover {
             }
             let now = std::time::Instant::now();
             if now >= deadline {
+                guard.pending.remove(&call.id);
                 return Decision::Deny(format!("`{}` approval timed out", call.name));
             }
             let Ok((g, _)) = cvar.wait_timeout(guard, Duration::from_millis(100)) else {
@@ -220,8 +295,8 @@ impl Approver for AcpApprover {
 }
 
 struct AcpEventStreamer {
-    writer: Arc<RpcWriter>,
-    session_id: Arc<Mutex<String>>,
+    broadcaster: RpcBroadcaster,
+    session_id: String,
 }
 
 impl Plugin for AcpEventStreamer {
@@ -230,42 +305,38 @@ impl Plugin for AcpEventStreamer {
     }
 
     fn apply(&self, scope: &mut Scope) {
-        let w1 = self.writer.clone();
-        let s1 = self.session_id.clone();
-        scope.on::<Chunk, _>(move |c| {
-            let sid = s1.lock().ok().map(|g| g.clone()).unwrap_or_default();
-            match c {
-                Chunk::Text(t) => {
-                    w1.send_notification(
-                        "session/update",
-                        json!({
-                            "session_id": sid,
-                            "type": "text",
-                            "content": t,
-                        }),
-                    );
-                }
-                Chunk::Reasoning(t) => {
-                    w1.send_notification(
-                        "session/update",
-                        json!({
-                            "session_id": sid,
-                            "type": "reasoning",
-                            "content": t,
-                        }),
-                    );
-                }
+        let b1 = self.broadcaster.clone();
+        let sid1 = self.session_id.clone();
+        scope.on::<Chunk, _>(move |c| match c {
+            Chunk::Text(t) => {
+                b1.send_notification(
+                    "session/update",
+                    json!({
+                        "session_id": sid1,
+                        "type": "text",
+                        "content": t,
+                    }),
+                );
+            }
+            Chunk::Reasoning(t) => {
+                b1.send_notification(
+                    "session/update",
+                    json!({
+                        "session_id": sid1,
+                        "type": "reasoning",
+                        "content": t,
+                    }),
+                );
             }
         });
 
-        let w2 = self.writer.clone();
-        let s2 = self.session_id.clone();
+        let b2 = self.broadcaster.clone();
+        let sid2 = self.session_id.clone();
         scope.on::<ToolStart, _>(move |ts| {
-            let sid = s2.lock().ok().map(|g| g.clone()).unwrap_or_default();
-            w2.send_notification(
+            b2.send_notification(
                 "session/update",
                 json!({
-                    "session_id": sid,
+                    "session_id": sid2,
                     "type": "tool_call",
                     "id": ts.0.id,
                     "name": ts.0.name,
@@ -274,14 +345,13 @@ impl Plugin for AcpEventStreamer {
             );
         });
 
-        let w3 = self.writer.clone();
-        let s3 = self.session_id.clone();
+        let b3 = self.broadcaster.clone();
+        let sid3 = self.session_id.clone();
         scope.on::<ToolResult, _>(move |tr| {
-            let sid = s3.lock().ok().map(|g| g.clone()).unwrap_or_default();
-            w3.send_notification(
+            b3.send_notification(
                 "session/update",
                 json!({
-                    "session_id": sid,
+                    "session_id": sid3,
                     "type": "tool_result",
                     "id": tr.0,
                     "output": tr.1,
@@ -289,14 +359,13 @@ impl Plugin for AcpEventStreamer {
             );
         });
 
-        let w4 = self.writer.clone();
-        let s4 = self.session_id.clone();
+        let b4 = self.broadcaster.clone();
+        let sid4 = self.session_id.clone();
         scope.on::<ToolDenied, _>(move |td| {
-            let sid = s4.lock().ok().map(|g| g.clone()).unwrap_or_default();
-            w4.send_notification(
+            b4.send_notification(
                 "session/update",
                 json!({
-                    "session_id": sid,
+                    "session_id": sid4,
                     "type": "tool_denied",
                     "id": td.0.id,
                     "name": td.0.name,
@@ -306,70 +375,179 @@ impl Plugin for AcpEventStreamer {
     }
 }
 
-/// Run the bidirectional ACP JSON-RPC 2.0 daemon loop over `reader` and `writer`.
-pub fn serve_acp<R: BufRead>(
-    mut reader: R,
-    writer: Box<dyn Write + Send>,
-    cfg: DaemonConfig,
-    llm: Arc<dyn Llm>,
-) -> Result<()> {
-    let rpc_writer = RpcWriter::new(writer);
-    let cancel_token = CancelToken::new();
-    let approver = AcpApprover::new(cfg.policy, rpc_writer.clone(), cancel_token.clone());
-    let session_id = Arc::new(Mutex::new(format!("acp-{}", std::process::id())));
+/// A managed conversation session inside the ACP daemon.
+pub struct SessionEntry {
+    pub id: String,
+    pub ctx: Arc<Context>,
+    pub history: Arc<Mutex<Vec<Message>>>,
+    pub cancel_token: CancelToken,
+    pub approver: Arc<AcpApprover>,
+    pub busy: Arc<AtomicBool>,
+    pub created_at: u64,
+    pub updated_at: Arc<Mutex<u64>>,
+    pub mounted: Mutex<Vec<keel_kernel::Mounted>>,
+}
 
+/// Thread-safe registry managing multiplexed sessions for the ACP daemon.
+pub struct SessionRegistry {
+    sessions: Mutex<HashMap<String, Arc<SessionEntry>>>,
+}
+
+impl Default for SessionRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SessionRegistry {
+    pub fn new() -> Self {
+        Self {
+            sessions: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn get(&self, id: &str) -> Option<Arc<SessionEntry>> {
+        self.sessions.lock().unwrap().get(id).cloned()
+    }
+
+    pub fn get_or_create(
+        &self,
+        id: &str,
+        cfg: &DaemonConfig,
+        llm: Arc<dyn Llm>,
+        broadcaster: RpcBroadcaster,
+    ) -> Arc<SessionEntry> {
+        let mut g = self.sessions.lock().unwrap();
+        if let Some(entry) = g.get(id) {
+            return entry.clone();
+        }
+        let entry = Arc::new(create_session(id.to_string(), cfg, llm, broadcaster));
+        g.insert(id.to_string(), entry.clone());
+        entry
+    }
+
+    pub fn close(&self, id: &str) -> bool {
+        let mut g = self.sessions.lock().unwrap();
+        if let Some(entry) = g.remove(id) {
+            entry.cancel_token.cancel();
+            entry.approver.notify_cancelled();
+            if let Ok(mut m) = entry.mounted.lock() {
+                while let Some(h) = m.pop() {
+                    h.unload();
+                }
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn list(&self) -> Vec<Value> {
+        let g = self.sessions.lock().unwrap();
+        let mut out = Vec::new();
+        for (id, entry) in g.iter() {
+            let msg_count = entry.history.lock().map(|h| h.len()).unwrap_or(0);
+            let busy = entry.busy.load(Ordering::SeqCst);
+            let updated_at = entry
+                .updated_at
+                .lock()
+                .map(|t| *t)
+                .unwrap_or(entry.created_at);
+            out.push(json!({
+                "session_id": id,
+                "message_count": msg_count,
+                "busy": busy,
+                "created_at": entry.created_at,
+                "updated_at": updated_at,
+            }));
+        }
+        out.sort_by(|a, b| {
+            a["session_id"]
+                .as_str()
+                .unwrap_or("")
+                .cmp(b["session_id"].as_str().unwrap_or(""))
+        });
+        out
+    }
+
+    pub fn find_session_with_pending_approval(&self, call_id: &str) -> Option<Arc<SessionEntry>> {
+        let g = self.sessions.lock().unwrap();
+        for entry in g.values() {
+            if entry.approver.is_pending(call_id) {
+                return Some(entry.clone());
+            }
+        }
+        None
+    }
+}
+
+fn create_session(
+    id: String,
+    cfg: &DaemonConfig,
+    llm: Arc<dyn Llm>,
+    broadcaster: RpcBroadcaster,
+) -> SessionEntry {
+    let cancel_token = CancelToken::new();
+    let approver = AcpApprover::new(
+        cfg.policy,
+        broadcaster.clone(),
+        cancel_token.clone(),
+        id.clone(),
+    );
     let ctx = Arc::new(Context::new());
-    let _p_stream = ctx.mount(&AcpEventStreamer {
-        writer: rpc_writer.clone(),
-        session_id: session_id.clone(),
-    });
-    let _p_llm = ctx.mount(&LlmPlugin(llm));
-    let _p_app = ctx.mount(&ApproverPlugin(approver.clone()));
-    let _p_cancel = ctx.mount(&CancelTokenPlugin(cancel_token.clone()));
-    let _p_log = ctx.mount(&SessionLogPlugin(SessionLog::none()));
-    let _p_ll = ctx.mount(&LandlockPlugin {
-        workspace: cfg.root.clone(),
-        enabled: cfg.landlock_enabled,
-    });
-    let _p_tools = ctx.mount(&BuiltinToolsPlugin {
-        root: cfg.root.clone(),
-        landlock_enabled: cfg.landlock_enabled,
-    });
-    let _p_guard = ctx.mount(&RepeatToolReminderPlugin::default());
-    let _p_pruner = ctx.mount(&ToolResultPrunerPlugin::default());
-    let _p_ws = ctx.mount(&WorkspaceContextPlugin {
-        root: cfg.root.clone(),
-    });
-    let _p_plan = ctx.mount(&PlanPlugin {
-        root: cfg.root.clone(),
-        verify_command: cfg.verify_command.clone(),
-    });
-    let _p_subagent = ctx.mount(&SubagentPlugin {
-        root: cfg.root.clone(),
-        landlock_enabled: cfg.landlock_enabled,
-    });
-    let _p_spec = ctx.mount(&SpeculatePlugin {
-        root: cfg.root.clone(),
-        landlock_enabled: cfg.landlock_enabled,
-    });
-    let _p_ckpt = ctx.mount(&CheckpointPlugin {
-        root: cfg.root.clone(),
-        auto_checkpoint: true,
-        auto_rollback: false,
-    });
-    let _p_epistemic = ctx.mount(&EpistemicMemoryPlugin {
-        root: cfg.root.clone(),
-    });
-    let _p_lsp = ctx.mount(&LspPlugin {
-        root: cfg.root.clone(),
-        extra_servers: HashMap::new(),
-        auto_post_edit_check: cfg.vfs_mode != VfsMode::ShadowMemory,
-    });
-    let _p_vfs = ctx.mount(&VfsPlugin {
-        root: cfg.root.clone(),
-        mode: cfg.vfs_mode,
-        persist: cfg.vfs_mode == VfsMode::MaterializedCow,
-    });
+    let mounted = vec![
+        ctx.mount(&AcpEventStreamer {
+            broadcaster: broadcaster.clone(),
+            session_id: id.clone(),
+        }),
+        ctx.mount(&LlmPlugin(llm)),
+        ctx.mount(&ApproverPlugin(approver.clone())),
+        ctx.mount(&CancelTokenPlugin(cancel_token.clone())),
+        ctx.mount(&SessionLogPlugin(SessionLog::none())),
+        ctx.mount(&LandlockPlugin {
+            workspace: cfg.root.clone(),
+            enabled: cfg.landlock_enabled,
+        }),
+        ctx.mount(&BuiltinToolsPlugin {
+            root: cfg.root.clone(),
+            landlock_enabled: cfg.landlock_enabled,
+        }),
+        ctx.mount(&RepeatToolReminderPlugin::default()),
+        ctx.mount(&ToolResultPrunerPlugin::default()),
+        ctx.mount(&WorkspaceContextPlugin {
+            root: cfg.root.clone(),
+        }),
+        ctx.mount(&PlanPlugin {
+            root: cfg.root.clone(),
+            verify_command: cfg.verify_command.clone(),
+        }),
+        ctx.mount(&SubagentPlugin {
+            root: cfg.root.clone(),
+            landlock_enabled: cfg.landlock_enabled,
+        }),
+        ctx.mount(&SpeculatePlugin {
+            root: cfg.root.clone(),
+            landlock_enabled: cfg.landlock_enabled,
+        }),
+        ctx.mount(&CheckpointPlugin {
+            root: cfg.root.clone(),
+            auto_checkpoint: true,
+            auto_rollback: false,
+        }),
+        ctx.mount(&EpistemicMemoryPlugin {
+            root: cfg.root.clone(),
+        }),
+        ctx.mount(&LspPlugin {
+            root: cfg.root.clone(),
+            extra_servers: HashMap::new(),
+            auto_post_edit_check: cfg.vfs_mode != VfsMode::ShadowMemory,
+        }),
+        ctx.mount(&VfsPlugin {
+            root: cfg.root.clone(),
+            mode: cfg.vfs_mode,
+            persist: cfg.vfs_mode == VfsMode::MaterializedCow,
+        }),
+    ];
 
     let mut sys_text = format!(
         "You are a coding agent working in {}. Use tools to inspect and change files. Be concise.",
@@ -381,15 +559,78 @@ pub fn serve_acp<R: BufRead>(
             sys_text.push_str(&ws.extra_system_prompt);
         }
     }
-    let history = Arc::new(Mutex::new(vec![Message::System {
-        text: sys_text.clone(),
-    }]));
+    let history = Arc::new(Mutex::new(vec![Message::System { text: sys_text }]));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
 
+    SessionEntry {
+        id,
+        ctx,
+        history,
+        cancel_token,
+        approver,
+        busy: Arc::new(AtomicBool::new(false)),
+        created_at: now,
+        updated_at: Arc::new(Mutex::new(now)),
+        mounted: Mutex::new(mounted),
+    }
+}
+
+/// Shared daemon server state and configuration.
+#[derive(Clone)]
+pub struct DaemonServer {
+    pub cfg: DaemonConfig,
+    pub llm: Arc<dyn Llm>,
+    pub auth_token: Option<String>,
+    pub broadcaster: RpcBroadcaster,
+    pub registry: Arc<SessionRegistry>,
+    pub shutdown_signal: Arc<AtomicBool>,
+}
+
+impl DaemonServer {
+    pub fn new(cfg: DaemonConfig, llm: Arc<dyn Llm>, auth_token: Option<String>) -> Self {
+        let broadcaster = RpcBroadcaster::new();
+        let registry = Arc::new(SessionRegistry::new());
+        let shutdown_signal = Arc::new(AtomicBool::new(false));
+        let default_sid = format!("acp-{}", std::process::id());
+        registry.get_or_create(&default_sid, &cfg, llm.clone(), broadcaster.clone());
+
+        Self {
+            cfg,
+            llm,
+            auth_token,
+            broadcaster,
+            registry,
+            shutdown_signal,
+        }
+    }
+}
+
+/// Run ACP JSON-RPC client connection loop over `reader` and `writer`.
+pub fn handle_acp_client<R: BufRead>(
+    mut reader: R,
+    writer: Box<dyn Write + Send>,
+    server: DaemonServer,
+    default_session_id: String,
+) -> Result<()> {
+    let rpc_writer = RpcWriter::new(writer);
+    server.broadcaster.register(rpc_writer.clone());
+
+    let current_session_id = Arc::new(Mutex::new(default_session_id));
+    let mut authenticated = server.auth_token.is_none();
     let mut active_workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
 
     loop {
+        if server.shutdown_signal.load(Ordering::Relaxed) {
+            break;
+        }
         let mut line = String::new();
-        let n = reader.read_line(&mut line)?;
+        let n = match reader.read_line(&mut line) {
+            Ok(n) => n,
+            Err(_) => break,
+        };
         if n == 0 {
             break;
         }
@@ -409,6 +650,40 @@ pub fn serve_acp<R: BufRead>(
         let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
         let params = msg.get("params").cloned().unwrap_or_else(|| json!({}));
 
+        // Authentication enforcement
+        if !authenticated {
+            let provided_token = params
+                .get("token")
+                .or_else(|| params.get("auth_token"))
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    msg.get("auth")
+                        .and_then(|a| a.get("token"))
+                        .and_then(|v| v.as_str())
+                });
+            if let Some(expected) = &server.auth_token {
+                if provided_token == Some(expected.as_str()) {
+                    authenticated = true;
+                } else if method == "initialize" || method == "auth" || method == "authenticate" {
+                    rpc_writer.send_error(
+                        id,
+                        -32001,
+                        "Unauthorized: invalid or missing daemon authentication token",
+                    );
+                    continue;
+                } else {
+                    rpc_writer.send_error(
+                        id,
+                        -32001,
+                        "Unauthorized: please provide valid token via initialize or auth",
+                    );
+                    continue;
+                }
+            } else {
+                authenticated = true;
+            }
+        }
+
         match method {
             "initialize" => {
                 rpc_writer.send_response(
@@ -417,7 +692,7 @@ pub fn serve_acp<R: BufRead>(
                         "protocolVersion": "2026-11-01",
                         "serverInfo": {
                             "name": "keel-acp-daemon",
-                            "version": "0.1.0",
+                            "version": "0.2.0",
                         },
                         "capabilities": {
                             "streaming": true,
@@ -427,24 +702,59 @@ pub fn serve_acp<R: BufRead>(
                             "checkpoints": true,
                             "speculation": true,
                             "epistemicMemory": true,
+                            "persistentDaemon": true,
+                            "sessionMultiplexing": true,
                         }
                     }),
                 );
+            }
+            "ping" => {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                rpc_writer.send_response(id, json!({ "status": "pong", "timestamp": now_ms }));
+            }
+            "auth" | "authenticate" => {
+                rpc_writer.send_response(id, json!({ "status": "authenticated" }));
+            }
+            "session/list" => {
+                rpc_writer.send_response(id, json!({ "sessions": server.registry.list() }));
             }
             "session/new" => {
                 let new_sid = params
                     .get("session_id")
                     .and_then(|v| v.as_str())
                     .map(String::from)
-                    .unwrap_or_else(|| format!("acp-{}", std::process::id()));
-                if let Ok(mut s) = session_id.lock() {
-                    *s = new_sid.clone();
-                }
-                if let Ok(mut h) = history.lock() {
-                    h.clear();
-                    h.push(Message::System {
-                        text: sys_text.clone(),
+                    .unwrap_or_else(|| {
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis())
+                            .unwrap_or(0);
+                        format!("acp-{}-{}", std::process::id(), ts)
                     });
+                let session = server.registry.get_or_create(
+                    &new_sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                let mut sys_text = format!(
+                    "You are a coding agent working in {}. Use tools to inspect and change files. Be concise.",
+                    server.cfg.root.display()
+                );
+                if let Some(ws) = session.ctx.service::<WorkspaceInstructions>() {
+                    if !ws.extra_system_prompt.is_empty() {
+                        sys_text.push_str("\n\n");
+                        sys_text.push_str(&ws.extra_system_prompt);
+                    }
+                }
+                if let Ok(mut h) = session.history.lock() {
+                    h.clear();
+                    h.push(Message::System { text: sys_text });
+                }
+                if let Ok(mut s) = current_session_id.lock() {
+                    *s = new_sid.clone();
                 }
                 rpc_writer.send_response(id, json!({ "session_id": new_sid, "status": "ok" }));
             }
@@ -453,26 +763,68 @@ pub fn serve_acp<R: BufRead>(
                     rpc_writer.send_error(id, -32602, "missing `path` parameter");
                     continue;
                 };
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
                 match SessionLog::read_history(log_path) {
                     Ok(prev) => {
                         let count = prev.len();
-                        if let Ok(mut h) = history.lock() {
+                        if let Ok(mut h) = session.history.lock() {
                             h.truncate(1);
                             h.extend(prev);
                         }
-                        rpc_writer
-                            .send_response(id, json!({ "status": "ok", "loaded_messages": count }));
+                        if let Ok(mut curr) = current_session_id.lock() {
+                            *curr = sid.clone();
+                        }
+                        rpc_writer.send_response(
+                            id,
+                            json!({
+                                "status": "ok",
+                                "session_id": sid,
+                                "loaded_messages": count,
+                            }),
+                        );
                     }
                     Err(e) => {
                         rpc_writer.send_error(id, -32000, &format!("failed to load session: {e:#}"))
                     }
                 }
             }
+            "session/close" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let closed = server.registry.close(&sid);
+                rpc_writer.send_response(
+                    id,
+                    json!({ "status": "closed", "session_id": sid, "found": closed }),
+                );
+            }
             "session/cancel" => {
-                cancel_token.cancel();
-                approver.notify_cancelled();
-                if !id.is_null() {
-                    rpc_writer.send_response(id, json!({ "status": "cancelled" }));
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                if let Some(session) = server.registry.get(&sid) {
+                    session.cancel_token.cancel();
+                    session.approver.notify_cancelled();
+                    if !id.is_null() {
+                        rpc_writer
+                            .send_response(id, json!({ "status": "cancelled", "session_id": sid }));
+                    }
+                } else if !id.is_null() {
+                    rpc_writer.send_error(id, -32602, &format!("Session `{sid}` not found"));
                 }
             }
             "approval/respond" => {
@@ -481,11 +833,36 @@ pub fn serve_acp<R: BufRead>(
                     .get("decision")
                     .and_then(|v| v.as_str())
                     .unwrap_or("deny");
-                approver.resolve(call_id, decision);
-                if !id.is_null() {
-                    rpc_writer.send_response(
+                let session_id_opt = params.get("session_id").and_then(|v| v.as_str());
+
+                let target_session = if let Some(sid) = session_id_opt {
+                    server.registry.get(sid)
+                } else if let Some(s) = server.registry.find_session_with_pending_approval(call_id)
+                {
+                    Some(s)
+                } else {
+                    let curr = current_session_id.lock().unwrap().clone();
+                    server.registry.get(&curr)
+                };
+
+                if let Some(session) = target_session {
+                    session.approver.resolve(call_id, decision);
+                    if !id.is_null() {
+                        rpc_writer.send_response(
+                            id,
+                            json!({
+                                "status": "ok",
+                                "call_id": call_id,
+                                "decision": decision,
+                                "session_id": session.id,
+                            }),
+                        );
+                    }
+                } else if !id.is_null() {
+                    rpc_writer.send_error(
                         id,
-                        json!({ "status": "ok", "call_id": call_id, "decision": decision }),
+                        -32602,
+                        &format!("No session found for approval call `{call_id}`"),
                     );
                 }
             }
@@ -504,28 +881,65 @@ pub fn serve_acp<R: BufRead>(
                     .and_then(|v| v.as_u64())
                     .unwrap_or(40) as usize;
 
-                cancel_token.reset();
-                let ctx_clone = ctx.clone();
-                let hist_clone = history.clone();
-                let writer_clone = rpc_writer.clone();
-                let sid_snapshot = session_id.lock().ok().map(|g| g.clone()).unwrap_or_default();
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
 
-                // Spawn turn execution on a background thread so the daemon reader loop stays
-                // responsive to `session/cancel` and `approval/respond` messages!
+                if session
+                    .busy
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
+                {
+                    rpc_writer.send_error(
+                        id,
+                        -32002,
+                        &format!("Session `{sid}` is already executing an in-flight prompt"),
+                    );
+                    continue;
+                }
+
+                session.cancel_token.reset();
+                let session_clone = session.clone();
+                let writer_clone = rpc_writer.clone();
+                let sid_snapshot = sid.clone();
+
                 let handle = std::thread::spawn(move || {
-                    let mut h_guard = match hist_clone.lock() {
-                        Ok(g) => g,
-                        Err(_) => {
-                            writer_clone.send_error(id, -32000, "session history mutex poisoned");
-                            return;
-                        }
+                    let result = {
+                        let mut h_guard = match session_clone.history.lock() {
+                            Ok(g) => g,
+                            Err(_) => {
+                                session_clone.busy.store(false, Ordering::SeqCst);
+                                writer_clone.send_error(
+                                    id,
+                                    -32000,
+                                    "session history mutex poisoned",
+                                );
+                                return;
+                            }
+                        };
+                        Agent::run_from_context(
+                            &session_clone.ctx,
+                            &mut h_guard,
+                            &prompt_text,
+                            max_steps,
+                        )
                     };
-                    match Agent::run_from_context(
-                        &ctx_clone,
-                        &mut h_guard,
-                        &prompt_text,
-                        max_steps,
-                    ) {
+                    session_clone.busy.store(false, Ordering::SeqCst);
+                    if let Ok(mut u) = session_clone.updated_at.lock() {
+                        *u = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                    }
+                    match result {
                         Ok(answer) => {
                             writer_clone.send_response(
                                 id,
@@ -544,21 +958,55 @@ pub fn serve_acp<R: BufRead>(
                 active_workers.push(handle);
             }
             "vfs/status" => {
-                if let Some(vfs) = ctx.service::<Arc<TransactionalVfs>>() {
-                    rpc_writer.send_response(id, json!({ "files": vfs.status() }));
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                if let Some(vfs) = session.ctx.service::<Arc<TransactionalVfs>>() {
+                    rpc_writer
+                        .send_response(id, json!({ "session_id": sid, "files": vfs.status() }));
                 } else {
                     rpc_writer.send_error(id, -32000, "VFS service not mounted");
                 }
             }
             "vfs/diff" => {
-                if let Some(vfs) = ctx.service::<Arc<TransactionalVfs>>() {
-                    rpc_writer.send_response(id, json!({ "diff": vfs.diff() }));
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                if let Some(vfs) = session.ctx.service::<Arc<TransactionalVfs>>() {
+                    rpc_writer.send_response(id, json!({ "session_id": sid, "diff": vfs.diff() }));
                 } else {
                     rpc_writer.send_error(id, -32000, "VFS service not mounted");
                 }
             }
             "vfs/commit" => {
-                if let Some(vfs) = ctx.service::<Arc<TransactionalVfs>>() {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                if let Some(vfs) = session.ctx.service::<Arc<TransactionalVfs>>() {
                     match vfs.commit() {
                         Ok(rep) => rpc_writer.send_response(id, serde_json::to_value(rep)?),
                         Err(e) => rpc_writer.send_error(id, -32000, &format!("{e:#}")),
@@ -568,7 +1016,18 @@ pub fn serve_acp<R: BufRead>(
                 }
             }
             "vfs/rollback" => {
-                if let Some(vfs) = ctx.service::<Arc<TransactionalVfs>>() {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                if let Some(vfs) = session.ctx.service::<Arc<TransactionalVfs>>() {
                     match vfs.rollback() {
                         Ok(rep) => rpc_writer.send_response(id, serde_json::to_value(rep)?),
                         Err(e) => rpc_writer.send_error(id, -32000, &format!("{e:#}")),
@@ -578,9 +1037,21 @@ pub fn serve_acp<R: BufRead>(
                 }
             }
             "checkpoint/list" => {
-                if let Some(mgr) = ctx.service::<CheckpointManager>() {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                if let Some(mgr) = session.ctx.service::<CheckpointManager>() {
                     match mgr.list() {
-                        Ok(list) => rpc_writer.send_response(id, json!({ "checkpoints": list })),
+                        Ok(list) => rpc_writer
+                            .send_response(id, json!({ "session_id": sid, "checkpoints": list })),
                         Err(e) => rpc_writer.send_error(id, -32000, &format!("{e:#}")),
                     }
                 } else {
@@ -588,11 +1059,22 @@ pub fn serve_acp<R: BufRead>(
                 }
             }
             "checkpoint/save" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
                 let desc = params
                     .get("description")
                     .and_then(|v| v.as_str())
                     .unwrap_or("daemon checkpoint");
-                if let Some(mgr) = ctx.service::<CheckpointManager>() {
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                if let Some(mgr) = session.ctx.service::<CheckpointManager>() {
                     match mgr.save(desc) {
                         Ok(ckpt) => rpc_writer.send_response(id, serde_json::to_value(ckpt)?),
                         Err(e) => rpc_writer.send_error(id, -32000, &format!("{e:#}")),
@@ -602,11 +1084,22 @@ pub fn serve_acp<R: BufRead>(
                 }
             }
             "checkpoint/restore" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
                 let target = params
                     .get("id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("latest");
-                if let Some(mgr) = ctx.service::<CheckpointManager>() {
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                if let Some(mgr) = session.ctx.service::<CheckpointManager>() {
                     match mgr.restore(target) {
                         Ok(rep) => rpc_writer.send_response(id, serde_json::to_value(rep)?),
                         Err(e) => rpc_writer.send_error(id, -32000, &format!("{e:#}")),
@@ -615,10 +1108,138 @@ pub fn serve_acp<R: BufRead>(
                     rpc_writer.send_error(id, -32000, "CheckpointManager not mounted");
                 }
             }
+            "memory/show" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                if let Some(store) = session.ctx.service::<EpistemicStore>() {
+                    let mem = store.get();
+                    let md = mem.render_markdown();
+                    rpc_writer.send_response(
+                        id,
+                        json!({
+                            "session_id": sid,
+                            "memory": mem,
+                            "markdown": md,
+                        }),
+                    );
+                } else {
+                    rpc_writer.send_error(id, -32000, "EpistemicStore not mounted");
+                }
+            }
+            "memory/add_fact" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let Some(fact) = params.get("fact").and_then(|v| v.as_str()) else {
+                    rpc_writer.send_error(id, -32602, "missing `fact` string parameter");
+                    continue;
+                };
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                if let Some(store) = session.ctx.service::<EpistemicStore>() {
+                    match store.add_fact(fact) {
+                        Ok(()) => rpc_writer.send_response(id, json!({ "status": "ok" })),
+                        Err(e) => rpc_writer.send_error(id, -32000, &format!("{e:#}")),
+                    }
+                } else {
+                    rpc_writer.send_error(id, -32000, "EpistemicStore not mounted");
+                }
+            }
+            "memory/set_hypothesis" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let hyp = params
+                    .get("hypothesis")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                if let Some(store) = session.ctx.service::<EpistemicStore>() {
+                    match store.set_hypothesis(hyp) {
+                        Ok(()) => rpc_writer.send_response(id, json!({ "status": "ok" })),
+                        Err(e) => rpc_writer.send_error(id, -32000, &format!("{e:#}")),
+                    }
+                } else {
+                    rpc_writer.send_error(id, -32000, "EpistemicStore not mounted");
+                }
+            }
+            "memory/record_failure" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let Some(approach) = params.get("approach").and_then(|v| v.as_str()) else {
+                    rpc_writer.send_error(id, -32602, "missing `approach` parameter");
+                    continue;
+                };
+                let Some(reason) = params.get("reason").and_then(|v| v.as_str()) else {
+                    rpc_writer.send_error(id, -32602, "missing `reason` parameter");
+                    continue;
+                };
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                if let Some(store) = session.ctx.service::<EpistemicStore>() {
+                    match store.record_failure(approach, reason) {
+                        Ok(()) => rpc_writer.send_response(id, json!({ "status": "ok" })),
+                        Err(e) => rpc_writer.send_error(id, -32000, &format!("{e:#}")),
+                    }
+                } else {
+                    rpc_writer.send_error(id, -32000, "EpistemicStore not mounted");
+                }
+            }
+            "memory/clear" => {
+                let sid = params
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| current_session_id.lock().unwrap().clone());
+                let session = server.registry.get_or_create(
+                    &sid,
+                    &server.cfg,
+                    server.llm.clone(),
+                    server.broadcaster.clone(),
+                );
+                if let Some(store) = session.ctx.service::<EpistemicStore>() {
+                    match store.clear() {
+                        Ok(()) => rpc_writer.send_response(id, json!({ "status": "ok" })),
+                        Err(e) => rpc_writer.send_error(id, -32000, &format!("{e:#}")),
+                    }
+                } else {
+                    rpc_writer.send_error(id, -32000, "EpistemicStore not mounted");
+                }
+            }
             "shutdown" | "exit" => {
                 if !id.is_null() {
                     rpc_writer.send_response(id, json!({ "status": "shutting_down" }));
                 }
+                server.shutdown_signal.store(true, Ordering::Relaxed);
                 break;
             }
             other => {
@@ -633,6 +1254,162 @@ pub fn serve_acp<R: BufRead>(
         let _ = h.join();
     }
 
+    server.broadcaster.unregister(&rpc_writer);
+    rpc_writer.mark_closed();
+
+    Ok(())
+}
+
+/// Run bidirectional ACP JSON-RPC 2.0 daemon over `reader` and `writer` (stdio mode).
+pub fn serve_acp<R: BufRead>(
+    reader: R,
+    writer: Box<dyn Write + Send>,
+    cfg: DaemonConfig,
+    llm: Arc<dyn Llm>,
+) -> Result<()> {
+    serve_acp_with_auth(reader, writer, cfg, llm, None)
+}
+
+/// Run bidirectional ACP JSON-RPC 2.0 daemon over `reader` and `writer` with optional bearer authentication.
+pub fn serve_acp_with_auth<R: BufRead>(
+    reader: R,
+    writer: Box<dyn Write + Send>,
+    cfg: DaemonConfig,
+    llm: Arc<dyn Llm>,
+    auth_token: Option<String>,
+) -> Result<()> {
+    let server = DaemonServer::new(cfg, llm, auth_token);
+    let default_sid = format!("acp-{}", std::process::id());
+    handle_acp_client(reader, writer, server, default_sid)
+}
+
+/// Listen on an existing TCP listener and serve multiplexed ACP JSON-RPC 2.0 sessions.
+pub fn serve_acp_listener(
+    listener: std::net::TcpListener,
+    cfg: DaemonConfig,
+    llm: Arc<dyn Llm>,
+    auth_token: Option<String>,
+) -> Result<()> {
+    listener.set_nonblocking(true)?;
+
+    let server = DaemonServer::new(cfg, llm, auth_token);
+    let default_sid = format!("acp-{}", std::process::id());
+
+    if let Ok(addr) = listener.local_addr() {
+        eprintln!("[keel-daemon] ACP JSON-RPC 2.0 server listening on tcp://{addr}");
+    }
+
+    while !server.shutdown_signal.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((stream, _peer_addr)) => {
+                let server_c = server.clone();
+                let def_sid = default_sid.clone();
+
+                std::thread::spawn(move || {
+                    let reader_stream = match stream.try_clone() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[keel-daemon] Failed to clone stream: {e}");
+                            return;
+                        }
+                    };
+                    let reader = std::io::BufReader::new(reader_stream);
+                    let writer = Box::new(stream);
+                    let _ = handle_acp_client(reader, writer, server_c, def_sid);
+                });
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(30));
+            }
+            Err(e) => {
+                eprintln!("[keel-daemon] TCP accept error: {e}");
+                std::thread::sleep(Duration::from_millis(30));
+            }
+        }
+    }
+    eprintln!("[keel-daemon] TCP server shutting down");
+    Ok(())
+}
+
+/// Listen on TCP address and serve multiplexed ACP JSON-RPC 2.0 sessions to connected clients.
+pub fn serve_acp_tcp(
+    addr: &str,
+    cfg: DaemonConfig,
+    llm: Arc<dyn Llm>,
+    auth_token: Option<String>,
+) -> Result<()> {
+    let listener = std::net::TcpListener::bind(addr)
+        .with_context(|| format!("Failed to bind TCP listener on {addr}"))?;
+    serve_acp_listener(listener, cfg, llm, auth_token)
+}
+
+/// Listen on Unix domain socket and serve multiplexed ACP JSON-RPC 2.0 sessions.
+#[cfg(unix)]
+pub fn serve_acp_unix(
+    socket_path: &std::path::Path,
+    cfg: DaemonConfig,
+    llm: Arc<dyn Llm>,
+    auth_token: Option<String>,
+) -> Result<()> {
+    if let Some(parent) = socket_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if socket_path.exists() {
+        if std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
+            anyhow::bail!(
+                "Another keel daemon is already active on socket {}",
+                socket_path.display()
+            );
+        }
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    let listener = std::os::unix::net::UnixListener::bind(socket_path)
+        .with_context(|| format!("Failed to bind Unix socket at {}", socket_path.display()))?;
+    listener.set_nonblocking(true)?;
+
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600));
+
+    let server = DaemonServer::new(cfg, llm, auth_token);
+    let default_sid = format!("acp-{}", std::process::id());
+
+    eprintln!(
+        "[keel-daemon] ACP JSON-RPC 2.0 server listening on unix:{}",
+        socket_path.display()
+    );
+
+    while !server.shutdown_signal.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let server_c = server.clone();
+                let def_sid = default_sid.clone();
+
+                std::thread::spawn(move || {
+                    let reader_stream = match stream.try_clone() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[keel-daemon] Failed to clone unix stream: {e}");
+                            return;
+                        }
+                    };
+                    let reader = std::io::BufReader::new(reader_stream);
+                    let writer = Box::new(stream);
+                    let _ = handle_acp_client(reader, writer, server_c, def_sid);
+                });
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(30));
+            }
+            Err(e) => {
+                eprintln!("[keel-daemon] Unix accept error: {e}");
+                std::thread::sleep(Duration::from_millis(30));
+            }
+        }
+    }
+
+    let _ = std::fs::remove_file(socket_path);
+    eprintln!("[keel-daemon] Unix server shutting down");
     Ok(())
 }
 
@@ -686,10 +1463,11 @@ mod tests {
             }
         }
 
-        // Send initialize -> session/prompt -> wait -> vfs/status -> vfs/rollback -> shutdown
         let requests = [
             json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}).to_string(),
             json!({"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {"prompt": "write hello.txt"}}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "session/list", "params": {}}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 4, "method": "shutdown", "params": {}}).to_string(),
         ]
         .join("\n")
             + "\n";
@@ -719,6 +1497,7 @@ mod tests {
         // Verify initialize response
         assert!(lines.iter().any(|v| v["id"] == 1
             && v["result"]["capabilities"]["streaming"] == true
+            && v["result"]["capabilities"]["sessionMultiplexing"] == true
             && v["result"]["capabilities"]["vfs"] == true));
 
         // Verify streaming tool_call & text notifications were emitted
@@ -731,11 +1510,206 @@ mod tests {
             && v["result"]["status"] == "ok"
             && v["result"]["answer"] == "All done via ACP daemon"));
 
+        // Verify session/list response
+        assert!(lines
+            .iter()
+            .any(|v| v["id"] == 3 && v["result"]["sessions"].as_array().is_some()));
+
         assert_eq!(
             std::fs::read_to_string(tmp.join("hello.txt")).unwrap(),
             "daemon wrote this\n"
         );
 
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn acp_daemon_tcp_multiplex_and_auth() {
+        let tmp = std::env::temp_dir().join(format!("keel-tcp-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let cfg = DaemonConfig {
+            root: tmp.clone(),
+            policy: ApprovalPolicy::Yolo,
+            landlock_enabled: false,
+            vfs_mode: VfsMode::MaterializedCow,
+            verify_command: None,
+        };
+
+        let token = "secret-token-12345".to_string();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        let addr = format!("127.0.0.1:{}", local_addr.port());
+        let token_clone = token.clone();
+
+        let srv_handle = std::thread::spawn(move || {
+            serve_acp_listener(listener, cfg, Arc::new(DaemonTestLlm), Some(token_clone)).unwrap();
+        });
+
+        // Wait for listener to bind
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Connect client 1: try unauthorized request
+        {
+            let mut stream = std::net::TcpStream::connect(&addr).unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+
+            writeln!(
+                stream,
+                "{}",
+                json!({"jsonrpc": "2.0", "id": 1, "method": "session/list", "params": {}})
+            )
+            .unwrap();
+
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let err_val: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(err_val["id"], 1);
+            assert_eq!(err_val["error"]["code"], -32001);
+        }
+
+        // Connect client 2: authorized handshake, session/new, epistemic memory
+        {
+            let mut stream = std::net::TcpStream::connect(&addr).unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+
+            // Initialize with token
+            writeln!(
+                stream,
+                "{}",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": { "token": token }
+                })
+            )
+            .unwrap();
+
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let init_res: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(init_res["id"], 1);
+            assert_eq!(init_res["result"]["serverInfo"]["name"], "keel-acp-daemon");
+
+            // Add fact to epistemic memory
+            writeln!(
+                stream,
+                "{}",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "memory/add_fact",
+                    "params": { "fact": "TCP daemon verified" }
+                })
+            )
+            .unwrap();
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            let mem_res: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(mem_res["id"], 2);
+            assert_eq!(mem_res["result"]["status"], "ok");
+
+            // Inspect memory
+            writeln!(
+                stream,
+                "{}",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "memory/show",
+                    "params": {}
+                })
+            )
+            .unwrap();
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            let show_res: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(show_res["id"], 3);
+            let facts = show_res["result"]["memory"]["facts"].as_array().unwrap();
+            assert!(facts.iter().any(|f| f == "TCP daemon verified"));
+
+            // Graceful shutdown
+            writeln!(
+                stream,
+                "{}",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "shutdown",
+                    "params": {}
+                })
+            )
+            .unwrap();
+        }
+
+        srv_handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acp_daemon_unix_socket_roundtrip() {
+        let tmp = std::env::temp_dir().join(format!("keel-sock-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let sock_path = tmp.join("daemon.sock");
+        let sock_path_clone = sock_path.clone();
+
+        let cfg = DaemonConfig {
+            root: tmp.clone(),
+            policy: ApprovalPolicy::Yolo,
+            landlock_enabled: false,
+            vfs_mode: VfsMode::MaterializedCow,
+            verify_command: None,
+        };
+
+        let srv_handle = std::thread::spawn(move || {
+            serve_acp_unix(&sock_path_clone, cfg, Arc::new(DaemonTestLlm), None).unwrap();
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+
+        {
+            let mut stream = std::os::unix::net::UnixStream::connect(&sock_path).unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+
+            writeln!(
+                stream,
+                "{}",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "ping",
+                    "params": {}
+                })
+            )
+            .unwrap();
+
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let ping_res: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(ping_res["id"], 1);
+            assert_eq!(ping_res["result"]["status"], "pong");
+
+            writeln!(
+                stream,
+                "{}",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "shutdown",
+                    "params": {}
+                })
+            )
+            .unwrap();
+        }
+
+        srv_handle.join().unwrap();
+        assert!(!sock_path.exists());
         let _ = std::fs::remove_dir_all(tmp);
     }
 }
