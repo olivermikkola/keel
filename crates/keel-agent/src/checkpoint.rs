@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static CKPT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointInfo {
@@ -117,7 +120,8 @@ impl CheckpointManager {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
-        let id = format!("ckpt-{}", now.as_millis());
+        let seq = CKPT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = format!("ckpt-{}-{}", now.as_millis(), seq);
         let created_at = format!("{}", now.as_secs());
 
         let dot_git = self.root.join(".git");
