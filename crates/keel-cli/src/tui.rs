@@ -93,6 +93,7 @@ enum PaletteAction {
     ModelPicker,
     ToggleSidebar,
     ToggleDetails,
+    ShowDiff,
     Help,
     Interrupt,
     ClearWake,
@@ -100,12 +101,13 @@ enum PaletteAction {
 }
 
 impl PaletteAction {
-    const ALL: [PaletteAction; 9] = [
+    const ALL: [PaletteAction; 10] = [
         PaletteAction::NewSession,
         PaletteAction::SearchSessions,
         PaletteAction::ModelPicker,
         PaletteAction::ToggleSidebar,
         PaletteAction::ToggleDetails,
+        PaletteAction::ShowDiff,
         PaletteAction::Help,
         PaletteAction::Interrupt,
         PaletteAction::ClearWake,
@@ -119,6 +121,7 @@ impl PaletteAction {
             Self::ModelPicker => "Choose model",
             Self::ToggleSidebar => "Toggle ship status",
             Self::ToggleDetails => "Toggle reasoning/tool detail",
+            Self::ShowDiff => "Show git diff",
             Self::Help => "Keyboard help",
             Self::Interrupt => "Interrupt current turn",
             Self::ClearWake => "Clear the wake view",
@@ -133,6 +136,7 @@ impl PaletteAction {
             Self::ModelPicker => "pick a local or API model",
             Self::ToggleSidebar => "show model, sandbox, usage and diffs",
             Self::ToggleDetails => "expand reasoning and tool output",
+            Self::ShowDiff => "review the workspace git diff",
             Self::Help => "show every key binding",
             Self::Interrupt => "stop the running keel process",
             Self::ClearWake => "hide the current transcript without deleting the log",
@@ -240,6 +244,10 @@ struct App {
     show_sidebar: bool,
     show_details: bool,
     show_help: bool,
+    show_diff: bool,
+    diff_text: String,
+    diff_error: Option<String>,
+    diff_scroll: usize,
     palette: Option<PaletteState>,
     model_picker: Option<ModelPickerState>,
     search_active: bool,
@@ -285,6 +293,10 @@ impl App {
             show_sidebar: true,
             show_details: false,
             show_help: false,
+            show_diff: false,
+            diff_text: String::new(),
+            diff_error: None,
+            diff_scroll: 0,
             palette: None,
             model_picker: None,
             search_active: false,
@@ -667,6 +679,27 @@ impl App {
             self.quit = true;
             return;
         }
+        if self.show_diff {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.show_diff = false,
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.diff_scroll = self.diff_scroll.saturating_add(1);
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.diff_scroll = self.diff_scroll.saturating_sub(1);
+                }
+                KeyCode::PageDown => {
+                    self.diff_scroll = self.diff_scroll.saturating_add(15);
+                }
+                KeyCode::PageUp => {
+                    self.diff_scroll = self.diff_scroll.saturating_sub(15);
+                }
+                KeyCode::Char('g') => self.diff_scroll = 0,
+                KeyCode::Char('G') => self.diff_scroll = usize::MAX / 2,
+                _ => {}
+            }
+            return;
+        }
         if self.show_help {
             if matches!(
                 key.code,
@@ -757,6 +790,7 @@ impl App {
                 }
                 KeyCode::Char('i') => self.focus = Focus::Composer,
                 KeyCode::Char('?') => self.show_help = true,
+                KeyCode::Char('D') => self.open_diff(),
                 KeyCode::Char('m') => self.open_model_picker(),
                 KeyCode::Char(':') => {
                     self.palette = Some(PaletteState {
@@ -786,6 +820,7 @@ impl App {
                 KeyCode::Char('s') => self.focus = Focus::Logbook,
                 KeyCode::Char('v') => self.show_sidebar = !self.show_sidebar,
                 KeyCode::Char('d') => self.show_details = !self.show_details,
+                KeyCode::Char('D') => self.open_diff(),
                 KeyCode::Char('m') => self.open_model_picker(),
                 KeyCode::Char('?') => self.show_help = true,
                 KeyCode::Char(':') => {
@@ -850,6 +885,40 @@ impl App {
             .position(|(id, _, _)| *id == self.model)
             .unwrap_or(0);
         self.model_picker = Some(ModelPickerState { selected });
+    }
+
+    fn open_diff(&mut self) {
+        self.show_diff = true;
+        self.diff_scroll = 0;
+        self.diff_error = None;
+        self.diff_text.clear();
+        let mut command = Command::new("git");
+        command.arg("diff").arg("--no-color");
+        if let Some(stats) = &self.last_stats {
+            if !stats.modified_files.is_empty() {
+                command.arg("--");
+                for file in &stats.modified_files {
+                    command.arg(file);
+                }
+            }
+        }
+        command.current_dir(&self.config.root);
+        match command.output() {
+            Ok(output) if output.status.success() => {
+                let text = String::from_utf8_lossy(&output.stdout).to_string();
+                if text.trim().is_empty() {
+                    self.diff_error = Some("No changes in the workspace.".to_string());
+                } else {
+                    self.diff_text = text;
+                }
+            }
+            Ok(output) => {
+                self.diff_error = Some(String::from_utf8_lossy(&output.stderr).trim().to_string());
+            }
+            Err(error) => {
+                self.diff_error = Some(format!("cannot run git diff: {error}"));
+            }
+        }
     }
 
     fn handle_model_picker_key(&mut self, key: KeyEvent) {
@@ -967,6 +1036,7 @@ impl App {
             PaletteAction::ModelPicker => self.open_model_picker(),
             PaletteAction::ToggleSidebar => self.show_sidebar = !self.show_sidebar,
             PaletteAction::ToggleDetails => self.show_details = !self.show_details,
+            PaletteAction::ShowDiff => self.open_diff(),
             PaletteAction::Help => self.show_help = true,
             PaletteAction::Interrupt => self.interrupt(),
             PaletteAction::ClearWake => {
@@ -989,6 +1059,10 @@ impl App {
         }
         if self.model_picker.is_some() {
             self.render_model_picker(frame, area);
+            return;
+        }
+        if self.show_diff {
+            self.render_diff(frame, area);
             return;
         }
         let vertical = Layout::default()
@@ -1380,7 +1454,7 @@ impl App {
                 "j/k sessions · Enter load · / search · n new · Tab wake · Ctrl-P palette · q quit"
             }
             Focus::Wake => {
-                "j/k scroll · d details · v ship · i type · n new · Ctrl-P palette · Esc interrupt · q quit"
+                "j/k scroll · d details · D diff · v ship · i type · n new · Ctrl-P palette · Esc interrupt · q quit"
             }
             Focus::Composer => {
                 "Enter send/queue · Esc wake · Ctrl-U clear · Ctrl-C quit"
@@ -1432,6 +1506,7 @@ impl App {
             Line::from("  s                focus the log book"),
             Line::from("  /                search the log book"),
             Line::from("  d                expand reasoning and tool output"),
+            Line::from("  D                review the workspace git diff"),
             Line::from("  v                toggle ship status rail"),
             Line::from("  m                model picker"),
             Line::from("  Ctrl-P or :      command palette"),
@@ -1520,6 +1595,77 @@ impl App {
             Paragraph::new(Text::from(lines))
                 .block(block)
                 .wrap(Wrap { trim: false }),
+            box_area,
+        );
+    }
+
+    fn render_diff(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(Clear, area);
+        let vertical = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Fill(1),
+                Constraint::Length(30.min(area.height)),
+                Constraint::Fill(1),
+            ])
+            .split(area);
+        let horizontal = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Fill(1),
+                Constraint::Length(110.min(area.width)),
+                Constraint::Fill(1),
+            ])
+            .split(vertical[1]);
+        let box_area = horizontal[1];
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        if let Some(error) = &self.diff_error {
+            lines.push(Line::from(Span::styled(
+                error.clone(),
+                Style::default().fg(AMBER),
+            )));
+        } else {
+            for line in self.diff_text.lines() {
+                let color = if line.starts_with("+++") || line.starts_with("---") {
+                    MUTED
+                } else if line.starts_with('+') {
+                    TEAL
+                } else if line.starts_with('-') {
+                    ROSE
+                } else if line.starts_with("@@") || line.starts_with("diff --git") {
+                    SKY
+                } else {
+                    Color::Gray
+                };
+                lines.push(Line::from(Span::styled(
+                    line.to_string(),
+                    Style::default().fg(color),
+                )));
+            }
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "j/k scroll · PgUp/PgDn page · g/G top/bottom · Esc close",
+            Style::default().fg(MUTED),
+        )));
+        let content_height = wrapped_line_count(&lines, box_area.width.saturating_sub(2));
+        let max_scroll = content_height.saturating_sub(box_area.height.saturating_sub(2) as usize);
+        let scroll = self.diff_scroll.min(max_scroll);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(TEAL))
+            .title(Span::styled(
+                format!(
+                    " DIFF · {} ",
+                    truncate(&self.config.root.display().to_string(), 60)
+                ),
+                Style::default().fg(TEAL).add_modifier(Modifier::BOLD),
+            ));
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .block(block)
+                .wrap(Wrap { trim: false })
+                .scroll((scroll.min(u16::MAX as usize) as u16, 0)),
             box_area,
         );
     }
