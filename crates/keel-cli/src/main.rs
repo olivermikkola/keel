@@ -45,6 +45,7 @@ use std::sync::Arc;
 mod args;
 mod bench;
 mod line_reader;
+mod tui;
 use line_reader::LineReader;
 
 /// Live terminal output: answer text on stdout, reasoning dimmed on stderr.
@@ -270,6 +271,7 @@ fn print_usage() {
   keel [options] "prompt"          run one-shot agent turn
   keel run [options] "prompt"      explicit run command
   keel repl [options]              interactive multi-turn REPL
+  keel tui [options] [prompt]      terminal cockpit (log book, wake, ship)
   keel patch <file> [diff]         apply diff or search/replace hunks (supports stdin)
   keel edit <file> --old S --new S surgical fuzzy replacement
   keel checkpoint <cmd>            git shadow snapshots (save, restore, list, diff)
@@ -1803,6 +1805,10 @@ fn main() -> anyhow::Result<()> {
         take_opt(&mut args, "--auth-token").or_else(|| std::env::var("KEEL_DAEMON_TOKEN").ok());
     let role_opt = take_opt(&mut args, "--role");
     let steps_opt: Option<usize> = take_opt(&mut args, "--steps").and_then(|s| s.parse().ok());
+    let tui_mode = args.first().map(String::as_str) == Some("tui");
+    if tui_mode {
+        args.remove(0);
+    }
     let daemon_mode = args.first().map(String::as_str) == Some("daemon");
     if daemon_mode {
         args.remove(0);
@@ -1819,7 +1825,7 @@ fn main() -> anyhow::Result<()> {
     if bench_mode {
         args.remove(0);
     }
-    let any_mode = daemon_mode || subagent_mode || speculate_mode || bench_mode;
+    let any_mode = daemon_mode || subagent_mode || speculate_mode || bench_mode || tui_mode;
     if let Err(msg) = args::validate_remaining(&args).and_then(|()| {
         if any_mode || interactive || !literal_tail.is_empty() {
             Ok(())
@@ -1886,6 +1892,25 @@ fn main() -> anyhow::Result<()> {
             "https://api.deepseek.com".into()
         }
     });
+
+    if tui_mode {
+        return tui::run(tui::Config {
+            root,
+            model: model_name,
+            base_url,
+            api_key: api_key_opt,
+            yolo,
+            read_only,
+            safety_mode: safety_mode_opt,
+            shadow_vfs,
+            no_sandbox,
+            allow_protected,
+            thinking: std::env::var("KEEL_THINKING").ok(),
+            steps: steps_opt,
+            max_context_tokens,
+            prompt: (!prompt.trim().is_empty()).then_some(prompt),
+        });
+    }
 
     let streaming_sentinel = Arc::new(StreamingSentinel::default());
     let prewarm_engine = Arc::new(PrewarmEngine::new(root.clone()));

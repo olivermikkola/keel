@@ -11,6 +11,45 @@ A **model-agnostic, Rust, everything-is-a-plugin CLI coding agent harness.** Pri
 - **Approvals and sandboxing are first-class**: Landlock/seccomp on Linux, an approval protocol that a phone UI can answer, safe-by-default permissions.
 - **Reverse-engineer the best ideas** from open source and re-implement them as plugins (see [docs/REFERENCES.md](docs/REFERENCES.md)). Copy designs and permissively licensed code (with attribution), not private leaks.
 
+## Terminal cockpit (`keel tui`)
+
+`keel tui` is the session-centric terminal cockpit: a **log book** of past
+wakes on the left, the live **wake** in the middle, and a **ship** status rail
+on the right (model/provider, safety, sandbox, VFS, last-turn tokens, changed
+files).
+
+```bash
+keel tui --model bonsai-9b --root ~/Projects/my-app
+keel tui --model bonsai-9b "explain this repo"   # start with a prompt
+```
+
+- **Non-blocking input:** keep typing while a turn runs; Enter queues the next
+  prompt and it resumes the same session log when the current turn exits.
+- **Streaming NDJSON:** reasoning, tool calls, tool results, sentinel vetoes
+  and turn summaries render as they arrive.
+- **Session log is the source of truth:** the log book loads
+  `~/.keel/sessions/*.jsonl`; closing the TUI never deletes a wake.
+- **Command palette:** `Ctrl-P` or `:`.
+- **Model picker:** `m` (Bonsai 2B/4B/9B/27B, Qwen, Kat, DeepSeek).
+- **Details:** `d` expands reasoning/tool output; `v` toggles the ship rail.
+- **Interrupt:** `x`, or `Esc` from the wake pane.
+
+| Key | Action |
+|---|---|
+| `Tab` | cycle Log book → Wake → Wake line |
+| `j` / `k`, `↑` / `↓` | move or scroll |
+| `Enter` | send, or queue while running |
+| `Esc` | leave composer / interrupt from the wake |
+| `n` | new wake (new session log) |
+| `s` | focus log book |
+| `/` | search log book |
+| `d` / `v` | details / ship rail |
+| `m` | model picker |
+| `Ctrl-P`, `:` | command palette |
+| `x` | interrupt |
+| `?` | help |
+| `q`, `Ctrl-C` | quit |
+
 ## Status
 
 **M1 & M2 core operational** (12 tests, clippy clean):
@@ -43,7 +82,7 @@ Tested locally on Vulkan (`llama-server`) across **Huihui Qwen3.8 27B (`Q4_K_M`,
 2. **M1, minimal agent (done):** `llm` service + OpenAI-compatible and DeepSeek providers, `agent-loop` (turn/step), tools (`read_file`, `list_dir`, `grep`, `edit_file`, `write_file`, `shell`), JSONL session log.
 3. **M2, safety (Landlock done):** sandbox plugin (Landlock `ABI::V3`), approval policy, guard plugins (timeouts, repeat-tool reminder).
 4. **M3, context:** compaction, skills (`SKILL.md`), `AGENTS.md`, MCP client, subagents, todo/plan.
-5. **M4, frontends:** TUI, ACP server, SDK JSON-RPC, Helm integration.
+5. **M4, frontends:** TUI session cockpit (done), ACP server, SDK JSON-RPC, Helm integration.
 6. **M5, extras:** LSP, worktree isolation per thread, scheduling/jobs, goal mode, cost meter.
 
 ## Layout

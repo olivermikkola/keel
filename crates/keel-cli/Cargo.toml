@@ -15,3 +15,5 @@ keel-agent = { path = "../keel-agent" }
 serde_json = "1"
 anyhow = "1"
 libc = "0.2"
+ratatui = "=0.30.2"
+crossterm = "=0.29.0"
