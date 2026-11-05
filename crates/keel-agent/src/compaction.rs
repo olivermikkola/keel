@@ -564,7 +564,12 @@ impl AdaptiveCompactor {
         if !self.should_compact(history) {
             return None;
         }
+        self.force_compact(history)
+    }
 
+    /// Compacts even when the estimate says it is not needed: the server has
+    /// just said the request is too big, so the estimate was wrong.
+    pub fn force_compact(&self, history: &mut Vec<Message>) -> Option<CompactionReport> {
         let before_tokens = self.estimate_history_tokens(history);
 
         // 1. Identify Head boundary (System messages + first User prompt)

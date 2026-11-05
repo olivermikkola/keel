@@ -874,9 +874,27 @@ impl Agent<'_> {
             if let Some(pruner) = self.ctx.service::<compaction::ToolResultPruner>() {
                 pruner.prune_history(history);
             }
-            let mut reply = self
+            let mut reply = match self
                 .llm
-                .complete_streaming(history, &specs, &mut |c| self.ctx.emit(&c))?;
+                .complete_streaming(history, &specs, &mut |c| self.ctx.emit(&c))
+            {
+                // Our token estimate was too low. Compact what we can
+                // and retry once instead of losing the whole turn.
+                Err(error) if is_context_overflow(&error) => {
+                    let report = self
+                        .ctx
+                        .service::<compaction::AdaptiveCompactor>()
+                        .and_then(|c| c.force_compact(history))
+                        .ok_or(error)?;
+                    self.ctx.emit(&compaction::CompactionEvent(report.clone()));
+                    let _ = self
+                        .log
+                        .append("compaction", serde_json::to_value(&report)?);
+                    self.llm
+                        .complete_streaming(history, &specs, &mut |c| self.ctx.emit(&c))?
+                }
+                other => other?,
+            };
             if cancel_token.as_ref().is_some_and(|c| c.is_cancelled()) {
                 anyhow::bail!("turn cancelled by client");
             }
@@ -1208,9 +1226,24 @@ fn json_without_name(v: &Value) -> Value {
     }
 }
 
+/// True when a provider error says the request did not fit the context
+/// window (llama.cpp, OpenAI-style and vLLM wordings).
+fn is_context_overflow(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}").to_ascii_lowercase();
+    [
+        "exceed_context_size",
+        "exceeds the available context",
+        "context_length_exceeded",
+        "maximum context length",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context as _;
     use std::sync::Mutex;
 
     /// Scripted model: returns queued replies in order.
@@ -1219,6 +1252,75 @@ mod tests {
         fn complete(&self, _: &[Message], _: &[ToolSpec]) -> Result<Message> {
             Ok(self.0.lock().unwrap().remove(0))
         }
+    }
+
+    /// Fails once with llama.cpp's real overflow error, then answers.
+    struct OverflowOnce(Mutex<bool>);
+    impl Llm for OverflowOnce {
+        fn complete(&self, history: &[Message], _: &[ToolSpec]) -> Result<Message> {
+            let mut failed = self.0.lock().unwrap();
+            if !*failed {
+                *failed = true;
+                return Err(anyhow::anyhow!(
+                    r#"http://127.0.0.1:8080/v1/chat/completions: status code 400: {{"error":{{"code":400,"message":"request (17000 tokens) exceeds the available context size (16384 tokens), try increasing it","type":"exceed_context_size_error"}}}}"#
+                ))
+                .context("provider request failed");
+            }
+            Ok(asst(
+                &format!("done with {} messages", history.len()),
+                vec![],
+            ))
+        }
+    }
+
+    #[test]
+    fn context_overflow_forces_compaction_and_retries_once() {
+        let ctx = Context::new();
+        let _p = ctx.mount(&compaction::AdaptiveCompactorPlugin::new(
+            compaction::AdaptiveCompactor::with_default_summarizer(
+                compaction::ContextBudget::builder()
+                    .keep_recent_turns(1)
+                    .build(),
+            ),
+        ));
+        let llm = OverflowOnce(Mutex::new(false));
+        let agent = Agent {
+            ctx: &ctx,
+            llm: &llm,
+            tools: vec![Box::new(Echo)],
+            approver: &AllowAll,
+            log: &SessionLog::none(),
+            max_steps: 2,
+        };
+        // Small by Keel's estimate, so normal compaction would not run.
+        let mut h = vec![Message::System { text: "sys".into() }];
+        for i in 0..4 {
+            h.push(Message::User {
+                text: format!("old question {i}"),
+            });
+            h.push(asst(&format!("old answer {i}"), vec![]));
+        }
+        let before = h.len();
+        agent.run_turn(&mut h, "new question").unwrap();
+        assert!(
+            h.len() < before,
+            "history was not compacted: {} -> {}",
+            before,
+            h.len()
+        );
+        assert!(h
+            .iter()
+            .any(|m| matches!(m, Message::User { text } if text.contains("Compacted History"))));
+        assert!(
+            matches!(h.last(), Some(Message::Assistant { text, .. }) if text.starts_with("done"))
+        );
+    }
+
+    #[test]
+    fn other_provider_errors_are_not_treated_as_overflow() {
+        let e =
+            anyhow::anyhow!("status code 401: invalid api key").context("provider request failed");
+        assert!(!is_context_overflow(&e));
     }
 
     struct Echo;

@@ -487,7 +487,25 @@ impl OpenAiCompat {
         if let Some(k) = &self.api_key {
             req = req.set("Authorization", &format!("Bearer {k}"));
         }
-        req.send_json(body).context("provider request failed")
+        match req.send_json(body) {
+            // Keep the server's own explanation (e.g. "request exceeds the
+            // available context size"); a bare status code is undiagnosable.
+            Err(ureq::Error::Status(code, resp)) => {
+                let url = resp.get_url().to_string();
+                let detail: String = resp
+                    .into_string()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(600)
+                    .collect();
+                Err(anyhow::anyhow!(
+                    "{url}: status code {code}: {}",
+                    detail.trim()
+                ))
+                .context("provider request failed")
+            }
+            other => other.context("provider request failed"),
+        }
     }
 }
 
