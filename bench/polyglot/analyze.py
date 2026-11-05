@@ -117,12 +117,13 @@ def report(run, harnesses, sessions):
     blocks = {}
     for row in rows:
         blocks.setdefault((row["exercise"], row.get("rep", 1)), {})[row["harness"]] = row
-    matched = [v for v in blocks.values() if set(harnesses) <= v.keys()]
+    matched = [v for v in blocks.values() if set(harnesses) <= v.keys()
+               and all(v[h].get("outcome", "completed") == "completed" for h in harnesses)]
     diagnostics = [session_metrics(p, warnings) for p in sessions]
     attempts = []
     for row in rows:
         rep = row.get("rep", 1)
-        log = run / row["harness"] / f"{row['exercise']}.{rep}.log"
+        log = run / row.get("agent_log", f"{row['harness']}/{row['exercise']}.{rep}.log")
         if not log.exists() and rep == 1:
             log = run / row["harness"] / f"{row['exercise']}.log"
         text = log.read_text(errors="replace") if log.exists() else ""
@@ -137,7 +138,8 @@ def report(run, harnesses, sessions):
               "harnesses": harnesses, "warnings": warnings,
               "attempts": attempts, "sessions": diagnostics}
     lines = ["# Polyglot evidence", "",
-             f"{len(rows)} recorded attempts; {len(matched)} complete matched blocks.", "",
+             f"{len(rows)} recorded attempts; {len(matched)} complete matched blocks.",
+             f"Infrastructure failures: {sum(r.get('outcome', 'completed') != 'completed' for r in rows)} (excluded from comparisons).", "",
              "Only blocks completed by every selected harness enter this table.", "",
              "| Harness | Solved | Matched runs | Mean tests passing | Scorable runs | Timeouts |",
              "|---|---:|---:|---:|---:|---:|"]
@@ -174,7 +176,7 @@ def report(run, harnesses, sessions):
               "- Reasoning streamed after the last saved event may be absent from session metrics.",
               "- Edit counts are calls, not proof of successful writes; shell edits are excluded.",
               "- Stock harness defaults can differ; this report does not verify matched sampling.",
-              "- This pilot's read-only root mount leaves reference solutions reachable by absolute path.",
+              "- Legacy pilot runs expose reference solutions; isolated-attempt-v1 uses runtime-only mounts.",
               "- Do not change architecture or declare a winner from partial credit on this small sample."]
     lines += ["", *[f"Warning: {w}" for w in warnings]]
     return result, "\n".join(lines) + "\n"
