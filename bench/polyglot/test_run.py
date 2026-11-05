@@ -21,6 +21,12 @@ runner.KEEL_BIN = os.environ.get("KEEL_TEST_BIN", runner.KEEL_BIN)
 
 
 class RunnerTests(unittest.TestCase):
+    def test_dataset_inside_runtime_mount_is_rejected_before_copying(self):
+        with patch.object(runner, "prepare") as prepare:
+            with self.assertRaisesRegex(RuntimeError, "outside mounted runtime"):
+                runner.attempt("keel", Path("/usr/share/benchmark"), 1, Path(), Path(), Path(), {})
+            prepare.assert_not_called()
+
     def test_manifest_and_repeat_resume_refuse_changed_binary(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

@@ -193,6 +193,10 @@ def execute(name, src, out, timeout, rep, artifact, root):
 
 
 def attempt(name, src, timeout, artifact, ws, home, row):
+    runtime_roots = [Path("/usr"), Path("/bin"), Path("/lib"), Path("/lib64"),
+                     REAL_HOME / ".npm-global", REAL_HOME / ".cache/uv", REAL_HOME / ".local/share/uv/python"]
+    if any(src.resolve().is_relative_to(p.resolve()) for p in runtime_roots):
+        raise RuntimeError("dataset must be outside mounted runtime directories")
     stubs, tests = prepare(src, ws)
     shutil.copytree(ws, artifact / "input", ignore=shutil.ignore_patterns(".git"))
     row["input_sha256"] = {str(p.relative_to(artifact / "input")): hashlib.sha256(p.read_bytes()).hexdigest()
