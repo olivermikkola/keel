@@ -1,0 +1,36 @@
+name: PR gate
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: pr-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: PR gate (proof, size, new features, frozen modules)
+    if: github.event.pull_request.user.login != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          BASE: ${{ github.event.pull_request.base.ref }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" --jq '.body // ""' > /tmp/body.md
+          labels=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" --jq '[.labels[].name] | join(",")')
+          open=$(gh api "repos/$GITHUB_REPOSITORY/pulls?state=open&per_page=100" \
+            --jq '[.[] | select(.user.login != "dependabot[bot]")] | length')
+          python3 scripts/pr_gate.py --base "origin/$BASE" --body-file /tmp/body.md \
+            --labels "$labels" --open-prs "$open"
