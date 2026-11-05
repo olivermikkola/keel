@@ -211,6 +211,23 @@ impl SandboxPolicy {
             }
         }
 
+        // `/dev` is read-only above, so `2>/dev/null` would fail with
+        // "Permission denied". Device nodes are files, so they get file rights.
+        // Only real character devices: `/dev/stdin` etc. can resolve to a pipe,
+        // and Landlock rejects rules on pipes with EINVAL.
+        let device = AccessFs::ReadFile | AccessFs::WriteFile;
+        for node in DEFAULT_DEVICE_NODES {
+            let is_char_device = std::fs::metadata(node)
+                .map(|m| std::os::unix::fs::FileTypeExt::is_char_device(&m.file_type()))
+                .unwrap_or(false);
+            if !is_char_device {
+                continue;
+            }
+            if let Ok(fd) = PathFd::new(node) {
+                ruleset = ruleset.add_rule(PathBeneath::new(fd, device))?;
+            }
+        }
+
         // Grant read-write access to workspace, /tmp, and extra write paths.
         for rw_path in self.write_paths() {
             if rw_path.exists() {
@@ -427,12 +444,70 @@ mod tests {
         assert_eq!(policy.discover_toolchains, cloned.discover_toolchains);
     }
 
+    /// Runs `script` under the real Landlock policy. `None` when the kernel
+    /// cannot enforce Landlock (the test then has nothing to check).
+    fn run_confined(name: &str, script: &str) -> Option<std::process::Output> {
+        use std::os::unix::process::CommandExt;
+        let ws = std::env::temp_dir().join(format!("keel-sandbox-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&ws).unwrap();
+        let policy = SandboxPolicy::new(&ws, true);
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg(script).current_dir(&ws);
+        unsafe {
+            cmd.pre_exec(move || {
+                policy
+                    .restrict_current_thread()
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))
+            });
+        }
+        // Piped stdin like the real agent run: `/dev/stdin` is then a pipe.
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        // Spawn fails only when the policy could not be applied.
+        let out = cmd.spawn().and_then(|c| c.wait_with_output());
+        let _ = std::fs::remove_dir_all(&ws);
+        match out {
+            Ok(out) => Some(out),
+            Err(e) if !landlock_active() => {
+                eprintln!("skipping, kernel has no Landlock: {e}");
+                None
+            }
+            Err(e) => panic!("confined spawn failed: {e}"),
+        }
+    }
+
+    fn landlock_active() -> bool {
+        std::fs::read_to_string("/sys/kernel/security/lsm")
+            .map(|lsm| lsm.split(',').any(|m| m.trim() == "landlock"))
+            .unwrap_or(false)
+    }
+
     #[test]
-    fn test_device_nodes_list_contains_expected_entries() {
-        assert!(DEFAULT_DEVICE_NODES.contains(&"/dev/null"));
-        assert!(DEFAULT_DEVICE_NODES.contains(&"/dev/zero"));
-        assert!(DEFAULT_DEVICE_NODES.contains(&"/dev/urandom"));
-        assert!(DEFAULT_DEVICE_NODES.contains(&"/dev/tty"));
-        assert!(!DEFAULT_DEVICE_NODES.is_empty());
+    fn test_confined_shell_can_redirect_to_dev_null() {
+        let Some(out) = run_confined(
+            "devnull",
+            "echo hi 2>/dev/null; echo quiet >/dev/null && echo done",
+        ) else {
+            return;
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "stderr: {stderr}");
+        assert_eq!(stdout, "hi\ndone\n", "stderr: {stderr}");
+    }
+
+    #[test]
+    fn test_confined_shell_still_cannot_write_outside_workspace() {
+        let target = "/var/tmp/keel-sandbox-escape-probe";
+        if !std::path::Path::new("/var/tmp").is_dir() {
+            return;
+        }
+        let Some(out) = run_confined("escape", &format!("touch {target}")) else {
+            return;
+        };
+        let escaped = std::path::Path::new(target).exists();
+        let _ = std::fs::remove_file(target);
+        assert!(!out.status.success() && !escaped);
     }
 }

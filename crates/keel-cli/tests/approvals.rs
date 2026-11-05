@@ -66,6 +66,9 @@ fn check_decision(allow: bool) {
             &format!("http://{address}/v1"),
             "Run the requested test tool",
         ])
+        // The fake server scripts exactly two chat calls; skip the
+        // context-window probe so it gets no extra GET requests.
+        .env("KEEL_MAX_CONTEXT_TOKENS", "16384")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

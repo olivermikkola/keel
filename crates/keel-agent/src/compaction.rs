@@ -198,6 +198,39 @@ impl ContextBudget {
     }
 }
 
+/// Asks a local OpenAI-compatible server how big the model's context window
+/// is, so compaction starts at 75% of the real window instead of a fixed 12k.
+/// Understands `context_length` in `GET {base}/models` (Lemonade, OpenRouter
+/// style) and llama.cpp's `GET /props`. Only loopback servers are asked;
+/// `None` means unknown (keep the default or `--max-context-tokens`).
+pub fn probe_context_window(base_url: &str, model: &str) -> Option<usize> {
+    let base = base_url
+        .trim_end_matches('/')
+        .trim_end_matches("/chat/completions");
+    let host = base.split("://").nth(1)?.split(['/', ':']).next()?;
+    if !matches!(host, "localhost" | "127.0.0.1") {
+        return None;
+    }
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(2))
+        .build();
+    let get = |url: String| -> Option<serde_json::Value> {
+        agent.get(&url).call().ok()?.into_json().ok()
+    };
+    let listed = get(format!("{base}/models")).and_then(|v| {
+        v["data"]
+            .as_array()?
+            .iter()
+            .find(|m| m["id"].as_str() == Some(model))?["context_length"]
+            .as_u64()
+    });
+    let window = listed.or_else(|| {
+        let server_root = base.strip_suffix("/v1").unwrap_or(base);
+        get(format!("{server_root}/props"))?["default_generation_settings"]["n_ctx"].as_u64()
+    })?;
+    (window >= 2048).then_some(window as usize)
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ContextBudgetBuilder {
     max_context_tokens: Option<usize>,
