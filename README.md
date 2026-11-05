@@ -45,6 +45,7 @@ keel tui --model bonsai-9b "explain this repo"   # start with a prompt
 | `/` | search log book |
 | `d` / `v` | details / ship rail |
 | `D` | review the workspace git diff |
+| `y` / `a` / `n` | approval: allow once / always / deny |
 | `m` | model picker |
 | `Ctrl-P`, `:` | command palette |
 | `x` | interrupt |
