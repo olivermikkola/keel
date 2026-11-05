@@ -96,7 +96,12 @@ reading their targets. Attempt evidence is never overwritten.
 
 Setup and scoring infrastructure failures stop the run and are excluded from
 matched comparisons. Incorrect solutions, syntax errors, and timed-out agents
-remain coding outcomes when scoring works. The manifest pins the runner,
+remain coding outcomes when scoring works. Under `isolated-attempt-v2`, a
+candidate that exhausts the 120-second grading budget is also unsolved
+(`score_exit: "timeout"`), with partial output preserved. A grading timeout
+records the budget limit, not a diagnosis of its underlying cause. Launcher,
+scorer setup, usage and internal errors still stop the run as infrastructure
+failures. The manifest pins the runner,
 Keel binary, dataset revision, selected settings and server defaults. Server
 defaults do **not** prove the sampling settings each harness actually sent.
 

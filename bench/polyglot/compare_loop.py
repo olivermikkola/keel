@@ -67,7 +67,8 @@ def snapshot(args):
         source = args.exercises / task
         paths = list((source / ".docs").rglob("*")) + list(source.glob("*.py"))
         inputs[task] = {str(p.relative_to(source)): digest(p) for p in sorted(paths) if p.is_file()}
-    return {"protocol": "keel-test-after-edit-v1", "prompts": PROMPTS,
+    return {"protocol": "keel-test-after-edit-v2", "prompts": PROMPTS,
+            "scoring": f"original tests; {run.SCORE_TIMEOUT}s grading timeout counts as unsolved",
             "schedule": list(schedule(args.repeat)), "timeout": args.timeout,
             "keel_sha256": digest(Path(run.KEEL_BIN)), "model": run.MODEL,
             "base_url": run.BASE_URL, "context": run.CONTEXT,

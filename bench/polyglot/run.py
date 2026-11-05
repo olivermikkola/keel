@@ -31,6 +31,7 @@ from pathlib import Path
 BASE_URL = "http://127.0.0.1:8080/v1"
 MODEL = "bonsai-9b"
 CONTEXT = 16384
+SCORE_TIMEOUT = 120
 REAL_HOME = Path.home()
 KEEL_BIN = str(REAL_HOME / ".local/bin/keel")
 
@@ -256,7 +257,7 @@ def attempt(name, src, timeout, artifact, ws, home, row):
         score = subprocess.run(["nice", "-n", "19", *sandbox(score_ws, score_home, [score_ws / t for t in tests]),
                                 "--setenv", "PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1", "python3", "-m", "pytest",
                                 "-q", "-p", "no:cacheprovider", *tests],
-                               stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
+                               stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=SCORE_TIMEOUT)
         (artifact / "score.stdout").write_text(score.stdout)
         (artifact / "score.stderr").write_text(score.stderr)
         tail = score.stdout.strip().splitlines()[-1:] or [""]
@@ -264,7 +265,9 @@ def attempt(name, src, timeout, artifact, ws, home, row):
         if score.returncode in (0, 1, 2) and re.search(r"\b\d+ (passed|failed|errors?)\b", tail[0]):
             row.update(passed=score.returncode == 0, outcome="completed")
     except subprocess.TimeoutExpired as error:
-        row["pytest"] = "pytest timeout"
+        # The fixed grading budget applies to candidate execution too. A
+        # nonterminating solution is unsolved, not a broken benchmark setup.
+        row.update(outcome="completed", score_exit="timeout", pytest="pytest timeout")
         for filename, value in (("score.stdout", error.stdout), ("score.stderr", error.stderr)):
             (artifact / filename).write_bytes(value.encode() if isinstance(value, str) else value or b"")
 
@@ -294,7 +297,8 @@ def main():
         ap.error("no exercises selected")
     globals()["KEEL_BIN"] = str(Path(a.keel_bin).resolve())
     a.out.mkdir(parents=True, exist_ok=True)
-    manifest = {"protocol": "isolated-attempt-v1", "model": MODEL, "base_url": BASE_URL,
+    manifest = {"protocol": "isolated-attempt-v2", "model": MODEL, "base_url": BASE_URL,
+                "scoring_timeout": SCORE_TIMEOUT,
                 "context": CONTEXT, "sampling": "stock harness defaults; not request-verified",
                 "timeout": a.timeout, "repeat": a.repeat, "exercises": names, "harness": a.harness,
                 "keel_sha256": hashlib.sha256(Path(KEEL_BIN).read_bytes()).hexdigest(),
