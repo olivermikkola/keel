@@ -9,18 +9,20 @@ public [polyglot benchmark](https://github.com/Aider-AI/polyglot-benchmark)
 
 - Same model (`bonsai-9b`, llama-server at `127.0.0.1:8080`, 16k context),
   same prompt, same time limit (default 300 s) for every harness.
-- Task copies contain the stub, test file and `.docs/`, excluding `.meta/`
-  reference solutions. This does not enforce read isolation; see below.
+- Task copies contain the stub, test file and `.docs/`. The sandbox exposes
+  system/tool runtimes and fresh task directories; the host home, source
+  dataset, reference solutions, and other attempts are not mounted.
 - A task passes only if the **original** test file passes (restored before
   scoring); `tampered_test` records if an agent edited it.
-- Every harness and the scoring run inside the same **bubblewrap** sandbox:
-  the whole system is read-only except the task folder and a throwaway HOME,
+- Every harness and the scoring run inside a **bubblewrap** sandbox:
+  installed runtimes are read-only; the task folder and throwaway HOME are writable,
   with a **clean environment** (no API keys or base URLs from your shell).
   Stock settings: no personal configs, rules files or plugins.
 - Heat guard: a task starts only when `Tctl < 60 °C`; the run stops if it
   passes 95 °C. Each task records its peak.
-- Harnesses are interleaved per exercise, and the run resumes from
-  `results.jsonl`, so stopping early still leaves comparable data.
+- Harnesses are interleaved per exercise and repeat (`--repeat N`). Resume
+  requires identical settings and completed attempts; legacy pilot data needs
+  a separate output directory. `--stop-at HH:MM` also applies after cooling.
 
 ## Run
 
@@ -76,8 +78,36 @@ test counts unknown, rejects duplicate attempts, and tolerates a live writer's
 incomplete final JSON record with a warning. Session metrics are separate from
 attempts because the legacy runner does not record a session identifier.
 
-The current sandbox isolates **writes**, not reads: `.meta` is omitted from
-the task copy but remains reachable in the original dataset by absolute path.
-Treat the current comparison as exploratory. See [DECISIONS.md](DECISIONS.md)
+The original 2026-11-05 pilot used a read-only host root and remains exploratory.
+Its running process is unchanged. New `isolated-attempt-v1` runs use the stricter
+mounts above. See [DECISIONS.md](DECISIONS.md)
 for the next controlled experiment and the evidence required before changing
 the agent architecture.
+
+## Attempt evidence and errors
+
+Each attempt has an exclusive `attempts/HARNESS/EXERCISE.REP/` directory with
+original inputs and hashes, final workspace, full agent/scoring logs, original
+scoring files, launch command and executable hash, timestamps and result JSON.
+Keel's archived session has an explicit link in its result row. Scoring uses a
+fresh home and only original tests plus the named solution files; agent-added
+pytest hooks/configuration are excluded. Solution symlinks are rejected without
+reading their targets. Attempt evidence is never overwritten.
+
+Setup and scoring infrastructure failures stop the run and are excluded from
+matched comparisons. Incorrect solutions, syntax errors, and timed-out agents
+remain coding outcomes when scoring works. The manifest pins the runner,
+Keel binary, dataset revision, selected settings and server defaults. Server
+defaults do **not** prove the sampling settings each harness actually sent.
+
+Aider runs directly from the single environment cached by the `uv tool run`
+command above, allowing its cache and managed Python runtime to stay read-only.
+Verify sandbox behavior and real Keel execution without inference:
+
+```bash
+KEEL_BENCH_SANDBOX_TESTS=1 python3 -m unittest discover -s bench/polyglot -p 'test_*.py' -v
+```
+
+The integration fixture uses a temporary scripted local provider. It validates
+execution and measurement, not coding ability. CI runs it after building Keel;
+the optional local OpenCode/Aider startup check requires their installations.

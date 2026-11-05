@@ -34,6 +34,12 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(data["matched_blocks"], 1)
         self.assertIn("| keel | 0 | 1 | 50.0% | 1 | 1 |", markdown)
 
+    def test_infrastructure_failure_excludes_entire_matched_block(self):
+        self.write("results.jsonl", [self.row(outcome="scoring_error"), self.row("aider")])
+        data, markdown = analyze.report(self.root, ["keel", "aider"], [])
+        self.assertEqual(data["matched_blocks"], 0)
+        self.assertIn("Infrastructure failures: 1", markdown)
+
     def test_repetitions_are_distinct_and_legacy_rows_default_to_one(self):
         self.write("results.jsonl", [self.row(), self.row(rep=2)])
         self.assertEqual(len(analyze.load_results(self.root / "results.jsonl", [])), 2)
