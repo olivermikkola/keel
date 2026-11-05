@@ -62,6 +62,10 @@ losing useful diagnostics could still make model performance worse.
 
 ## Next controlled experiment: line feedback versus default
 
+**Updated priority:** Oliver selected the smaller Keel-only edit/test/fix
+comparison in [LOOP_EXPERIMENT.md](LOOP_EXPERIMENT.md). Run that first. The
+traceback comparison below remains a deferred hypothesis, not a queued run.
+
 Compare the existing prompt's `python3 -m pytest -q TEST` with
 `python3 -m pytest -q --tb=line TEST` in a **new run directory**. Keep the same
 binary, model, task set, context, generation settings, and wall-clock budget.
