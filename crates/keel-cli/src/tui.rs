@@ -11,7 +11,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use serde_json::Value;
-use std::io::{BufRead, BufReader, IsTerminal, Read};
+use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -154,6 +154,11 @@ struct ModelPickerState {
     selected: usize,
 }
 
+struct ApprovalPrompt {
+    tool: String,
+    args: String,
+}
+
 struct SessionMeta {
     path: PathBuf,
     title: String,
@@ -235,6 +240,8 @@ struct App {
     running: bool,
     interrupted: bool,
     child_pid: Option<i32>,
+    child_stdin: Option<std::process::ChildStdin>,
+    pending_approval: Option<ApprovalPrompt>,
     pending_prompts: Vec<String>,
     input: Vec<char>,
     cursor: usize,
@@ -284,6 +291,8 @@ impl App {
             running: false,
             interrupted: false,
             child_pid: None,
+            child_stdin: None,
+            pending_approval: None,
             pending_prompts: Vec::new(),
             input: Vec::new(),
             cursor: 0,
@@ -409,7 +418,7 @@ impl App {
             .arg("--log")
             .arg(&log)
             .current_dir(&self.config.root)
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if log.exists()
@@ -459,6 +468,7 @@ impl App {
         match command.spawn() {
             Ok(mut child) => {
                 let pid = child.id() as i32;
+                self.child_stdin = child.stdin.take();
                 let stdout = child.stdout.take();
                 let stderr = child.stderr.take();
                 let (tx, rx) = mpsc::channel();
@@ -488,8 +498,18 @@ impl App {
             Err(error) => {
                 self.error = Some(format!("cannot start keel: {error}"));
                 self.running = false;
+                self.child_stdin = None;
             }
         }
+    }
+
+    fn answer_approval(&mut self, decision: &str) {
+        if let Some(stdin) = self.child_stdin.as_mut() {
+            let _ = writeln!(stdin, "{decision}");
+            let _ = stdin.flush();
+        }
+        self.pending_approval = None;
+        self.status = format!("Approval: {decision}");
     }
 
     fn interrupt(&mut self) {
@@ -547,6 +567,8 @@ impl App {
                 Ok(AgentEvent::Exited(code)) => {
                     self.running = false;
                     self.child_pid = None;
+                    self.child_stdin = None;
+                    self.pending_approval = None;
                     self.rx = None;
                     keep_receiver = false;
                     if let Some(prompt) = self.pending_prompts.first().cloned() {
@@ -657,6 +679,22 @@ impl App {
                         .to_string(),
                 });
             }
+            "approval_request" => {
+                let tool = value
+                    .get("tool")
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool")
+                    .to_string();
+                let args = value
+                    .get("arguments")
+                    .map(|args| compact_json(args, 240))
+                    .unwrap_or_default();
+                self.pending_approval = Some(ApprovalPrompt {
+                    tool: tool.clone(),
+                    args,
+                });
+                self.status = format!("Approval required: {tool}");
+            }
             "done" => {
                 let status = value.get("status").and_then(Value::as_str).unwrap_or("ok");
                 if status != "ok" {
@@ -677,6 +715,15 @@ impl App {
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.quit = true;
+            return;
+        }
+        if self.pending_approval.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => self.answer_approval("allow"),
+                KeyCode::Char('a') => self.answer_approval("always"),
+                KeyCode::Char('n') | KeyCode::Esc => self.answer_approval("deny"),
+                _ => {}
+            }
             return;
         }
         if self.show_diff {
@@ -1049,6 +1096,10 @@ impl App {
 
     fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
+        if self.pending_approval.is_some() {
+            self.render_approval(frame, area);
+            return;
+        }
         if self.show_help {
             self.render_help(frame, area);
             return;
@@ -1473,6 +1524,78 @@ impl App {
             ])
         };
         frame.render_widget(Paragraph::new(line), area);
+    }
+
+    fn render_approval(&self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(Clear, area);
+        let vertical = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Fill(1),
+                Constraint::Length(14.min(area.height)),
+                Constraint::Fill(1),
+            ])
+            .split(area);
+        let horizontal = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Fill(1),
+                Constraint::Length(86.min(area.width)),
+                Constraint::Fill(1),
+            ])
+            .split(vertical[1]);
+        let box_area = horizontal[1];
+        let Some(approval) = &self.pending_approval else {
+            return;
+        };
+        let mut lines = vec![
+            Line::from(Span::styled(
+                "Keel needs permission before it runs this tool.",
+                Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("tool   ", Style::default().fg(MUTED)),
+                Span::styled(
+                    approval.tool.clone(),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("input  ", Style::default().fg(MUTED)),
+                Span::styled(
+                    truncate(&approval.args, 72),
+                    Style::default().fg(Color::Gray),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "y / Enter  allow once",
+                Style::default().fg(TEAL),
+            )),
+            Line::from(Span::styled(
+                "a          always allow this call",
+                Style::default().fg(SKY),
+            )),
+            Line::from(Span::styled("n / Esc    deny", Style::default().fg(ROSE))),
+        ];
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "The turn stays suspended until you answer.",
+            Style::default().fg(MUTED),
+        )));
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(AMBER))
+            .title(" APPROVAL REQUIRED ");
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .block(block)
+                .wrap(Wrap { trim: false }),
+            box_area,
+        );
     }
 
     fn render_help(&self, frame: &mut Frame, area: Rect) {
