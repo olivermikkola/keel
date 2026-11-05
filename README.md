@@ -1,15 +1,37 @@
 # keel (placeholder name)
 
-A **model-agnostic, Rust, everything-is-a-plugin CLI coding agent harness.** Private, early.
+A **Rust CLI coding-agent harness** aimed at making **small local models**
+(2–27B, e.g. Bonsai and Qwen on llama.cpp) do useful coding work. Private, early.
 
-## The gist
+## What is true today
 
-- **Kernel, not a monolith.** A tiny `keel-kernel` hosts services, typed events and *reversible effects*. The model adapter, tools, session log, sandbox, approvals, compaction and the agent loop are all plugins mounted on it. Any of them can be swapped from config. No privileged core.
-- **Model-agnostic.** Provider plugins (OpenAI-compatible, Anthropic, DeepSeek, Gemini, local llama.cpp, routers like OmniRoute) all implement one `llm` service. DeepSeek is just the first.
-- **Profiles.** A profile is an ordered list of plugin bundles plus a user patch file: `tui`, `headless`, `acp`, `sdk`, `daemon`.
-- **Append-only session log** (JSONL). Durable facts are events; the log is the source of truth. [Helm](https://github.com/olivermikkola/helm-gateway) can tail it natively as a fifth harness.
-- **Approvals and sandboxing are first-class**: Landlock/seccomp on Linux, an approval protocol that a phone UI can answer, safe-by-default permissions.
-- **Reverse-engineer the best ideas** from open source and re-implement them as plugins (see [docs/REFERENCES.md](docs/REFERENCES.md)). Copy designs and permissively licensed code (with attribution), not private leaks.
+- **Plugin kernel.** A small `keel-kernel` hosts services, typed events and
+  reversible effects; the model adapter, tools, session log, sandbox,
+  approvals, compaction and agent loop are plugins mounted on it. The plugin
+  set is **hardcoded** in `keel-cli` (all of them mount on every run; see
+  `keel --dump-config`). There is no config file or profile system yet.
+- **One provider: OpenAI-compatible chat completions** (llama.cpp, Lemonade,
+  DeepSeek, OmniRoute, ...). No native Anthropic or Gemini adapters.
+- **Append-only JSONL session log**, which [Helm](https://github.com/olivermikkola/helm-gateway)
+  tails as one of its harnesses.
+- **Safety:** Linux Landlock confines `shell` (writes only in the workspace
+  and `/tmp`), file tools are confined to the workspace. Default policy
+  `standard`: workspace edits are auto-allowed, `shell` asks first (`--read-only`,
+  `--safety-mode safe`, `--yolo` change this). There is
+  a line-based approval protocol on stdin, and Keel refuses `~` or `/` as the
+  workspace. No seccomp.
+- **Weak-model help:** `<tool_call>` text fallback, repeat-tool reminders,
+  compaction sized to the server's real context window.
+
+## Direction
+
+Fix the basics before adding features (see [AGENTS.md](AGENTS.md)). Many
+modules were added quickly and are **frozen** until the core is solid:
+epistemic memory, swarm/handoff, exploration tree, speculate, cascade,
+replay/recorder, and the daemon. The open question that decides whether Keel
+is worth more work: **does it beat other harnesses (OpenCode, Aider, Codex
+CLI) with the same small local model on a real benchmark?** `keel bench`
+today is 9 toy tasks and cannot answer that.
 
 ## Terminal cockpit (`keel tui`)
 
@@ -52,21 +74,20 @@ keel tui --model bonsai-9b "explain this repo"   # start with a prompt
 | `?` | help |
 | `q`, `Ctrl-C` | quit |
 
-## Status
-
-**M1 & M2 core operational** (12 tests, clippy clean):
-- **Plugin-mounted architecture:** `LlmPlugin`, `ApproverPlugin`, `SessionLogPlugin`, `LandlockPlugin`, `BuiltinToolsPlugin`, `Printer`, and `ReasoningMeter` all mount onto `keel_kernel::Context`.
-- **Linux Landlock sandbox (`ABI::V3`):** `shell` child processes are confined in `pre_exec` so writes outside the workspace + `/tmp` are blocked by the kernel. Canonical symlink escape checks protect all file tools.
-- **Streaming + weak-model resilience:** Live SSE streaming for both content and reasoning tokens, `KEEL_THINKING=0|1` control, surgical `edit_file`, `grep`, `list_dir`, and `<tool_call>` text fallback recovery.
+## Quick start
 
 ```bash
 export DEEPSEEK_API_KEY=...        # or KEEL_BASE_URL / KEEL_API_KEY / KEEL_MODEL for any compatible API
-keel "explain this repo"           # read-only by default
+keel "explain this repo"           # run inside a project folder; edits auto-allowed there, shell asks first
 keel --yolo --log s.jsonl "fix the failing test"
 keel bench --runs 3                # multi-run coding benchmark with thinking-token meter
 ```
 
 ## Benchmark (`keel bench`)
+
+9 small toy tasks (create a file, rename a function, fix an obvious bug), 2 runs
+each. Useful as a smoke test for a model + harness pair; it is **not**
+comparable to public benchmarks and does not show Keel beats anything.
 
 Tested locally on Vulkan (`llama-server`) across **Huihui Qwen3.8 27B (`Q4_K_M`, 21 GB)** and the full **PrismML Ternary Bonsai 2 (`Q2_0`)** family (**2B, 4B, 9B, 27B**):
 
@@ -80,12 +101,12 @@ Tested locally on Vulkan (`llama-server`) across **Huihui Qwen3.8 27B (`Q4_K_M`,
 
 ## Roadmap
 
-1. **M0, kernel:** services, events, effects, config-driven plugin tree, `--dump-config`.
-2. **M1, minimal agent (done):** `llm` service + OpenAI-compatible and DeepSeek providers, `agent-loop` (turn/step), tools (`read_file`, `list_dir`, `grep`, `edit_file`, `write_file`, `shell`), JSONL session log.
-3. **M2, safety (Landlock done):** sandbox plugin (Landlock `ABI::V3`), approval policy, guard plugins (timeouts, repeat-tool reminder).
-4. **M3, context:** compaction, skills (`SKILL.md`), `AGENTS.md`, MCP client, subagents, todo/plan.
-5. **M4, frontends:** TUI session cockpit (done), ACP server, SDK JSON-RPC, Helm integration.
-6. **M5, extras:** LSP, worktree isolation per thread, scheduling/jobs, goal mode, cost meter.
+1. **Reliable basics:** agent loop, tools, sandbox, approvals, resume and
+   compaction work in real runs with small local models.
+2. **Honest benchmark:** a slice of a public benchmark (Terminal-Bench or
+   SWE-bench Lite), Keel vs. other harnesses, same model.
+3. Only then: config-driven plugin profiles, native providers, unfreezing
+   modules that the benchmark shows are worth it.
 
 ## Contributing
 
