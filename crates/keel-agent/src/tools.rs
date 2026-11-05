@@ -6,6 +6,7 @@ use crate::{Tool, ToolSpec};
 use anyhow::{bail, Context as _, Result};
 use keel_kernel::{Plugin, Scope};
 use serde_json::{json, Value};
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
@@ -15,6 +16,7 @@ use std::time::Duration;
 
 const MAX_OUT: usize = 32 * 1024;
 const MAX_PIPE_CAPTURE: usize = 1024 * 1024;
+const TRUNCATION: &str = "\n…[truncated]\n";
 const MAX_GREP_FILE_SIZE: u64 = 10 * 1024 * 1024;
 
 /// Terminate a child process and its entire process group cleanly.
@@ -32,19 +34,37 @@ pub fn kill_process_group(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
+/// Drain the pipe, retaining a bounded prefix and suffix. Short output is exact.
 pub fn read_pipe_capped<R: Read>(mut pipe: R) -> Vec<u8> {
-    let mut buf = Vec::new();
-    let _ = pipe
-        .by_ref()
-        .take(MAX_PIPE_CAPTURE as u64)
-        .read_to_end(&mut buf);
-    let mut discard = [0u8; 8192];
-    while let Ok(n) = pipe.read(&mut discard) {
-        if n == 0 {
-            break;
-        }
+    let head_limit = MAX_PIPE_CAPTURE / 2;
+    let tail_limit = MAX_PIPE_CAPTURE - head_limit;
+    let mut head = Vec::new();
+    let mut tail = VecDeque::new();
+    let mut total = 0usize;
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = match pipe.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        total = total.saturating_add(n);
+        let take = (head_limit - head.len()).min(n);
+        head.extend_from_slice(&chunk[..take]);
+        let rest = &chunk[take..n];
+        let overflow = (tail.len() + rest.len()).saturating_sub(tail_limit);
+        tail.drain(..overflow);
+        tail.extend(rest.iter().copied());
     }
-    buf
+    let skip = if total > MAX_PIPE_CAPTURE {
+        head.extend_from_slice(TRUNCATION.as_bytes());
+        TRUNCATION.len()
+    } else {
+        0
+    };
+    head.extend(tail.into_iter().skip(skip));
+    head
 }
 
 /// Run `cmd` to completion with a hard `timeout` and capped stdout/stderr.
@@ -242,6 +262,23 @@ fn truncate(mut s: String) -> String {
         s.push_str("\n…[truncated]");
     }
     s
+}
+
+// Shell diagnostics often end with the useful failure summary. File reads
+// retain their existing prefix-only behavior; shell output keeps both ends.
+fn truncate_shell(s: String) -> String {
+    if s.len() <= MAX_OUT {
+        return s;
+    }
+    let mut head = MAX_OUT / 2;
+    while !s.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = s.len() - MAX_OUT / 2;
+    while !s.is_char_boundary(tail) {
+        tail += 1;
+    }
+    format!("{}{}{}", &s[..head], TRUNCATION, &s[tail..])
 }
 
 /// Slice lines from file content given optional 1-indexed `offset`, line count `limit`, and `line_numbers`.
@@ -842,7 +879,7 @@ impl Tool for Shell {
 
         let out = run_command_bounded(cmd, timeout)?;
 
-        Ok(truncate(format!(
+        Ok(truncate_shell(format!(
             "exit: {}\nstdout:\n{}\nstderr:\n{}",
             out.status.code().unwrap_or(-1),
             String::from_utf8_lossy(&out.stdout),
@@ -1242,6 +1279,61 @@ mod tests {
         assert_eq!(out.status.code(), Some(3));
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hi");
         assert_eq!(String::from_utf8_lossy(&out.stderr).trim(), "err");
+    }
+
+    #[test]
+    fn bounded_runner_preserves_both_stream_tails_after_capture_limit() {
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            r#"printf 'OUT_START\n'; head -c 2097152 /dev/zero | tr '\000' x;
+            printf '\nOUT_SUMMARY\n'; printf 'ERR_START\n' >&2;
+            head -c 2097152 /dev/zero | tr '\000' y >&2;
+            printf '\nERR_SUMMARY\n' >&2; exit 7"#,
+        ]);
+        let out = run_command_bounded(cmd, Duration::from_secs(10)).unwrap();
+        assert_eq!(out.status.code(), Some(7));
+        for (bytes, start, end) in [
+            (&out.stdout, "OUT_START\n", "\nOUT_SUMMARY\n"),
+            (&out.stderr, "ERR_START\n", "\nERR_SUMMARY\n"),
+        ] {
+            assert!(bytes.len() <= MAX_PIPE_CAPTURE);
+            assert!(bytes.starts_with(start.as_bytes()));
+            assert!(bytes.ends_with(end.as_bytes()));
+            assert!(String::from_utf8_lossy(bytes).contains(TRUNCATION));
+        }
+    }
+
+    #[test]
+    fn shell_retains_failure_summary_and_exit_status_on_long_output() {
+        let ws = std::env::temp_dir().join(format!("keel-shell-tail-{}", std::process::id()));
+        std::fs::create_dir_all(&ws).unwrap();
+        let result = Shell::new(ws.clone())
+            .run(&json!({"command": "printf 'TEST_START\\n'; head -c 65536 /dev/zero | tr '\\000' x; printf '\\n27 failed, 4 passed\\n'; exit 1"}))
+            .unwrap();
+        assert!(result.starts_with("exit: 1\nstdout:\nTEST_START\n"));
+        assert!(result.contains("27 failed, 4 passed\n"));
+        assert!(result.contains(TRUNCATION));
+        assert!(result.len() <= MAX_OUT + TRUNCATION.len());
+        let model_result = crate::compaction::ToolResultPruner::default().prune_str(&result);
+        assert!(model_result.starts_with("exit: 1\n"));
+        assert!(model_result.contains("27 failed, 4 passed\n"));
+        std::fs::remove_dir_all(ws).unwrap();
+    }
+
+    #[test]
+    fn shell_truncation_is_utf8_safe_and_small_output_is_verbatim() {
+        assert_eq!(truncate_shell("small\n".into()), "small\n");
+        let noisy = format!("HEAD!{}TAIL!", "🦀α".repeat(MAX_OUT));
+        let output = truncate_shell(noisy);
+        assert!(output.starts_with("HEAD!"));
+        assert!(output.ends_with("TAIL!"));
+        assert!(output.contains(TRUNCATION));
+        assert!(output.len() <= MAX_OUT + TRUNCATION.len());
+        for size in [0, MAX_PIPE_CAPTURE / 2, MAX_PIPE_CAPTURE] {
+            let input = vec![b'x'; size];
+            assert_eq!(read_pipe_capped(std::io::Cursor::new(&input)), input);
+        }
     }
 
     #[test]
