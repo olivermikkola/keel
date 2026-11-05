@@ -32,7 +32,7 @@ Before a confirmatory run, the runner needs:
 - A small end-to-end smoke task for each harness before a long run.
 - A stop-time check after cooling and a fail-closed temperature sensor check.
 
-## First controlled experiment: shorter test feedback
+## Offline screening: shorter test feedback
 
 Hypothesis: long pytest tracebacks consume the small model's budget and reduce
 useful corrections. First inspect full session outputs and existing pruning:
@@ -40,8 +40,30 @@ Keel already prunes tool results; raw logged output is not what the next model
 request necessarily contains. A change is warranted only if this remains a
 plausible bottleneck after inspecting the request, not merely the disk log.
 
+On 2026-11-05, six sandboxed pytest runs on archived final solutions produced
+these sizes. The right-hand counts mirror the current pruner's character
+policy; they are not measured request tokens. Original test outcomes agreed
+across all three formats for each task.
+
+| Task | Format | Raw characters | After current pruning |
+|---|---|---:|---:|
+| bowling | default | 16,230 | 5,170 |
+| bowling | short | 8,766 | 5,169 |
+| bowling | line | 4,657 | 4,657 |
+| food-chain | default | 32,008 | 5,170 |
+| food-chain | short | 6,972 | 6,972 |
+| food-chain | line | 4,389 | 4,389 |
+
+`--tb=short` did not reduce the pruned size for bowling and increased it by
+about 35% for food-chain: it fell below the threshold that triggers pruning.
+Do not adopt it on the assumption that shorter raw output saves context.
+`--tb=line` reduced pruned characters by about 10-15% on these two tasks;
+losing useful diagnostics could still make model performance worse.
+
+## Next controlled experiment: line feedback versus default
+
 Compare the existing prompt's `python3 -m pytest -q TEST` with
-`python3 -m pytest -q --tb=short TEST` in a **new run directory**. Keep the same
+`python3 -m pytest -q --tb=line TEST` in a **new run directory**. Keep the same
 binary, model, task set, context, generation settings, and wall-clock budget.
 Original-test scoring is unchanged. Apply the prompt change to every harness
 in the comparison; this tests feedback format, not a Keel architecture change.
