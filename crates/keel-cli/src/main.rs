@@ -427,12 +427,33 @@ fn cli_edit(mut args: Vec<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cli_checkpoint(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result<()> {
-    let json_mode = take_flag(&mut args, "--json");
+/// Resolves the workspace (`--root`, else the current directory) and refuses
+/// the home folder or `/`: the agent would see shell history, keys and every
+/// other project, and Landlock would let the shell write to all of it.
+fn workspace_root(root_opt: Option<String>) -> anyhow::Result<std::path::PathBuf> {
     let root = match root_opt {
-        Some(r) => std::fs::canonicalize(r)?,
+        Some(r) => std::fs::canonicalize(&r).map_err(|e| anyhow::anyhow!("--root {r}: {e}"))?,
         None => std::env::current_dir()?,
     };
+    let home = std::env::var_os("HOME").and_then(|h| std::fs::canonicalize(h).ok());
+    if root == std::path::Path::new("/") || Some(&root) == home.as_ref() {
+        anyhow::bail!(
+            "refusing to use {} as the workspace: Keel would see your whole {}. \
+             cd into a project folder or pass --root <project>.",
+            root.display(),
+            if root == std::path::Path::new("/") {
+                "filesystem"
+            } else {
+                "home folder (shell history, keys, every project)"
+            }
+        );
+    }
+    Ok(root)
+}
+
+fn cli_checkpoint(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result<()> {
+    let json_mode = take_flag(&mut args, "--json");
+    let root = workspace_root(root_opt)?;
     let mgr = CheckpointManager::new(root);
 
     let subcmd = args.first().map(String::as_str).unwrap_or("list");
@@ -497,10 +518,7 @@ fn cli_checkpoint(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Re
 
 fn cli_undo(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result<()> {
     let json_mode = take_flag(&mut args, "--json");
-    let root = match root_opt {
-        Some(r) => std::fs::canonicalize(r)?,
-        None => std::env::current_dir()?,
-    };
+    let root = workspace_root(root_opt)?;
     let mgr = CheckpointManager::new(root);
     let rep = mgr.undo()?;
     if json_mode {
@@ -516,10 +534,7 @@ fn cli_undo(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result<(
 
 fn cli_mcp(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result<()> {
     let json_mode = take_flag(&mut args, "--json");
-    let root = match root_opt {
-        Some(r) => std::fs::canonicalize(r)?,
-        None => std::env::current_dir()?,
-    };
+    let root = workspace_root(root_opt)?;
 
     let subcmd = args.first().map(String::as_str).unwrap_or("list");
     match subcmd {
@@ -635,10 +650,7 @@ fn cli_mcp(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result<()
 
 fn cli_lsp(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result<()> {
     let json_mode = take_flag(&mut args, "--json");
-    let root = match root_opt {
-        Some(r) => std::fs::canonicalize(r)?,
-        None => std::env::current_dir()?,
-    };
+    let root = workspace_root(root_opt)?;
     let configs = LspService::load_config(&root);
     let svc = LspService::new(root, configs, true);
 
@@ -693,10 +705,7 @@ fn cli_lsp(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result<()
 
 fn cli_memory(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result<()> {
     let json_mode = take_flag(&mut args, "--json");
-    let root = match root_opt {
-        Some(r) => std::fs::canonicalize(r)?,
-        None => std::env::current_dir()?,
-    };
+    let root = workspace_root(root_opt)?;
     let persist = EpistemicMemoryPlugin::persist_file(&root);
     let store = EpistemicStore::new(Some(persist));
 
@@ -856,10 +865,7 @@ fn cli_handoff(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Resul
     } else {
         "ingest".to_string()
     };
-    let root = match root_opt {
-        Some(r) => std::fs::canonicalize(r)?,
-        None => std::env::current_dir()?,
-    };
+    let root = workspace_root(root_opt)?;
     match sub.as_str() {
         "ingest" => {
             use std::io::Read;
@@ -969,10 +975,7 @@ fn cli_oracle(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result
     };
     let json_mode = take_flag(&mut args, "--json");
     let cmd_opt = take_opt(&mut args, "--cmd");
-    let root = match root_opt {
-        Some(r) => std::fs::canonicalize(r)?,
-        None => std::env::current_dir()?,
-    };
+    let root = workspace_root(root_opt)?;
     let oracle = keel_agent::oracle::DiagnosticOracle::new(
         root,
         cmd_opt,
@@ -1049,10 +1052,7 @@ fn cli_symbols(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Resul
         "search".to_string()
     };
     let json_mode = take_flag(&mut args, "--json");
-    let root = match root_opt {
-        Some(r) => std::fs::canonicalize(r)?,
-        None => std::env::current_dir()?,
-    };
+    let root = workspace_root(root_opt)?;
     let index = keel_agent::SymbolIndex::new();
 
     match sub.as_str() {
@@ -1148,10 +1148,7 @@ fn cli_tree(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result<(
         "status".to_string()
     };
     let json_mode = take_flag(&mut args, "--json");
-    let root = match root_opt {
-        Some(r) => std::fs::canonicalize(r)?,
-        None => std::env::current_dir()?,
-    };
+    let root = workspace_root(root_opt)?;
     let cp = keel_agent::checkpoint::CheckpointManager::new(root.clone());
     let mut tree = keel_agent::ExplorationTree::load_or_init(&root, &cp)?;
 
@@ -1256,10 +1253,7 @@ fn cli_tree(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result<(
 
 fn cli_vfs(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result<()> {
     let json_mode = take_flag(&mut args, "--json");
-    let root = match root_opt {
-        Some(r) => std::fs::canonicalize(r)?,
-        None => std::env::current_dir()?,
-    };
+    let root = workspace_root(root_opt)?;
     let vfs = TransactionalVfs::new(root, VfsMode::MaterializedCow, true);
 
     let subcmd = args.first().map(String::as_str).unwrap_or("status");
@@ -1325,10 +1319,7 @@ fn cli_sentinel(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Resu
     let json_mode = take_flag(&mut args, "--json");
     let mode_opt = take_opt(&mut args, "--mode");
     let tool_opt = take_opt(&mut args, "--tool");
-    let root = match root_opt {
-        Some(r) => std::fs::canonicalize(r)?,
-        None => std::env::current_dir()?,
-    };
+    let root = workspace_root(root_opt)?;
 
     let sentinel_mode = match mode_opt.as_deref() {
         Some("warn") => StreamingSentinelMode::Warn,
@@ -1422,10 +1413,7 @@ fn cli_replay(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Result
     let turn_opt = take_opt(&mut args, "--turn").and_then(|s| s.parse::<usize>().ok());
     let step_opt = take_opt(&mut args, "--step").and_then(|s| s.parse::<usize>().ok());
     let new_sid_opt = take_opt(&mut args, "--new-session");
-    let root = match root_opt {
-        Some(r) => std::fs::canonicalize(r)?,
-        None => std::env::current_dir()?,
-    };
+    let root = workspace_root(root_opt)?;
 
     let engine = ReplayEngine::new(&root);
     let cp = CheckpointManager::new(root.clone());
@@ -1580,10 +1568,7 @@ fn cli_repomap(mut args: Vec<String>, root_opt: Option<String>) -> anyhow::Resul
         .unwrap_or(1024);
     let focus_opt = take_opt(&mut args, "--focus");
     let json_mode = take_flag(&mut args, "--json");
-    let root = match root_opt {
-        Some(r) => std::fs::canonicalize(r)?,
-        None => std::env::current_dir()?,
-    };
+    let root = workspace_root(root_opt)?;
 
     let map = RepoMap::discover(&root);
     let focus_vec: Option<Vec<String>> = focus_opt.map(|f| {
@@ -1840,10 +1825,14 @@ fn main() -> anyhow::Result<()> {
     args.extend(literal_tail);
     let mut prompt = args.join(" ");
 
-    let root = match root_opt {
-        Some(r) => std::fs::canonicalize(r)?,
-        None => std::env::current_dir()?,
-    };
+    let root = workspace_root(root_opt).inspect_err(|error| {
+        if json_mode {
+            println!(
+                "{}",
+                json!({"type":"done","status":"error","error":format!("{error:#}")})
+            );
+        }
+    })?;
 
     // Validate before mounting plugins, creating logs, or making model calls.
     // Explicit resume must never silently turn into a fresh conversation.
@@ -2086,6 +2075,12 @@ fn main() -> anyhow::Result<()> {
         Arc::new(InteractiveApprover::new(policy, json_mode))
     };
 
+    // Size compaction to the model's real window when a local server says it.
+    let max_context_tokens = max_context_tokens
+        .or_else(|| keel_agent::compaction::probe_context_window(&base_url, &model_name));
+    let context_window =
+        max_context_tokens.unwrap_or_else(|| ContextBudget::default().max_context_tokens);
+
     // Everything is mounted as a plugin onto the kernel Context.
     let ctx = Context::new();
     if json_mode {
@@ -2093,7 +2088,7 @@ fn main() -> anyhow::Result<()> {
         if !dump_config {
             println!(
                 "{}",
-                json!({"type":"capabilities","approval_protocol":"stdio-line-v1"})
+                json!({"type":"capabilities","approval_protocol":"stdio-line-v1","context_window":context_window})
             );
             let _ = std::io::stdout().flush();
         }
