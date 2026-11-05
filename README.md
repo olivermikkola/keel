@@ -87,6 +87,12 @@ Tested locally on Vulkan (`llama-server`) across **Huihui Qwen3.8 27B (`Q4_K_M`,
 5. **M4, frontends:** TUI session cockpit (done), ACP server, SDK JSON-RPC, Helm integration.
 6. **M5, extras:** LSP, worktree isolation per thread, scheduling/jobs, goal mode, cost meter.
 
+## Contributing
+
+Agents and humans: read [AGENTS.md](AGENTS.md) first. Every PR needs a real-run
+`## Proof`, stays under 600 changed lines and adds no new modules without
+approval; the `PR gate` CI job enforces this.
+
 ## Layout
 
 ```
