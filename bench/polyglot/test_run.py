@@ -157,6 +157,18 @@ class SandboxTests(unittest.TestCase):
         self.assertEqual(row["outcome"], "completed")
         self.assertFalse(row["passed"])
 
+    def test_nonterminating_candidate_is_unsolved_not_infrastructure_failure(self):
+        code = "import time\ndef answer():\n    time.sleep(30)\n    return 42\n"
+        with patch.object(runner, "SCORE_TIMEOUT", .5):
+            row = self.run_agent(f"from pathlib import Path; Path('solution.py').write_text({code!r})")
+        self.assertEqual(row["outcome"], "completed")
+        self.assertFalse(row["passed"])
+        self.assertEqual(row["score_exit"], "timeout")
+        artifact = self.out / row["artifact"]
+        self.assertEqual((artifact / "score/solution.py").read_text(), code)
+        self.assertTrue((artifact / "score.stdout").is_file())
+        self.assertTrue((artifact / "score.stderr").is_file())
+
     def test_scoring_infrastructure_failure_stays_separate(self):
         real_run = subprocess.run
         def fail_score(cmd, **kwargs):

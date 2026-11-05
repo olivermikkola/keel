@@ -66,3 +66,12 @@ report that explicitly; it does not establish whether enforced scheduling works.
 This experiment takes priority over the earlier traceback-format proposal in
 DECISIONS.md. No swarm, tree, cascade or other architecture expansion follows
 from this pilot.
+
+The first isolated screen stopped after its guided affine-cipher candidate
+appended to the same list it was iterating over in `decode`, causing tests to
+hang. The original runner misclassified the grading timeout as infrastructure.
+Those raw attempts remain preserved in `test-after-edit`. The corrected
+`keel-test-after-edit-v2` protocol counts grading-budget exhaustion as unsolved;
+use a new output directory, not a rewrite of the original results. The next
+screen uses one pair per task (`--repeat 1`) before the 19:30 cutoff; repetitions
+and confirmation remain necessary before promoting a production change.
