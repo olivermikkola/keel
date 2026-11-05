@@ -8,7 +8,8 @@
 //!
 //! Env: KEEL_THINKING=0 disables model thinking (Qwen templates). KEEL_BASE_URL (default https://api.deepseek.com), KEEL_API_KEY (or DEEPSEEK_API_KEY),
 //! KEEL_MODEL (default deepseek-chat). Flags: --yolo (allow mutating tools), --no-sandbox (disable Landlock), --log <file>.
-//! Default policy is read-only: mutating tools are denied unless --yolo is given.
+//! Default policy is `standard`: workspace edits are auto-allowed, shell and
+//! sensitive paths ask on stdin. --read-only denies all mutation, --yolo allows all.
 
 use anyhow::Context as _;
 use keel_agent::Chunk;
