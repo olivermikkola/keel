@@ -9,8 +9,8 @@ public [polyglot benchmark](https://github.com/Aider-AI/polyglot-benchmark)
 
 - Same model (`bonsai-9b`, llama-server at `127.0.0.1:8080`, 16k context),
   same prompt, same time limit (default 300 s) for every harness.
-- Agents get the stub, the test file and `.docs/`. Never `.meta/`: it holds
-  the reference solution.
+- Task copies contain the stub, test file and `.docs/`, excluding `.meta/`
+  reference solutions. This does not enforce read isolation; see below.
 - A task passes only if the **original** test file passes (restored before
   scoring); `tampered_test` records if an agent edited it.
 - Every harness and the scoring run inside the same **bubblewrap** sandbox:
@@ -60,3 +60,24 @@ several runs per task, not one.
 
 Keel bugs the pilot found: a context overflow killed a whole task with a bare
 `status code 400` (fixed in #58: show the server's message, compact and retry).
+
+## Inspect a running benchmark
+
+```bash
+python3 bench/polyglot/analyze.py /path/to/run \
+  --sessions /path/to/keel/sessions/*.jsonl
+python3 bench/polyglot/analyze.py /path/to/run --json
+python3 -m unittest discover -s bench/polyglot -p 'test_*.py'
+```
+
+Analysis reads files only. Redirect stdout to a separate file if you want a
+saved report. It compares complete exercise/repetition blocks, keeps missing
+test counts unknown, rejects duplicate attempts, and tolerates a live writer's
+incomplete final JSON record with a warning. Session metrics are separate from
+attempts because the legacy runner does not record a session identifier.
+
+The current sandbox isolates **writes**, not reads: `.meta` is omitted from
+the task copy but remains reachable in the original dataset by absolute path.
+Treat the current comparison as exploratory. See [DECISIONS.md](DECISIONS.md)
+for the next controlled experiment and the evidence required before changing
+the agent architecture.
