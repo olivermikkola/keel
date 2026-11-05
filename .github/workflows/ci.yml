@@ -47,6 +47,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Check benchmark analysis
+        run: python3 -m unittest discover -s bench/polyglot -p 'test_*.py'
+
       - name: Run Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 

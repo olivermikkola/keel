@@ -6,6 +6,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 run() { echo "=== $*"; nice -n 19 "$@"; }
 
+run python3 -m unittest discover -s bench/polyglot -p 'test_*.py'
 run cargo fmt --all -- --check
 run cargo clippy --locked -j 2 --all-targets -- -D warnings
 run cargo test --locked -j 2 -- --test-threads=2
