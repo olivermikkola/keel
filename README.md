@@ -1,4 +1,4 @@
-# keel (placeholder name)
+# keel
 
 A **Rust CLI coding-agent harness** aimed at making **small local models**
 (2–27B, e.g. Bonsai and Qwen on llama.cpp) do useful coding work. Private, early.
@@ -12,8 +12,8 @@ A **Rust CLI coding-agent harness** aimed at making **small local models**
   `keel --dump-config`). There is no config file or profile system yet.
 - **One provider: OpenAI-compatible chat completions** (llama.cpp, Lemonade,
   DeepSeek, OmniRoute, ...). No native Anthropic or Gemini adapters.
-- **Append-only JSONL session log**, which [Helm](https://github.com/olivermikkola/helm-gateway)
-  tails as one of its harnesses.
+- **Append-only JSONL session log**, which [MoE-Deck](https://github.com/olivermikkola/moedeck)
+  can tail as one of its harnesses.
 - **Safety:** Linux Landlock confines `shell` (writes only in the workspace
   and `/tmp`), file tools are confined to the workspace. Default policy
   `standard`: workspace edits are auto-allowed, `shell` asks first (`--read-only`,
