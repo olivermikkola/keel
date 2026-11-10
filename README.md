@@ -1,7 +1,11 @@
-# keel
+<img src="docs/brand/mark.svg" width="64" height="64" alt="Keel jade and rust sail" />
+
+# Keel
 
 A **Rust CLI coding-agent harness** aimed at making **small local models**
 (2–27B, e.g. Bonsai and Qwen on llama.cpp) do useful coding work. Private, early.
+
+[Visual identity and icon assets](docs/brand/README.md).
 
 ## What is true today
 
