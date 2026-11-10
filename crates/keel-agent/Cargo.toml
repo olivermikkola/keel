@@ -10,6 +10,6 @@ keel-kernel = { path = "../keel-kernel" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
-ureq = { version = "2", features = ["json"] }
+ureq = { version = "3", features = ["json"] }
 landlock = "0.4"
 libc = "0.2"
