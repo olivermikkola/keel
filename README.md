@@ -7,6 +7,15 @@ A **Rust CLI coding-agent harness** aimed at making **small local models**
 
 [Visual identity and icon assets](docs/brand/README.md).
 
+## First 60 seconds
+
+```bash
+cargo build --release
+export DEEPSEEK_API_KEY=...        # or KEEL_BASE_URL / KEEL_API_KEY / KEEL_MODEL for any compatible API
+./target/release/keel "explain this repo"           # run inside a project folder; edits auto-allowed, shell asks first
+./target/release/keel tui --model bonsai-9b         # session-centric terminal cockpit
+```
+
 ## What is true today
 
 - **Plugin kernel.** A small `keel-kernel` hosts services, typed events and
@@ -35,7 +44,8 @@ epistemic memory, swarm/handoff, exploration tree, speculate, cascade,
 replay/recorder, and the daemon. The open question that decides whether Keel
 is worth more work: **does it beat other harnesses (OpenCode, Aider, Codex
 CLI) with the same small local model on a real benchmark?** `keel bench`
-today is 9 toy tasks and cannot answer that.
+today is 9 toy tasks; full reproducible evaluations live in
+[Keel Arena](https://github.com/olivermikkola/keel-arena).
 
 ## Terminal cockpit (`keel tui`)
 
@@ -107,10 +117,18 @@ Tested locally on Vulkan (`llama-server`) across **Huihui Qwen3.8 27B (`Q4_K_M`,
 
 1. **Reliable basics:** agent loop, tools, sandbox, approvals, resume and
    compaction work in real runs with small local models.
-2. **Honest benchmark:** a slice of a public benchmark (Terminal-Bench or
-   SWE-bench Lite), Keel vs. other harnesses, same model.
+2. **Honest benchmark:** evaluate Keel vs. other harnesses and small local models
+   across the 7-suite gauntlet in [Keel Arena](https://github.com/olivermikkola/keel-arena)
+   and Harbor-isolated tasks.
 3. Only then: config-driven plugin profiles, native providers, unfreezing
    modules that the benchmark shows are worth it.
+
+## Ecosystem
+
+- [**Keel Arena**](https://github.com/olivermikkola/keel-arena) — Reproducible Edge AI & coding-agent benchmarks (7-suite gauntlet, frontier LLM judge, hardware profiling).
+- [**Keel Desktop**](https://github.com/olivermikkola/keel-desktop) — Tauri 2 local AI desktop workspace built on Keel's small-model harness.
+- [**Keel Mobile**](https://github.com/olivermikkola/keel-mobile) — On-device iOS local coding & assistant app.
+- [**MoE Deck**](https://github.com/olivermikkola/moedeck-community) — Multi-harness cockpit and PWA that tails `~/.keel/sessions/*.jsonl`.
 
 ## Contributing
 
