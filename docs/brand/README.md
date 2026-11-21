@@ -39,6 +39,10 @@ canvas in a browser. The supplied PNGs were rendered headlessly in Chromium.
 
 ## Product family
 
+Positioning is canonical in [VISION.md](../VISION.md): the Keel CLI is the
+coding agent (the Claude Code role); Keel Desktop is the everyday app (the
+Claude Desktop role) whose Code mode is the Keel CLI.
+
 | Product | Surface | Role |
 | --- | --- | --- |
 | **Keel** | CLI & TUI (`keel`) | Core Rust coding-agent harness for small local models |

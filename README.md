@@ -5,7 +5,7 @@
 A **Rust CLI coding-agent harness** aimed at making **small local models**
 (2–27B, e.g. Bonsai and Qwen on llama.cpp) do useful coding work. Private, early.
 
-[Visual identity, palette & Keel family](docs/brand/README.md) · [moesystems.com/keel](https://moesystems.com/keel/).
+[Product vision](docs/VISION.md) · [Visual identity, palette & Keel family](docs/brand/README.md) · [moesystems.com/keel](https://moesystems.com/keel/).
 
 ## First 60 seconds
 
