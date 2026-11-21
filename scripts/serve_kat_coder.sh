@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Launch local Kat-Coder v2.5 on AMD Strix Point iGPU with Vulkan acceleration
+# Usage: MODEL_PATH=/path/to/model.gguf LLAMA_BUILD=/path/to/llama.cpp/build/bin \
+#        ./scripts/serve_kat_coder.sh
 
 set -euo pipefail
 
-MODEL_PATH="${MODEL_PATH:-/home/olivermikkola/Models/Kwaipilot_KAT-Coder-V2.5-Dev-Q4_K_M.gguf}"
-LLAMA_BUILD="${LLAMA_BUILD:-/home/olivermikkola/Projects/llama.cpp/build/bin}"
+MODEL_PATH="${MODEL_PATH:?Set MODEL_PATH to a Kat-Coder (or any chat) .gguf file}"
+LLAMA_BUILD="${LLAMA_BUILD:?Set LLAMA_BUILD to your llama.cpp build/bin directory}"
 PORT="${PORT:-8085}"
 CTX="${CTX:-16384}"
 NGL="${NGL:-99}"
