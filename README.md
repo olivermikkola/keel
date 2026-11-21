@@ -2,50 +2,48 @@
 
 # Keel
 
-A **Rust CLI coding-agent harness** aimed at making **small local models**
-(2–27B, e.g. Bonsai and Qwen on llama.cpp) do useful coding work. Private, early.
+[![CI](https://github.com/olivermikkola/keel/actions/workflows/ci.yml/badge.svg)](https://github.com/olivermikkola/keel/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-[Product vision](docs/VISION.md) · [Visual identity, palette & Keel family](docs/brand/README.md) · [moesystems.com/keel](https://moesystems.com/keel/).
+**A coding agent that runs on small local models — in your terminal.**
+Point Keel at a model on your own machine (2–27B, e.g. Bonsai or Qwen on
+llama.cpp), say what you want changed, and it reads, edits and tests code
+while you approve the risky parts. Think Claude Code, except the model is
+yours and nothing has to leave your machine.
 
-## First 60 seconds
+[Product vision](docs/VISION.md) · [Visual identity & Keel family](docs/brand/README.md) · [moesystems.com/keel](https://moesystems.com/keel/)
+
+## What it does
+
+- **Edits your project.** Reads files, searches code, applies patches, runs
+  shell commands — inside the folder you point it at, nowhere else.
+- **You approve, the model asks.** Workspace edits are auto-allowed by
+  default; shell commands ask first. `--read-only`, `--safety-mode safe` and
+  `--yolo` change that. Keel refuses `~` or `/` as a workspace.
+- **Remembers the conversation.** Every run appends to a JSONL session log
+  you can resume later — from the CLI, the TUI, or another tool.
+- **Works with weak models.** Text-format tool-call fallback, repeat-tool
+  reminders, and compaction sized to your server's real context window keep
+  2–9B models on task.
+- **Has a full terminal cockpit.** `keel tui`: past sessions on the left,
+  the live run in the middle, model/safety/token status on the right.
+
+## Try it in 60 seconds
 
 ```bash
 cargo build --release
-export DEEPSEEK_API_KEY=...        # or KEEL_BASE_URL / KEEL_API_KEY / KEEL_MODEL for any compatible API
-./target/release/keel "explain this repo"           # run inside a project folder; edits auto-allowed, shell asks first
-./target/release/keel tui --model bonsai-9b         # session-centric terminal cockpit
+
+# Local model (llama-server, Ollama, LM Studio — any OpenAI-compatible API):
+export KEEL_BASE_URL=http://localhost:8080/v1 KEEL_MODEL=bonsai-9b
+./target/release/keel "explain this repo"        # run inside a project folder
+
+# Or a hosted compatible API:
+export DEEPSEEK_API_KEY=...
+./target/release/keel "fix the failing test"
+
+./target/release/keel tui                        # the terminal cockpit
+./target/release/keel bench --runs 3             # smoke-test your model + harness
 ```
-
-## What is true today
-
-- **Plugin kernel.** A small `keel-kernel` hosts services, typed events and
-  reversible effects; the model adapter, tools, session log, sandbox,
-  approvals, compaction and agent loop are plugins mounted on it. The plugin
-  set is **hardcoded** in `keel-cli` (all of them mount on every run; see
-  `keel --dump-config`). There is no config file or profile system yet.
-- **One provider: OpenAI-compatible chat completions** (llama.cpp, Lemonade,
-  DeepSeek, OmniRoute, ...). No native Anthropic or Gemini adapters.
-- **Append-only JSONL session log**, which [MoE-Deck](https://github.com/olivermikkola/moedeck)
-  can tail as one of its harnesses.
-- **Safety:** Linux Landlock confines `shell` (writes only in the workspace
-  and `/tmp`), file tools are confined to the workspace. Default policy
-  `standard`: workspace edits are auto-allowed, `shell` asks first (`--read-only`,
-  `--safety-mode safe`, `--yolo` change this). There is
-  a line-based approval protocol on stdin, and Keel refuses `~` or `/` as the
-  workspace. No seccomp.
-- **Weak-model help:** `<tool_call>` text fallback, repeat-tool reminders,
-  compaction sized to the server's real context window.
-
-## Direction
-
-Fix the basics before adding features (see [AGENTS.md](AGENTS.md)). Many
-modules were added quickly and are **frozen** until the core is solid:
-epistemic memory, swarm/handoff, exploration tree, speculate, cascade,
-replay/recorder, and the daemon. The open question that decides whether Keel
-is worth more work: **does it beat other harnesses (OpenCode, Aider, Codex
-CLI) with the same small local model on a real benchmark?** `keel bench`
-today is 9 toy tasks; full reproducible evaluations live in
-[Keel Arena](https://github.com/olivermikkola/keel-arena).
 
 ## Terminal cockpit (`keel tui`)
 
@@ -65,10 +63,6 @@ keel tui --model bonsai-9b "explain this repo"   # start with a prompt
   and turn summaries render as they arrive.
 - **Session log is the source of truth:** the log book loads
   `~/.keel/sessions/*.jsonl`; closing the TUI never deletes a wake.
-- **Command palette:** `Ctrl-P` or `:`.
-- **Model picker:** `m` (Bonsai 2B/4B/9B/27B, Qwen, Kat, DeepSeek).
-- **Details:** `d` expands reasoning/tool output; `v` toggles the ship rail.
-- **Interrupt:** `x`, or `Esc` from the wake pane.
 
 | Key | Action |
 |---|---|
@@ -76,32 +70,21 @@ keel tui --model bonsai-9b "explain this repo"   # start with a prompt
 | `j` / `k`, `↑` / `↓` | move or scroll |
 | `Enter` | send, or queue while running |
 | `Esc` | leave composer / interrupt from the wake |
-| `n` | new wake (new session log) |
-| `s` | focus log book |
-| `/` | search log book |
+| `n` / `s` / `/` | new wake / focus log book / search log book |
 | `d` / `v` | details / ship rail |
 | `D` | review the workspace git diff |
 | `y` / `a` / `n` | approval: allow once / always / deny |
-| `m` | model picker |
+| `m` | model picker (Bonsai 2B/4B/9B/27B, Qwen, Kat, DeepSeek) |
 | `Ctrl-P`, `:` | command palette |
 | `x` | interrupt |
-| `?` | help |
-| `q`, `Ctrl-C` | quit |
+| `?` / `q` | help / quit (`Ctrl-C` also quits) |
 
-## Quick start
+## Does it actually work? (`keel bench`)
 
-```bash
-export DEEPSEEK_API_KEY=...        # or KEEL_BASE_URL / KEEL_API_KEY / KEEL_MODEL for any compatible API
-keel "explain this repo"           # run inside a project folder; edits auto-allowed there, shell asks first
-keel --yolo --log s.jsonl "fix the failing test"
-keel bench --runs 3                # multi-run coding benchmark with thinking-token meter
-```
-
-## Benchmark (`keel bench`)
-
-9 small toy tasks (create a file, rename a function, fix an obvious bug), 2 runs
-each. Useful as a smoke test for a model + harness pair; it is **not**
-comparable to public benchmarks and does not show Keel beats anything.
+9 small tasks (create a file, rename a function, fix an obvious bug), 2 runs
+each. A smoke test for a model + harness pair — **not** comparable to public
+benchmarks, and it does not show Keel beats anything. Full reproducible
+evaluations live in [Keel Arena](https://github.com/olivermikkola/keel-arena).
 
 Tested locally on Vulkan (`llama-server`) across **Huihui Qwen3.8 27B (`Q4_K_M`, 21 GB)** and the full **PrismML Ternary Bonsai 2 (`Q2_0`)** family (**2B, 4B, 9B, 27B**):
 
@@ -113,39 +96,28 @@ Tested locally on Vulkan (`llama-server`) across **Huihui Qwen3.8 27B (`Q4_K_M`,
 | **Ternary-Bonsai-2-27B (`Q2_0`)** | 7.2 GB | **12/12 (100%)** | 2/2 (14.8s) | 2/2 (10.8s) | 2/2 (33.1s) | 2/2 (62.9s) | 2/2 (9.8s) | 2/2 (131.4s) |
 | **Qwen3.8-27B-abliterated (`Q4_K_M`)** | 21.0 GB | **6/6 (100%)** | 1/1 (55.5s) | 1/1 (23.6s) | 1/1 (67.1s) | 1/1 (144.5s) | 1/1 (24.0s) | 1/1 (300.4s) |
 
-## Roadmap
+## Under the hood
 
-1. **Reliable basics:** agent loop, tools, sandbox, approvals, resume and
-   compaction work in real runs with small local models.
-2. **Honest benchmark:** evaluate Keel vs. other harnesses and small local models
-   across the 7-suite gauntlet in [Keel Arena](https://github.com/olivermikkola/keel-arena)
-   and Harbor-isolated tasks.
-3. Only then: config-driven plugin profiles, native providers, unfreezing
-   modules that the benchmark shows are worth it.
-
-## Ecosystem
-
-- [**Keel Arena**](https://github.com/olivermikkola/keel-arena) — Reproducible Edge AI & coding-agent benchmarks (7-suite gauntlet, frontier LLM judge, hardware profiling).
-- [**Keel Desktop**](https://github.com/olivermikkola/keel-desktop) — Tauri 2 local AI desktop workspace built on Keel's small-model harness.
-- [**Keel Mobile**](https://github.com/olivermikkola/keel-mobile) — On-device iOS local coding & assistant app.
-- [**MoE Deck**](https://github.com/olivermikkola/moedeck-community) — Multi-harness cockpit and PWA that tails `~/.keel/sessions/*.jsonl`.
-
-## Contributing
-
-Agents and humans: read [AGENTS.md](AGENTS.md) first. Every PR needs a real-run
-`## Proof`, stays under 600 changed lines and adds no new modules without
-approval; the `PR gate` CI job enforces this.
-
-## Layout
+- **Plugin kernel.** A small `keel-kernel` hosts services, typed events and
+  reversible effects; the model adapter, tools, session log, sandbox,
+  approvals, compaction and agent loop are plugins mounted on it. The plugin
+  set is **hardcoded** in `keel-cli` (all of them mount on every run; see
+  `keel --dump-config`). There is no config file or profile system yet.
+- **One provider: OpenAI-compatible chat completions** (llama.cpp, Lemonade,
+  DeepSeek, OmniRoute, ...). No native Anthropic or Gemini adapters.
+- **Safety:** Linux Landlock confines `shell` (writes only in the workspace
+  and `/tmp`); file tools are confined to the workspace. No seccomp.
+- **Append-only JSONL session log**, which [MoE-Deck](https://github.com/olivermikkola/moedeck)
+  can tail as one of its harnesses.
 
 ```
 crates/keel-kernel   plugin kernel (Context, Plugin, Scope, effects)
 crates/keel-agent    agent loop, tools, Landlock sandbox, OpenAI/DeepSeek provider
-crates/keel-cli      `keel` binary + `keel bench` harness benchmark suite
+crates/keel-cli      `keel` binary, `keel tui` cockpit, `keel bench` suite
 docs/REFERENCES.md   what we study and borrow, with licenses
 ```
 
-## Resuming a conversation
+### Resuming a conversation
 
 `keel run --resume session.jsonl "continue"` loads the complete saved conversation
 before mounting runtime plugins or calling the model. Missing, empty, malformed,
@@ -154,7 +126,7 @@ use a truncated prefix. In `--json` mode, this returns a `done` event with
 `status: "error"` and exits unsuccessfully. The source log is left unchanged.
 Use a valid log, or omit `--resume` to deliberately start a new conversation.
 
-## JSON approval requests
+### JSON approval requests (for GUIs and parent tools)
 
 One-shot `keel run --json` advertises `approval_protocol: "stdio-line-v1"` in a
 `capabilities` event. A `tool_call` event is progress, not a permission request.
@@ -170,3 +142,42 @@ command waits for the decision. EOF or a failed request write denies the call.
 Reads, policy-authorized calls, read-only rejections, and previously authorized
 calls do not emit an approval request. Parents should scope every response to
 its current subprocess/run and never infer a request from ordinary tool progress.
+
+## Status & roadmap
+
+Early, and honest about it. The basics come before features (see
+[AGENTS.md](AGENTS.md)); many modules are **frozen** until the core is solid:
+epistemic memory, swarm/handoff, exploration tree, speculate, cascade,
+replay/recorder, and the daemon.
+
+1. **Reliable basics:** agent loop, tools, sandbox, approvals, resume and
+   compaction work in real runs with small local models.
+2. **Honest benchmark:** Keel vs. other harnesses, same small model, across
+   the 7-suite gauntlet in [Keel Arena](https://github.com/olivermikkola/keel-arena).
+3. Only then: config-driven plugin profiles, native providers, unfreezing
+   modules that the benchmark shows are worth it.
+
+## The Keel family
+
+One engine, focused surfaces. The canonical positioning is in
+[docs/VISION.md](docs/VISION.md): **Keel is the coding agent (the Claude Code
+role); Keel Desktop is the everyday app (the Claude Desktop role) whose Code
+mode is this CLI.**
+
+| Product | What it is |
+| --- | --- |
+| **Keel** (this repo) | CLI + TUI coding-agent harness for small local models |
+| [Keel Desktop](https://github.com/olivermikkola/keel-desktop) | Everyday local-AI app for macOS/Linux/Windows: Chat, Work, Images, and Code powered by this CLI |
+| [Keel Mobile](https://github.com/olivermikkola/keel-mobile) | Standalone on-device iPhone agent — the model runs on the phone |
+| [Keel Console](https://github.com/olivermikkola/keel-xbox) | Living-room app for Xbox / TV |
+| [Keel Arena](https://github.com/olivermikkola/keel-arena) | Public benchmarks and scorecards — the proof layer |
+
+## Contributing
+
+Agents and humans: read [AGENTS.md](AGENTS.md) first. Every PR needs a real-run
+`## Proof`, stays under 600 changed lines and adds no new modules without
+approval; the `PR gate` CI job enforces this.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
