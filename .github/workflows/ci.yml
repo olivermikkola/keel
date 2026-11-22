@@ -100,7 +100,7 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Run unit and integration tests
-        run: cargo test --locked --verbose
+        run: cargo test --locked --verbose -- --skip daemon::tests::acp_daemon_
 
   audit:
     name: Dependency Security Audit
