@@ -2089,7 +2089,7 @@ fn main() -> anyhow::Result<()> {
         if !dump_config {
             println!(
                 "{}",
-                json!({"type":"capabilities","approval_protocol":"stdio-line-v1","context_window":context_window})
+                json!({"type":"capabilities","approval_protocol":"stdio-line-v1","stop_protocol":if cfg!(unix) {Some("sigint-shell-v1")} else {None},"context_window":context_window})
             );
             let _ = std::io::stdout().flush();
         }

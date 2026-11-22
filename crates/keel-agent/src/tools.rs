@@ -2,7 +2,7 @@
 //! All paths are confined to a root, and `shell` enforces Linux Landlock when enabled.
 
 use crate::sandbox::{SandboxPolicy, ToolRegistry};
-use crate::{Tool, ToolSpec};
+use crate::{CancelToken, Tool, ToolSpec};
 use anyhow::{bail, Context as _, Result};
 use keel_kernel::{Plugin, Scope};
 use serde_json::{json, Value};
@@ -72,9 +72,20 @@ pub fn read_pipe_capped<R: Read>(mut pipe: R) -> Vec<u8> {
 /// On Unix the child leads its own process group and the whole group is killed on
 /// timeout, so grandchildren cannot outlive the call. Stdin is closed.
 pub fn run_command_bounded(
-    mut cmd: std::process::Command,
+    cmd: std::process::Command,
     timeout: std::time::Duration,
 ) -> Result<std::process::Output> {
+    run_command_cancellable(cmd, timeout, None)
+}
+
+fn run_command_cancellable(
+    mut cmd: std::process::Command,
+    timeout: Duration,
+    cancel: Option<&CancelToken>,
+) -> Result<std::process::Output> {
+    if cancel.is_some_and(CancelToken::is_cancelled) {
+        bail!("command stopped by user");
+    }
     use std::process::Stdio;
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -92,19 +103,19 @@ pub fn run_command_bounded(
 
     let start = std::time::Instant::now();
     let status = loop {
+        if cancel.is_some_and(CancelToken::is_cancelled) {
+            kill_process_group(&mut child);
+            bail!("command stopped by user");
+        }
         match child.try_wait() {
-            Ok(Some(st)) => break st,
-            Ok(None) if start.elapsed() > timeout => {
+            Ok(Some(st)) if out_t.is_finished() && err_t.is_finished() => break st,
+            Ok(_) if start.elapsed() > timeout => {
                 kill_process_group(&mut child);
-                let _ = out_t.join();
-                let _ = err_t.join();
                 bail!("command timed out after {}s", timeout.as_secs());
             }
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Ok(_) => std::thread::sleep(Duration::from_millis(20)),
             Err(e) => {
                 kill_process_group(&mut child);
-                let _ = out_t.join();
-                let _ = err_t.join();
                 return Err(e).context("waiting on command");
             }
         }
@@ -802,6 +813,7 @@ pub struct Shell {
     pub sandbox: SandboxPolicy,
     pub timeout: Duration,
     pub allow_protected: bool,
+    cancel: Option<CancelToken>,
 }
 
 impl Shell {
@@ -811,6 +823,7 @@ impl Shell {
             root,
             timeout: Duration::from_secs(120),
             allow_protected: false,
+            cancel: None,
         }
     }
 
@@ -877,7 +890,7 @@ impl Tool for Shell {
             .map(Duration::from_secs)
             .unwrap_or(self.timeout);
 
-        let out = run_command_bounded(cmd, timeout)?;
+        let out = run_command_cancellable(cmd, timeout, self.cancel.as_ref())?;
 
         Ok(truncate_shell(format!(
             "exit: {}\nstdout:\n{}\nstderr:\n{}",
@@ -968,6 +981,7 @@ impl Plugin for BuiltinToolsPlugin {
             sandbox: sandbox_policy,
             timeout: Duration::from_secs(120),
             allow_protected,
+            cancel: scope.context().service::<CancelToken>().as_deref().cloned(),
         }));
         scope.provide(reg);
     }
@@ -1264,11 +1278,31 @@ mod tests {
     #[test]
     fn bounded_runner_times_out_and_kills_group() {
         let mut cmd = std::process::Command::new("sh");
-        cmd.args(["-c", "sleep 30 & sleep 30"]);
+        // Exiting the shell does not close pipes inherited by its child.
+        cmd.args(["-c", "sleep 30 & exit 0"]);
         let t = std::time::Instant::now();
         let err = run_command_bounded(cmd, std::time::Duration::from_millis(300)).unwrap_err();
         assert!(format!("{err:#}").contains("timed out"), "{err:#}");
         assert!(t.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_runner_obeys_cancellation_during_an_approved_command() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "sleep 30 & wait"]);
+        let token = CancelToken::new();
+        let sender = token.clone();
+        let signal = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            sender.cancel();
+        });
+        let started = std::time::Instant::now();
+        let failure =
+            run_command_cancellable(cmd, Duration::from_secs(6), Some(&token)).unwrap_err();
+        signal.join().unwrap();
+        assert_eq!(failure.to_string(), "command stopped by user");
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     #[test]
