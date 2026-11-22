@@ -28,9 +28,15 @@ yours and nothing has to leave your machine.
 - **Has a full terminal cockpit.** `keel tui`: past sessions on the left,
   the live run in the middle, model/safety/token status on the right.
 
-## Try it in 60 seconds
+## Build and try Keel
+
+Install a stable [Rust toolchain](https://rustup.rs/). For local inference, start
+an OpenAI-compatible server and load a compatible model first. The example uses
+`llama-server` on port 8080 and the server's model alias `bonsai-9b`.
 
 ```bash
+git clone https://github.com/olivermikkola/keel.git
+cd keel
 cargo build --release
 
 # Local model (llama-server, Ollama, LM Studio — any OpenAI-compatible API):
@@ -107,7 +113,7 @@ Tested locally on Vulkan (`llama-server`) across **Huihui Qwen3.8 27B (`Q4_K_M`,
   DeepSeek, OmniRoute, ...). No native Anthropic or Gemini adapters.
 - **Safety:** Linux Landlock confines `shell` (writes only in the workspace
   and `/tmp`); file tools are confined to the workspace. No seccomp.
-- **Append-only JSONL session log**, which [MoE-Deck](https://github.com/olivermikkola/moedeck)
+- **Append-only JSONL session log**, which [MoE Deck](https://github.com/olivermikkola/moedeck-community)
   can tail as one of its harnesses.
 
 ```
@@ -168,7 +174,8 @@ mode is this CLI.**
 | --- | --- |
 | **Keel** (this repo) | CLI + TUI coding-agent harness for small local models |
 | [Keel Desktop](https://github.com/olivermikkola/keel-desktop) | Everyday local-AI app for macOS/Linux/Windows: Chat, Work, Images, and Code powered by this CLI |
-| [Keel Mobile](https://github.com/olivermikkola/keel-mobile) | Standalone on-device iPhone agent — the model runs on the phone |
+| [Keel Mobile](https://moesystems.com/keel-mobile/) | Standalone on-device iPhone agent — the model runs on the phone |
+| [Keel Mobile for Android](https://github.com/olivermikkola/keel-mobile-android) | On-device Android agent, source-build pre-alpha |
 | [Keel Console](https://github.com/olivermikkola/keel-xbox) | Living-room app for Xbox / TV |
 | [Keel Arena](https://github.com/olivermikkola/keel-arena) | Public benchmarks and scorecards — the proof layer |
 
