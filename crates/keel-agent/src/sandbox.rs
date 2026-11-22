@@ -14,13 +14,29 @@
 
 use crate::Tool;
 use anyhow::Result;
+#[cfg(target_os = "linux")]
 use landlock::{
     Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
     ABI,
 };
 use std::collections::HashSet;
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Identifies the OS-level shell confinement mechanism available on this platform.
+pub fn platform_sandbox_kind() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "landlock"
+    } else if cfg!(target_os = "macos") {
+        if Path::new("/usr/bin/sandbox-exec").is_file() {
+            "seatbelt"
+        } else {
+            "none"
+        }
+    } else {
+        "none"
+    }
+}
 
 /// Default device nodes that should be accessible for standard I/O redirection.
 pub const DEFAULT_DEVICE_NODES: &[&str] = &[
@@ -188,10 +204,94 @@ impl SandboxPolicy {
         paths
     }
 
+    /// Build a macOS Seatbelt (SBPL) profile that permits reads/execs while restricting
+    /// file writes to `self.write_paths()` and standard character devices.
+    pub fn seatbelt_profile(&self) -> String {
+        let mut lines = vec![
+            "(version 1)".to_string(),
+            "(allow default)".to_string(),
+            "(deny file-write*)".to_string(),
+            "(allow file-write* (literal \"/dev/null\") (literal \"/dev/tty\") (literal \"/dev/zero\") (literal \"/dev/dtracehelper\"))".to_string(),
+        ];
+        let mut seen = HashSet::new();
+        for path in self.write_paths() {
+            let mut variants = vec![path.clone()];
+            if let Ok(canon) = std::fs::canonicalize(&path) {
+                if canon != path {
+                    variants.push(canon);
+                }
+            }
+            for variant in variants {
+                let raw = variant.to_string_lossy().to_string();
+                if seen.insert(raw.clone()) {
+                    let escaped = raw.replace('\\', "\\\\").replace('"', "\\\"");
+                    lines.push(format!("(allow file-write* (subpath \"{escaped}\"))"));
+                }
+            }
+        }
+        lines.join("\n")
+    }
+
+    /// Construct a shell command confined according to `self` on the current platform.
+    /// Fails closed if `self.enabled` is true and no verified OS confinement exists.
+    pub fn build_shell_command(&self, cmd_str: &str, root: &Path) -> Result<std::process::Command> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::process::CommandExt;
+            let policy = self.clone();
+            let mut cmd = std::process::Command::new("sh");
+            cmd.arg("-c").arg(cmd_str).current_dir(root);
+            unsafe {
+                cmd.pre_exec(move || {
+                    policy
+                        .restrict_current_thread()
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))
+                });
+            }
+            Ok(cmd)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if !self.enabled {
+                let mut cmd = std::process::Command::new("/bin/sh");
+                cmd.arg("-c").arg(cmd_str).current_dir(root);
+                return Ok(cmd);
+            }
+            let sandbox_exec = Path::new("/usr/bin/sandbox-exec");
+            if !sandbox_exec.is_file() {
+                anyhow::bail!(
+                    "macOS sandbox-exec is unavailable; refusing unsandboxed shell command (use --no-sandbox only in an isolated environment)"
+                );
+            }
+            let profile = self.seatbelt_profile();
+            let mut cmd = std::process::Command::new(sandbox_exec);
+            cmd.arg("-p")
+                .arg(profile)
+                .arg("--")
+                .arg("/bin/sh")
+                .arg("-c")
+                .arg(cmd_str)
+                .current_dir(root);
+            Ok(cmd)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            if self.enabled {
+                anyhow::bail!(
+                    "OS sandbox confinement is unavailable on this platform; refusing unsandboxed shell command"
+                );
+            }
+            let mut cmd = std::process::Command::new("sh");
+            cmd.arg("-c").arg(cmd_str).current_dir(root);
+            Ok(cmd)
+        }
+    }
+
     /// Apply Landlock rules inside the child process before `exec`.
     /// Read/Execute is permitted across standard system paths (`/usr`, `/bin`, `/lib`, `/etc`, `/dev`, `/proc`),
     /// plus discovered toolchains and extra read paths.
     /// Read+Write is restricted strictly to `self.workspace`, `/tmp`, and configured extra write paths.
+    #[cfg(target_os = "linux")]
     pub fn restrict_current_thread(&self) -> Result<()> {
         if !self.enabled {
             return Ok(());
@@ -242,6 +342,15 @@ impl SandboxPolicy {
             anyhow::bail!("Landlock is not supported by the running kernel");
         }
         Ok(())
+    }
+
+    /// Non-Linux platforms must enforce confinement through `build_shell_command`.
+    #[cfg(not(target_os = "linux"))]
+    pub fn restrict_current_thread(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        anyhow::bail!("In-process Landlock confinement is Linux-only; use build_shell_command")
     }
 }
 
@@ -444,22 +553,21 @@ mod tests {
         assert_eq!(policy.discover_toolchains, cloned.discover_toolchains);
     }
 
-    /// Runs `script` under the real Landlock policy. `None` when the kernel
-    /// cannot enforce Landlock (the test then has nothing to check).
+    /// Runs `script` under the real OS sandbox policy (Landlock on Linux, Seatbelt on macOS).
+    /// `None` when the host kernel cannot enforce confinement.
     fn run_confined(name: &str, script: &str) -> Option<std::process::Output> {
-        use std::os::unix::process::CommandExt;
         let ws = std::env::temp_dir().join(format!("keel-sandbox-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&ws).unwrap();
         let policy = SandboxPolicy::new(&ws, true);
-        let mut cmd = std::process::Command::new("/bin/sh");
-        cmd.arg("-c").arg(script).current_dir(&ws);
-        unsafe {
-            cmd.pre_exec(move || {
-                policy
-                    .restrict_current_thread()
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))
-            });
-        }
+        let mut cmd = match policy.build_shell_command(script, &ws) {
+            Ok(cmd) => cmd,
+            Err(e) if !sandbox_active() => {
+                eprintln!("skipping, host has no OS sandbox: {e}");
+                let _ = std::fs::remove_dir_all(&ws);
+                return None;
+            }
+            Err(e) => panic!("failed to build confined command: {e}"),
+        };
         // Piped stdin like the real agent run: `/dev/stdin` is then a pipe.
         cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -469,18 +577,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&ws);
         match out {
             Ok(out) => Some(out),
-            Err(e) if !landlock_active() => {
-                eprintln!("skipping, kernel has no Landlock: {e}");
+            Err(e) if !sandbox_active() => {
+                eprintln!("skipping, host has no OS sandbox: {e}");
                 None
             }
             Err(e) => panic!("confined spawn failed: {e}"),
         }
     }
 
-    fn landlock_active() -> bool {
-        std::fs::read_to_string("/sys/kernel/security/lsm")
-            .map(|lsm| lsm.split(',').any(|m| m.trim() == "landlock"))
-            .unwrap_or(false)
+    fn sandbox_active() -> bool {
+        if cfg!(target_os = "linux") {
+            std::fs::read_to_string("/sys/kernel/security/lsm")
+                .map(|lsm| lsm.split(',').any(|m| m.trim() == "landlock"))
+                .unwrap_or(false)
+        } else if cfg!(target_os = "macos") {
+            Path::new("/usr/bin/sandbox-exec").is_file()
+        } else {
+            false
+        }
+    }
+
+    #[test]
+    fn test_seatbelt_profile_denies_general_writes_and_allows_workspace() {
+        let policy = SandboxPolicy::new("/Users/dev/project\"quote", true)
+            .with_extra_write("/Users/dev/extra");
+        let profile = policy.seatbelt_profile();
+        assert!(profile.contains("(deny file-write*)"));
+        assert!(profile.contains("(literal \"/dev/null\")"));
+        assert!(profile.contains("(subpath \"/Users/dev/project\\\"quote\")"));
+        assert!(profile.contains("(subpath \"/Users/dev/extra\")"));
     }
 
     #[test]
