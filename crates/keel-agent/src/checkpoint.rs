@@ -355,11 +355,16 @@ pub fn is_forbidden_checkpoint_root(root: &Path) -> bool {
     matches!(
         s.as_ref(),
         "/" | "/home"
+            | "/Users"
             | "/root"
             | "/tmp"
+            | "/private/tmp"
             | "/var"
+            | "/private/var"
             | "/var/tmp"
+            | "/private/var/tmp"
             | "/etc"
+            | "/private/etc"
             | "/usr"
             | "/opt"
             | "/srv"

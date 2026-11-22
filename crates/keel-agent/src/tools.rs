@@ -8,8 +8,8 @@ use keel_kernel::{Plugin, Scope};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read};
-use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
+#[cfg(test)]
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
@@ -865,23 +865,13 @@ impl Tool for Shell {
             }
         }
 
-        let policy = self.sandbox.clone();
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg(cmd_str).current_dir(&self.root);
+        let mut cmd = self.sandbox.build_shell_command(cmd_str, &self.root)?;
 
         // Scrub sensitive environment variables to prevent credential exfiltration
         for (k, _) in std::env::vars() {
             if is_sensitive_env_var(&k) {
                 cmd.env_remove(&k);
             }
-        }
-
-        unsafe {
-            cmd.pre_exec(move || {
-                policy
-                    .restrict_current_thread()
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))
-            });
         }
 
         let timeout = a
