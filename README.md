@@ -65,8 +65,8 @@ keel tui --model bonsai-9b "explain this repo"   # start with a prompt
 
 - **Non-blocking input:** keep typing while a turn runs; Enter queues the next
   prompt and it resumes the same session log when the current turn exits.
-- **Streaming NDJSON:** reasoning, tool calls, tool results, sentinel vetoes
-  and turn summaries render as they arrive.
+- **Streaming NDJSON:** reasoning, tool calls, tool results, `file_edit`
+  (unified diffs), sentinel vetoes and turn summaries render as they arrive.
 - **Session log is the source of truth:** the log book loads
   `~/.keel/sessions/*.jsonl`; closing the TUI never deletes a wake.
 
@@ -148,6 +148,20 @@ command waits for the decision. EOF or a failed request write denies the call.
 Reads, policy-authorized calls, read-only rejections, and previously authorized
 calls do not emit an approval request. Parents should scope every response to
 its current subprocess/run and never infer a request from ordinary tool progress.
+
+### JSON `file_edit` events (Diff / `--shadow`)
+
+When `write_file`, `edit_file`, or `patch_file` successfully apply — including
+under `--shadow` (in-memory VFS overlay) — `--json` emits a dedicated event with
+a repo-relative path and unified diff. Parents (e.g. Keel Desktop Diff) must not
+invent Diff rows from `tool_call` alone; wait for this event:
+
+```json
+{"type":"file_edit","path":"src/main.rs","diff":"--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,1 +1,1 @@\n-old\n+new\n","tool_call_id":"call-1"}
+```
+
+`tool_call_id` is included when available. Failed or denied edits do not emit
+`file_edit`. There is no parallel `patch` event type.
 
 ## Status & roadmap
 
