@@ -399,25 +399,44 @@ impl TransactionalVfs {
         };
         let mut out = String::new();
         for (rel, entry) in &guard.entries {
-            let current = if self.mode == VfsMode::MaterializedCow {
-                std::fs::read_to_string(self.root.join(rel)).ok()
-            } else {
-                entry.staged_content.clone()
-            };
-            if current == entry.original_content {
-                continue;
+            if let Some(chunk) = Self::entry_unified_diff(self.mode, &self.root, rel, entry) {
+                out.push_str(&chunk);
             }
-            let old_text = entry.original_content.as_deref().unwrap_or("");
-            let new_text = current.as_deref().unwrap_or("");
-            out.push_str(&format_simple_unified_diff(
-                rel,
-                entry.original_content.is_some(),
-                current.is_some(),
-                old_text,
-                new_text,
-            ));
         }
         out
+    }
+
+    /// Unified diff for a single repo-relative path, if it has uncommitted changes.
+    pub fn diff_for_path(&self, rel_path: &str) -> Option<String> {
+        let (_, rel) = self.normalize_rel(Path::new(rel_path)).ok()?;
+        let guard = self.journal.lock().ok()?;
+        let entry = guard.entries.get(&rel)?;
+        Self::entry_unified_diff(self.mode, &self.root, &rel, entry)
+    }
+
+    fn entry_unified_diff(
+        mode: VfsMode,
+        root: &Path,
+        rel: &str,
+        entry: &VfsEntry,
+    ) -> Option<String> {
+        let current = if mode == VfsMode::MaterializedCow {
+            std::fs::read_to_string(root.join(rel)).ok()
+        } else {
+            entry.staged_content.clone()
+        };
+        if current == entry.original_content {
+            return None;
+        }
+        let old_text = entry.original_content.as_deref().unwrap_or("");
+        let new_text = current.as_deref().unwrap_or("");
+        Some(format_simple_unified_diff(
+            rel,
+            entry.original_content.is_some(),
+            current.is_some(),
+            old_text,
+            new_text,
+        ))
     }
 
     /// Calculate added and deleted line counts across all staged diffs.
@@ -734,6 +753,38 @@ mod tests {
             "line 1\nline 2\n"
         );
         assert!(!tmp.join("created.txt").exists());
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn diff_for_path_returns_unified_diff_in_shadow_and_cow() {
+        let tmp = std::env::temp_dir().join(format!("keel-vfs-diff-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("src_main.rs"), "fn main() {}\n").unwrap();
+
+        let shadow = TransactionalVfs::new(tmp.clone(), VfsMode::ShadowMemory, false);
+        shadow
+            .write_string(
+                Path::new("src_main.rs"),
+                "fn main() { println!(\"hi\"); }\n",
+            )
+            .unwrap();
+        let d = shadow.diff_for_path("src_main.rs").expect("shadow diff");
+        assert!(d.contains("--- a/src_main.rs"), "{d}");
+        assert!(d.contains("+++ b/src_main.rs"), "{d}");
+        assert!(d.contains("-fn main() {}"), "{d}");
+        assert!(d.contains("+fn main() { println!(\"hi\"); }"), "{d}");
+        assert!(shadow.diff_for_path("missing.rs").is_none());
+
+        let cow = TransactionalVfs::new(tmp.clone(), VfsMode::MaterializedCow, false);
+        cow.capture_pre_image("src_main.rs").unwrap();
+        std::fs::write(tmp.join("src_main.rs"), "fn main() { /* cow */ }\n").unwrap();
+        cow.sync_post_image("src_main.rs").unwrap();
+        let d2 = cow.diff_for_path("src_main.rs").expect("cow diff");
+        assert!(d2.contains("--- a/src_main.rs"), "{d2}");
+        assert!(d2.contains("+fn main() { /* cow */ }"), "{d2}");
 
         let _ = std::fs::remove_dir_all(tmp);
     }

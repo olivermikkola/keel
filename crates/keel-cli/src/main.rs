@@ -175,6 +175,18 @@ impl Plugin for JsonPrinter {
             );
             let _ = std::io::stdout().flush();
         });
+        s.on::<keel_agent::FileEdit, _>(|edit| {
+            let mut event = serde_json::json!({
+                "type": "file_edit",
+                "path": edit.path,
+                "diff": edit.diff,
+            });
+            if let Some(id) = &edit.tool_call_id {
+                event["tool_call_id"] = serde_json::json!(id);
+            }
+            println!("{event}");
+            let _ = std::io::stdout().flush();
+        });
         s.on::<keel_agent::TurnSummary, _>(|summary| {
             println!(
                 "{}",
@@ -306,7 +318,7 @@ options:
   --listen <addr>                  listen on TCP address (e.g. 127.0.0.1:4040)
   --socket <path>                  listen on Unix domain socket (e.g. ~/.keel/daemon.sock)
   --auth-token <token>             enforce bearer authentication token
-  --json                           emit machine-readable JSON output
+  --json                           emit NDJSON events (text, tool_call, file_edit, ...)
   --dry-run                        preview patch/edit without writing
   --yolo                           allow mutating tools (write/edit/patch/shell)
   --allow-protected               permit modifications to .git, .env, .ssh, .keel

@@ -588,6 +588,15 @@ pub struct ToolDenied(pub ToolCall);
 pub struct ToolResult(pub String, pub String);
 pub struct TurnEnd(pub String);
 
+/// Emitted after `write_file` / `edit_file` / `patch_file` successfully apply
+/// (including `--shadow` overlay). Carries a unified diff for GUI Diff viewers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileEdit {
+    pub path: String,
+    pub diff: String,
+    pub tool_call_id: Option<String>,
+}
+
 /// Detailed summary of actions, metrics, and outcomes for an agent turn.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct TurnSummary {
@@ -1121,6 +1130,24 @@ impl Agent<'_> {
         )
     }
 
+    /// Emit a dedicated `FileEdit` event with a unified diff for Desktop Diff / `--shadow`.
+    fn emit_file_edit(&self, call: &ToolCall, vfs: &vfs::TransactionalVfs) {
+        let Some(path) = call.args.get("path").and_then(|v| v.as_str()) else {
+            return;
+        };
+        let Some(diff) = vfs.diff_for_path(path) else {
+            return;
+        };
+        if diff.trim().is_empty() {
+            return;
+        }
+        self.ctx.emit(&FileEdit {
+            path: path.to_string(),
+            diff,
+            tool_call_id: Some(call.id.clone()),
+        });
+    }
+
     fn execute(&self, call: &ToolCall) -> String {
         let Some(tool) = self.tools.iter().find(|t| t.spec().name == call.name) else {
             return format!("error: unknown tool `{}`", call.name);
@@ -1152,6 +1179,9 @@ impl Agent<'_> {
                 if let Some(ref v) = vfs_svc {
                     if let Some(shadow_res) = v.execute_shadow_tool(&call.name, &call.args) {
                         let out = shadow_res.unwrap_or_else(|e| format!("error: {e:#}"));
+                        if !out.starts_with("error:") {
+                            self.emit_file_edit(call, v);
+                        }
                         self.ctx.emit(&ToolResult(call.id.clone(), out.clone()));
                         return out;
                     }
@@ -1200,6 +1230,7 @@ impl Agent<'_> {
                     if let Some(rel_path) = call.args.get("path").and_then(|v| v.as_str()) {
                         if let Some(ref v) = vfs_svc {
                             let _ = v.sync_post_image(rel_path);
+                            self.emit_file_edit(call, v);
                         }
                         if let Some(lsp_svc) = self.ctx.service::<Arc<lsp::LspService>>() {
                             if let Some(diag_feedback) = lsp_svc.post_edit_feedback(rel_path) {
@@ -1805,6 +1836,102 @@ mod tests {
         assert!(
             tool_msg.contains("[diagnostics: 1 issue(s) detected in `config.json`]"),
             "expected post-edit diagnostics in tool result, got: {tool_msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn file_edit_event_emitted_for_shadow_write_and_edit() {
+        let tmp = std::env::temp_dir().join(format!("keel-file-edit-evt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("app.rs"), "fn main() {}\n").unwrap();
+
+        let collected: Arc<Mutex<Vec<FileEdit>>> = Arc::new(Mutex::new(Vec::new()));
+        struct FileEditCollector(Arc<Mutex<Vec<FileEdit>>>);
+        impl Plugin for FileEditCollector {
+            fn name(&self) -> &str {
+                "file-edit-collector"
+            }
+            fn apply(&self, s: &mut Scope) {
+                let sink = self.0.clone();
+                s.on::<FileEdit, _>(move |e| {
+                    sink.lock().unwrap().push(e.clone());
+                });
+            }
+        }
+
+        let ctx = Context::new();
+        let _p_tools = ctx.mount(&tools::BuiltinToolsPlugin {
+            root: tmp.clone(),
+            landlock_enabled: false,
+            allow_protected: false,
+        });
+        let _p_vfs = ctx.mount(&vfs::VfsPlugin {
+            root: tmp.clone(),
+            mode: vfs::VfsMode::ShadowMemory,
+            persist: false,
+        });
+        let _p_collect = ctx.mount(&FileEditCollector(collected.clone()));
+
+        let llm = Script(Mutex::new(vec![
+            asst(
+                "Editing",
+                vec![ToolCall {
+                    id: "e1".into(),
+                    name: "edit_file".into(),
+                    args: serde_json::json!({
+                        "path": "app.rs",
+                        "old": "fn main() {}",
+                        "new": "fn main() { println!(\"hi\"); }"
+                    }),
+                }],
+            ),
+            asst(
+                "Writing",
+                vec![ToolCall {
+                    id: "w1".into(),
+                    name: "write_file".into(),
+                    args: serde_json::json!({
+                        "path": "new.txt",
+                        "content": "hello\n"
+                    }),
+                }],
+            ),
+            asst("Done", vec![]),
+        ]));
+
+        let _p_llm = ctx.mount(&LlmPlugin(Arc::new(llm)));
+        let _p_app = ctx.mount(&ApproverPlugin(Arc::new(AllowAll)));
+        let _p_log = ctx.mount(&SessionLogPlugin(SessionLog::none()));
+
+        let mut h = vec![];
+        let ans = Agent::run_from_context(&ctx, &mut h, "edit and write", 5).unwrap();
+        assert_eq!(ans, "Done");
+
+        // Shadow overlay: disk unchanged for app.rs
+        assert_eq!(
+            std::fs::read_to_string(tmp.join("app.rs")).unwrap(),
+            "fn main() {}\n"
+        );
+        assert!(!tmp.join("new.txt").exists());
+
+        let events = collected.lock().unwrap().clone();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0].path, "app.rs");
+        assert_eq!(events[0].tool_call_id.as_deref(), Some("e1"));
+        assert!(
+            events[0].diff.contains("--- a/app.rs") && events[0].diff.contains("+fn main()"),
+            "{}",
+            events[0].diff
+        );
+        assert_eq!(events[1].path, "new.txt");
+        assert_eq!(events[1].tool_call_id.as_deref(), Some("w1"));
+        assert!(
+            events[1].diff.contains("+++ b/new.txt") && events[1].diff.contains("+hello"),
+            "{}",
+            events[1].diff
         );
 
         let _ = std::fs::remove_dir_all(&tmp);

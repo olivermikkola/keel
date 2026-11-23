@@ -44,6 +44,14 @@ Do not extend these. Bug fixes need the `frozen-ok` label from Oliver:
 - Local model for real runs: `--base-url http://localhost:8080/v1 --model bonsai-9b`
   (llama-server on the Beelink, if running).
 
+## NDJSON events (`keel run --json`)
+
+Stdout is one JSON object per line. Common types: `capabilities`, `text`,
+`reasoning`, `tool_call`, `tool_result`, `file_edit`, `approval_request`,
+`turn_summary`, `done`. `file_edit` is emitted when `write_file` /
+`edit_file` / `patch_file` apply (including `--shadow`), with `path` + unified
+`diff` for Desktop Diff projection.
+
 ## Safety
 
 Never print API keys or tokens. Never run Keel with `~` as the workspace;
