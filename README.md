@@ -1,12 +1,12 @@
 <img src="docs/brand/mark.svg" width="64" height="64" alt="Keel jade and rust sail" />
 
-# Keel
+# Keel Code
 
-[![CI](https://github.com/olivermikkola/keel/actions/workflows/ci.yml/badge.svg)](https://github.com/olivermikkola/keel/actions/workflows/ci.yml)
+[![CI](https://github.com/olivermikkola/keel-code/actions/workflows/ci.yml/badge.svg)](https://github.com/olivermikkola/keel-code/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 **A coding agent that runs on small local models — in your terminal.**
-Point Keel at a model on your own machine (2–27B, e.g. Bonsai or Qwen on
+Point Keel Code (`keel`) at a model on your own machine (2–27B, e.g. Bonsai or Qwen on
 llama.cpp), say what you want changed, and it reads, edits and tests code
 while you approve the risky parts. Think Claude Code, except the model is
 yours and nothing has to leave your machine.
@@ -28,15 +28,15 @@ yours and nothing has to leave your machine.
 - **Has a full terminal cockpit.** `keel tui`: past sessions on the left,
   the live run in the middle, model/safety/token status on the right.
 
-## Build and try Keel
+## Build and try Keel Code
 
 Install a stable [Rust toolchain](https://rustup.rs/). For local inference, start
 an OpenAI-compatible server and load a compatible model first. The example uses
 `llama-server` on port 8080 and the server's model alias `bonsai-9b`.
 
 ```bash
-git clone https://github.com/olivermikkola/keel.git
-cd keel
+git clone https://github.com/olivermikkola/keel-code.git
+cd keel-code
 cargo build --release
 
 # Local model (llama-server, Ollama, LM Studio — any OpenAI-compatible API):
@@ -180,14 +180,14 @@ replay/recorder, and the daemon.
 ## The Keel family
 
 One engine, focused surfaces. The canonical positioning is in
-[docs/VISION.md](docs/VISION.md): **Keel is the coding agent (the Claude Code
-role); Keel Desktop is the everyday app (the Claude Desktop role) whose Code
-mode is this CLI.**
+[docs/VISION.md](docs/VISION.md): **Keel Code is the terminal coding agent (the
+Claude Code role); Keel Desktop is the everyday app (the Claude Desktop role)
+whose Code mode is this CLI.**
 
 | Product | What it is |
 | --- | --- |
-| **Keel** (this repo) | CLI + TUI coding-agent harness for small local models |
-| [Keel Desktop](https://github.com/olivermikkola/keel-desktop) | Everyday local-AI app for macOS/Linux/Windows: Chat, Work, Images, and Code powered by this CLI |
+| **Keel Code** (this repo) | CLI + TUI coding-agent harness (`keel`) for small local models |
+| [Keel Desktop](https://github.com/olivermikkola/keel-desktop) | Everyday local-AI app for macOS/Linux/Windows: Chat, Work, Images, and Code powered by Keel Code |
 | [Keel Mobile](https://moesystems.com/keel-mobile/) | Standalone on-device iPhone agent — the model runs on the phone |
 | [Keel Mobile for Android](https://github.com/olivermikkola/keel-mobile-android) | On-device Android agent, source-build pre-alpha |
 | [Keel Console](https://github.com/olivermikkola/keel-xbox) | Living-room app for Xbox / TV |
