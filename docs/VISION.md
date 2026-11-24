@@ -5,7 +5,7 @@ instead of restating it. Visual identity lives in [brand/README.md](brand/README
 
 ## The two anchors
 
-**Keel (CLI + TUI) is the coding agent — the role Claude Code plays.**
+**Keel Code (CLI + TUI, binary `keel`) is the coding agent — the role Claude Code plays.**
 One engine in the terminal: `keel` and `keel tui` over the same session logs,
 tools, sandbox and approvals. It is the core of the family; the other surfaces
 front it or carry its techniques to other devices.
@@ -13,7 +13,7 @@ front it or carry its techniques to other devices.
 **Keel Desktop is the everyday app — the role Claude Desktop plays.**
 Chat, Work (Websites, Sheets, Docs, Study, Slides), Images, projects and saved
 preferences: the place you go for ease, no terminal required. Its **Code mode
-is the Keel CLI** — the same engine you can run in a terminal, fronted by the
+is Keel Code** — the same engine you can run in a terminal, fronted by the
 GUI, not a second coding agent.
 
 ## What follows from this
