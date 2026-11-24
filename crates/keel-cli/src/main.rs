@@ -1838,14 +1838,18 @@ fn main() -> anyhow::Result<()> {
     args.extend(literal_tail);
     let mut prompt = args.join(" ");
 
-    let root = workspace_root(root_opt).inspect_err(|error| {
-        if json_mode {
-            println!(
-                "{}",
-                json!({"type":"done","status":"error","error":format!("{error:#}")})
-            );
-        }
-    })?;
+    let root = if bench_mode {
+        std::env::temp_dir()
+    } else {
+        workspace_root(root_opt).inspect_err(|error| {
+            if json_mode {
+                println!(
+                    "{}",
+                    json!({"type":"done","status":"error","error":format!("{error:#}")})
+                );
+            }
+        })?
+    };
 
     // Validate before mounting plugins, creating logs, or making model calls.
     // Explicit resume must never silently turn into a fresh conversation.
@@ -1924,7 +1928,7 @@ fn main() -> anyhow::Result<()> {
         model: model_name.clone(),
         enable_thinking: std::env::var("KEEL_THINKING").ok().map(|v| v != "0"),
         sentinel: Some(streaming_sentinel.clone()),
-        prewarm: Some(prewarm_engine.clone()),
+        prewarm: (!bench_mode).then_some(prewarm_engine.clone()),
     });
     let llm: Arc<dyn Llm> = if let Some(frontier_model) = cascade_model_opt {
         let frontier: Arc<dyn Llm> = Arc::new(OpenAiCompat {
@@ -1934,7 +1938,7 @@ fn main() -> anyhow::Result<()> {
             model: frontier_model,
             enable_thinking: Some(true),
             sentinel: Some(streaming_sentinel.clone()),
-            prewarm: Some(prewarm_engine.clone()),
+            prewarm: (!bench_mode).then_some(prewarm_engine.clone()),
         });
         Arc::new(CascadeProvider::new(primary_llm, frontier, 2))
     } else {
