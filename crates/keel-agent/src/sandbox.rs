@@ -81,6 +81,7 @@ pub const TOOLCHAIN_ENV_VARS: &[&str] = &[
 pub struct SandboxPolicy {
     pub workspace: PathBuf,
     pub enabled: bool,
+    pub workspace_read_only: bool,
     pub extra_read_paths: Vec<PathBuf>,
     pub extra_write_paths: Vec<PathBuf>,
     pub discover_toolchains: bool,
@@ -91,6 +92,7 @@ impl Default for SandboxPolicy {
         Self {
             workspace: PathBuf::from("."),
             enabled: true,
+            workspace_read_only: false,
             extra_read_paths: Vec::new(),
             extra_write_paths: Vec::new(),
             discover_toolchains: true,
@@ -106,6 +108,12 @@ impl SandboxPolicy {
             enabled,
             ..Default::default()
         }
+    }
+
+    /// Restricts the workspace to read-only (e.g. under `--shadow` VFS mode).
+    pub fn with_workspace_read_only(mut self, read_only: bool) -> Self {
+        self.workspace_read_only = read_only;
+        self
     }
 
     /// Adds a path to the list of extra read-only paths.
@@ -177,6 +185,10 @@ impl SandboxPolicy {
         // User-configured extra read-only paths.
         paths.extend(self.extra_read_paths.clone());
 
+        if self.workspace_read_only {
+            paths.push(self.workspace.clone());
+        }
+
         // Deduplicate
         let mut seen = HashSet::new();
         paths.retain(|p| seen.insert(p.clone()));
@@ -187,7 +199,9 @@ impl SandboxPolicy {
     /// Returns the combined set of read-write paths to grant access to.
     pub fn write_paths(&self) -> Vec<PathBuf> {
         let mut paths = Vec::new();
-        paths.push(self.workspace.clone());
+        if !self.workspace_read_only {
+            paths.push(self.workspace.clone());
+        }
         paths.push(PathBuf::from("/tmp"));
         if let Ok(tmpdir) = env::var("TMPDIR") {
             let p = PathBuf::from(tmpdir);
@@ -407,7 +421,12 @@ impl keel_kernel::Plugin for LandlockPlugin {
     }
 
     fn apply(&self, scope: &mut keel_kernel::Scope) {
+        let shadow_vfs = scope
+            .context()
+            .service::<std::sync::Arc<crate::vfs::TransactionalVfs>>()
+            .is_some_and(|v| v.mode() == crate::vfs::VfsMode::ShadowMemory);
         let mut policy = SandboxPolicy::new(self.workspace.clone(), self.enabled)
+            .with_workspace_read_only(shadow_vfs)
             .with_toolchains(self.discover_toolchains);
         for r in &self.extra_read_paths {
             policy = policy.with_extra_read(r.clone());
@@ -634,5 +653,56 @@ mod tests {
         let escaped = std::path::Path::new(target).exists();
         let _ = std::fs::remove_file(target);
         assert!(!out.status.success() && !escaped);
+    }
+
+    #[test]
+    fn test_workspace_read_only_policy_and_seatbelt_profile() {
+        let ws = PathBuf::from("/Users/dev/shadow-project");
+        let policy = SandboxPolicy::new(&ws, true).with_workspace_read_only(true);
+        assert!(policy.read_only_paths().contains(&ws));
+        assert!(!policy.write_paths().contains(&ws));
+        let profile = policy.seatbelt_profile();
+        assert!(profile.contains("(deny file-write*)"));
+        assert!(!profile.contains("shadow-project"));
+    }
+
+    #[test]
+    fn test_confined_shell_cannot_write_workspace_when_read_only() {
+        if !sandbox_active() {
+            return;
+        }
+        // Place workspace outside /tmp so /tmp write access cannot mask workspace confinement.
+        let ws = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("keel-sandbox-ro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+        let seed = ws.join("src_main.rs");
+        std::fs::write(&seed, "fn main() {}\n").unwrap();
+
+        let policy = SandboxPolicy::new(&ws, true).with_workspace_read_only(true);
+        let mut read_cmd = policy
+            .build_shell_command("cat src_main.rs", &ws)
+            .expect("build read command");
+        let read_out = read_cmd.output().expect("run read command");
+        assert!(
+            read_out.status.success(),
+            "read failed: {}",
+            String::from_utf8_lossy(&read_out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&read_out.stdout), "fn main() {}\n");
+
+        let mut write_cmd = policy
+            .build_shell_command("echo hacked > src_main.rs", &ws)
+            .expect("build write command");
+        let write_out = write_cmd.output().expect("run write command");
+        let content = std::fs::read_to_string(&seed).unwrap();
+        let _ = std::fs::remove_dir_all(&ws);
+
+        assert!(
+            !write_out.status.success(),
+            "shell write succeeded under read-only workspace"
+        );
+        assert_eq!(content, "fn main() {}\n");
     }
 }

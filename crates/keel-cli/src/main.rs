@@ -2119,6 +2119,15 @@ fn main() -> anyhow::Result<()> {
     let _p_llm = ctx.mount(&LlmPlugin(llm));
     let _p_approver = ctx.mount(&ApproverPlugin(approver));
     let _p_log = ctx.mount(&SessionLogPlugin(session));
+    let _p_vfs = ctx.mount(&VfsPlugin {
+        root: root.clone(),
+        mode: if shadow_vfs {
+            VfsMode::ShadowMemory
+        } else {
+            VfsMode::MaterializedCow
+        },
+        persist: !shadow_vfs,
+    });
     let _p_landlock = ctx.mount(&LandlockPlugin {
         workspace: root.clone(),
         enabled: !no_sandbox,
@@ -2171,15 +2180,6 @@ fn main() -> anyhow::Result<()> {
         root: root.clone(),
         extra_servers: std::collections::HashMap::new(),
         auto_post_edit_check: !shadow_vfs,
-    });
-    let _p_vfs = ctx.mount(&VfsPlugin {
-        root: root.clone(),
-        mode: if shadow_vfs {
-            VfsMode::ShadowMemory
-        } else {
-            VfsMode::MaterializedCow
-        },
-        persist: !shadow_vfs,
     });
     let _p_diff_printer = if show_diff && !json_mode {
         ctx.service::<Arc<TransactionalVfs>>()

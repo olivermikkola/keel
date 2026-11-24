@@ -960,11 +960,18 @@ impl Plugin for BuiltinToolsPlugin {
             r.clone(),
             allow_protected,
         )));
-        let sandbox_policy = scope
+        let shadow_vfs = scope
+            .context()
+            .service::<Arc<crate::vfs::TransactionalVfs>>()
+            .is_some_and(|v| v.mode() == crate::vfs::VfsMode::ShadowMemory);
+        let mut sandbox_policy = scope
             .context()
             .service::<SandboxPolicy>()
             .map(|p| (*p).clone())
             .unwrap_or_else(|| SandboxPolicy::new(r.clone(), self.landlock_enabled));
+        if shadow_vfs {
+            sandbox_policy = sandbox_policy.with_workspace_read_only(true);
+        }
 
         reg.register(Arc::new(Shell {
             root: r.clone(),
